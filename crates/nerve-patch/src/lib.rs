@@ -27,6 +27,8 @@ pub enum PatchError {
     UnsafePath { path: PathBuf, reason: String },
     #[error("unsupported patch operation: {message}")]
     Unsupported { message: String },
+    #[error("invalid patch state for `{path}`: {message}")]
+    InvalidOperationState { path: PathBuf, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, PatchError>;
@@ -41,10 +43,24 @@ pub struct NvPatch {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FilePatch {
     pub path: PathBuf,
+    #[serde(default = "default_file_operation")]
+    pub operation: FileOperation,
     pub original: String,
     pub modified: String,
     pub original_sha256: String,
     pub modified_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOperation {
+    Modify,
+    Create,
+    Delete,
+}
+
+fn default_file_operation() -> FileOperation {
+    FileOperation::Modify
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,12 +113,7 @@ impl NvPatch {
 
         let mut files = Vec::with_capacity(file_diffs.len());
         for file_diff in file_diffs {
-            let path = file_diff.patch_path()?;
-            ensure_safe_relative_path(cwd, &path)?;
-
-            let original = read_to_string(cwd, &path)?;
-            let modified = apply_hunks(&original, &file_diff.hunks)?;
-            files.push(FilePatch::new(path, original, modified));
+            files.push(file_diff.to_file_patch(cwd)?);
         }
 
         Ok(Some(Self::new(files)))
@@ -119,7 +130,7 @@ impl NvPatch {
         self.validate(cwd, false)?;
         if !dry_run {
             for file in &self.files {
-                file.write_modified(cwd)?;
+                file.apply(cwd)?;
             }
         }
         Ok(ApplyReport {
@@ -133,7 +144,7 @@ impl NvPatch {
         self.validate(cwd, true)?;
         if !dry_run {
             for file in &self.files {
-                file.write_original(cwd)?;
+                file.rollback(cwd)?;
             }
         }
         Ok(ApplyReport {
@@ -150,10 +161,28 @@ impl FilePatch {
         original: impl Into<String>,
         modified: impl Into<String>,
     ) -> Self {
+        Self::with_operation(path, FileOperation::Modify, original, modified)
+    }
+
+    pub fn create(path: impl Into<PathBuf>, modified: impl Into<String>) -> Self {
+        Self::with_operation(path, FileOperation::Create, "", modified)
+    }
+
+    pub fn delete(path: impl Into<PathBuf>, original: impl Into<String>) -> Self {
+        Self::with_operation(path, FileOperation::Delete, original, "")
+    }
+
+    pub fn with_operation(
+        path: impl Into<PathBuf>,
+        operation: FileOperation,
+        original: impl Into<String>,
+        modified: impl Into<String>,
+    ) -> Self {
         let original = original.into();
         let modified = modified.into();
         Self {
             path: path.into(),
+            operation,
             original_sha256: sha256_hex(&original),
             modified_sha256: sha256_hex(&modified),
             original,
@@ -162,8 +191,14 @@ impl FilePatch {
     }
 
     pub fn to_unified_diff(&self) -> String {
-        let old_path = format!("a/{}", self.path.display());
-        let new_path = format!("b/{}", self.path.display());
+        let old_path = match self.operation {
+            FileOperation::Create => "/dev/null".to_string(),
+            FileOperation::Modify | FileOperation::Delete => format!("a/{}", self.path.display()),
+        };
+        let new_path = match self.operation {
+            FileOperation::Delete => "/dev/null".to_string(),
+            FileOperation::Modify | FileOperation::Create => format!("b/{}", self.path.display()),
+        };
         TextDiff::from_lines(&self.original, &self.modified)
             .unified_diff()
             .header(&old_path, &new_path)
@@ -172,6 +207,7 @@ impl FilePatch {
 
     fn validate(&self, cwd: &Path, rollback: bool) -> Result<()> {
         ensure_safe_relative_path(cwd, &self.path)?;
+        self.validate_operation_state(cwd, rollback)?;
         let expected = if rollback {
             &self.modified_sha256
         } else {
@@ -189,12 +225,40 @@ impl FilePatch {
         Ok(())
     }
 
-    fn write_modified(&self, cwd: &Path) -> Result<()> {
-        write_string(cwd, &self.path, &self.modified)
+    fn validate_operation_state(&self, cwd: &Path, rollback: bool) -> Result<()> {
+        match (&self.operation, rollback) {
+            (FileOperation::Create, false) if target_exists(cwd, &self.path) => {
+                Err(PatchError::InvalidOperationState {
+                    path: self.path.clone(),
+                    message: "create target already exists".to_string(),
+                })
+            }
+            (FileOperation::Delete, false) if !target_exists(cwd, &self.path) => {
+                Err(PatchError::InvalidOperationState {
+                    path: self.path.clone(),
+                    message: "delete target does not exist".to_string(),
+                })
+            }
+            _ => Ok(()),
+        }
     }
 
-    fn write_original(&self, cwd: &Path) -> Result<()> {
-        write_string(cwd, &self.path, &self.original)
+    fn apply(&self, cwd: &Path) -> Result<()> {
+        match self.operation {
+            FileOperation::Delete => remove_file(cwd, &self.path),
+            FileOperation::Modify | FileOperation::Create => {
+                write_string(cwd, &self.path, &self.modified)
+            }
+        }
+    }
+
+    fn rollback(&self, cwd: &Path) -> Result<()> {
+        match self.operation {
+            FileOperation::Create => remove_file(cwd, &self.path),
+            FileOperation::Modify | FileOperation::Delete => {
+                write_string(cwd, &self.path, &self.original)
+            }
+        }
     }
 }
 
@@ -224,6 +288,22 @@ fn write_string(cwd: &Path, relative: &Path, value: &str) -> Result<()> {
     })
 }
 
+fn remove_file(cwd: &Path, relative: &Path) -> Result<()> {
+    let path = cwd.join(relative);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(PatchError::Io {
+            path: relative.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn target_exists(cwd: &Path, relative: &Path) -> bool {
+    cwd.join(relative).exists()
+}
+
 #[derive(Debug, Clone)]
 struct ParsedFileDiff {
     old_path: Option<PathBuf>,
@@ -232,27 +312,39 @@ struct ParsedFileDiff {
 }
 
 impl ParsedFileDiff {
-    fn patch_path(&self) -> Result<PathBuf> {
-        if self.new_path.is_none() {
-            return Err(PatchError::Unsupported {
-                message: "file deletion is not supported by NvPatch yet".to_string(),
-            });
-        }
+    fn to_file_patch(&self, cwd: &Path) -> Result<FilePatch> {
+        let (path, operation) = match (&self.old_path, &self.new_path) {
+            (None, Some(new_path)) => (new_path.clone(), FileOperation::Create),
+            (Some(old_path), None) => (old_path.clone(), FileOperation::Delete),
+            (Some(old_path), Some(new_path)) if old_path == new_path => {
+                (new_path.clone(), FileOperation::Modify)
+            }
+            (Some(old_path), Some(new_path)) => {
+                return Err(PatchError::Unsupported {
+                    message: format!(
+                        "file rename from `{}` to `{}` is not supported by NvPatch yet",
+                        old_path.display(),
+                        new_path.display()
+                    ),
+                });
+            }
+            (None, None) => {
+                return Err(PatchError::InvalidUnifiedDiff {
+                    message: "file diff has neither old nor new path".to_string(),
+                });
+            }
+        };
 
-        let new_path = self.new_path.clone().unwrap();
-        if let Some(old_path) = &self.old_path
-            && old_path != &new_path
-        {
-            return Err(PatchError::Unsupported {
-                message: format!(
-                    "file rename from `{}` to `{}` is not supported by NvPatch yet",
-                    old_path.display(),
-                    new_path.display()
-                ),
-            });
-        }
+        ensure_safe_relative_path(cwd, &path)?;
+        let original = match operation {
+            FileOperation::Create => String::new(),
+            FileOperation::Modify | FileOperation::Delete => read_to_string(cwd, &path)?,
+        };
+        let modified = apply_hunks(&original, &self.hunks)?;
 
-        Ok(new_path)
+        Ok(FilePatch::with_operation(
+            path, operation, original, modified,
+        ))
     }
 }
 
@@ -689,6 +781,7 @@ diff --git a/file.txt b/file.txt
 
         assert_eq!(patch.files.len(), 1);
         assert_eq!(patch.files[0].path, PathBuf::from("file.txt"));
+        assert_eq!(patch.files[0].operation, FileOperation::Modify);
         assert_eq!(patch.files[0].original, "before\nsame\n");
         assert_eq!(patch.files[0].modified, "after\nsame\n");
     }
@@ -710,8 +803,22 @@ diff --git a/new.txt b/new.txt
             .unwrap();
 
         assert_eq!(patch.files[0].path, PathBuf::from("new.txt"));
+        assert_eq!(patch.files[0].operation, FileOperation::Create);
         assert_eq!(patch.files[0].original, "");
         assert_eq!(patch.files[0].modified, "first\nsecond\n");
+    }
+
+    #[test]
+    fn create_patch_rolls_back_by_removing_created_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        let patch = NvPatch::new(vec![FilePatch::create("new.txt", "created\n")]);
+
+        patch.apply(dir.path(), false).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "created\n");
+
+        patch.rollback(dir.path(), false).unwrap();
+        assert!(!path.exists());
     }
 
     #[test]
@@ -755,9 +862,10 @@ diff --git a/new.txt b/new.txt
     }
 
     #[test]
-    fn rejects_file_deletion_until_model_supports_it() {
+    fn parses_and_applies_file_deletion() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("file.txt"), "remove\n").unwrap();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, "remove\n").unwrap();
         let diff = "\
 --- a/file.txt
 +++ /dev/null
@@ -765,8 +873,19 @@ diff --git a/new.txt b/new.txt
 -remove
 ";
 
-        let err = NvPatch::from_unified_diff(dir.path(), diff).unwrap_err();
+        let patch = NvPatch::from_unified_diff(dir.path(), diff)
+            .unwrap()
+            .unwrap();
 
-        assert!(matches!(err, PatchError::Unsupported { .. }));
+        assert_eq!(patch.files[0].path, PathBuf::from("file.txt"));
+        assert_eq!(patch.files[0].operation, FileOperation::Delete);
+        assert_eq!(patch.files[0].original, "remove\n");
+        assert_eq!(patch.files[0].modified, "");
+
+        patch.apply(dir.path(), false).unwrap();
+        assert!(!path.exists());
+
+        patch.rollback(dir.path(), false).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "remove\n");
     }
 }
