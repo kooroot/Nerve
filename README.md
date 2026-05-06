@@ -271,10 +271,17 @@ Profiles can route work by:
 
 - Keyword rules matched against the task prompt
 - Glob rules matched against task context paths
+- Combined `all` / `any` rule groups
 - Per-profile `lead`
 - Per-profile `reviewer`
 - Per-profile `review_strictness`
 - Optional per-profile `max_refinement_rounds`
+
+`match_rules` accepts the original shorthand array or a logical rule object:
+
+```json
+{ "all": ["*.rs", "contract"], "any": ["audit", "security"] }
+```
 
 ### Conflict Policies
 
@@ -358,6 +365,7 @@ Current test coverage verifies:
 - Doctor checks for config and adapter prerequisites
 - Token and estimated-cost budget enforcement when adapter usage is reported
 - Strategy dispatch for `consensus`, `pipeline`, and `tournament`
+- Profile `all` / `any` match rule groups
 
 ## How It Works
 
@@ -402,6 +410,7 @@ User: "add a health endpoint"
 ### Phase 3
 
 - Real-time cross-firing between lead and reviewer.
+- Profile `all` / `any` match rule groups are implemented.
 - Strategy dispatch for `consensus`, `pipeline`, and `tournament` is implemented.
 - cmux or TUI layout for lead stream, reviewer stream, and orchestrator state.
 - Long-running daemon mode for editor and shell integrations.

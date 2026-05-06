@@ -190,6 +190,8 @@ MVP가 "순차+1라운드"에 머무른 부분을 **진짜 병렬 + 실시간 cr
   ```
 - `review_strictness: "high" | "normal" | "low"`를 reviewer prompt에 주입.
 - Profile 별 `max_refinement_rounds` override 허용.
+- 2026-05-06 현재: 기존 배열 shorthand와 함께 `{ "all": [...], "any": [...] }`
+  logical rule object를 지원한다.
 
 ### 3.3 Strategy 플러그인
 - `default_strategy`를 trait `Strategy`로 추상화:

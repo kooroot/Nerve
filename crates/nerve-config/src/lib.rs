@@ -44,7 +44,7 @@ pub struct Roles {
 pub struct Profile {
     pub id: String,
     #[serde(default)]
-    pub match_rules: Vec<String>,
+    pub match_rules: MatchRules,
     pub lead: String,
     pub reviewer: String,
     #[serde(default)]
@@ -60,6 +60,33 @@ pub struct ProfileSelection {
     pub reviewer: String,
     pub review_strictness: ReviewStrictness,
     pub max_refinement_rounds: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum MatchRules {
+    Any(Vec<String>),
+    Logic {
+        #[serde(default)]
+        all: Vec<String>,
+        #[serde(default)]
+        any: Vec<String>,
+    },
+}
+
+impl Default for MatchRules {
+    fn default() -> Self {
+        Self::Any(Vec::new())
+    }
+}
+
+impl MatchRules {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Any(rules) => rules.is_empty(),
+            Self::Logic { all, any } => all.is_empty() && any.is_empty(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -195,39 +222,53 @@ impl Profile {
             return Ok(false);
         }
 
-        let prompt = task.prompt.to_lowercase();
-        let mut glob_builder = GlobSetBuilder::new();
-        let mut has_glob = false;
-        let mut keywords = Vec::new();
-
-        for rule in &self.match_rules {
-            if looks_like_glob(rule) {
-                glob_builder.add(Glob::new(rule).with_context(|| {
-                    format!("invalid glob rule `{}` in profile `{}`", rule, self.id)
-                })?);
-                has_glob = true;
-            } else {
-                keywords.push(rule.to_lowercase());
+        match &self.match_rules {
+            MatchRules::Any(rules) => any_rule_matches(rules, task),
+            MatchRules::Logic { all, any } => {
+                let all_match = all_rules_match(all, task)?;
+                let any_match = if any.is_empty() && !all.is_empty() {
+                    true
+                } else {
+                    any_rule_matches(any, task)?
+                };
+                Ok(all_match && any_match)
             }
         }
+    }
+}
 
-        if keywords.iter().any(|keyword| prompt.contains(keyword)) {
+fn any_rule_matches(rules: &[String], task: &Task) -> Result<bool> {
+    for rule in rules {
+        if rule_matches(rule, task)? {
             return Ok(true);
         }
-
-        if has_glob {
-            let glob_set = glob_builder.build()?;
-            if task
-                .context_paths
-                .iter()
-                .any(|path| glob_set.is_match(path))
-            {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
     }
+    Ok(false)
+}
+
+fn all_rules_match(rules: &[String], task: &Task) -> Result<bool> {
+    for rule in rules {
+        if !rule_matches(rule, task)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn rule_matches(rule: &str, task: &Task) -> Result<bool> {
+    let prompt = task.prompt.to_lowercase();
+    if !looks_like_glob(rule) {
+        return Ok(prompt.contains(&rule.to_lowercase()));
+    }
+
+    let mut glob_builder = GlobSetBuilder::new();
+    glob_builder.add(Glob::new(rule).with_context(|| format!("invalid glob rule `{rule}`"))?);
+    let glob_set = glob_builder.build()?;
+
+    Ok(task
+        .context_paths
+        .iter()
+        .any(|path| glob_set.is_match(path)))
 }
 
 fn looks_like_glob(rule: &str) -> bool {
@@ -277,5 +318,40 @@ mod tests {
         let selected = config.select_profile(&task).unwrap();
 
         assert_eq!(selected.id.as_deref(), Some("blockchain_dev"));
+    }
+
+    #[test]
+    fn matches_all_any_profile_rules() {
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": {
+                "architect": "claude-code",
+                "reviewer": "codex"
+              },
+              "profiles": [
+                {
+                  "id": "contract_audit",
+                  "match_rules": {
+                    "all": ["*.rs", "contract"],
+                    "any": ["audit", "security"]
+                  },
+                  "lead": "claude-code",
+                  "reviewer": "codex"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let mut task = Task::new("audit payment contract", ".");
+        task.context_paths.push(PathBuf::from("src/lib.rs"));
+
+        let selected = config.select_profile(&task).unwrap();
+
+        assert_eq!(selected.id.as_deref(), Some("contract_audit"));
     }
 }
