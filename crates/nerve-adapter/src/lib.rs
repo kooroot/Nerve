@@ -236,7 +236,7 @@ impl ModelAdapter for SubprocessAdapter {
             task.prompt
         );
         let raw = self.run_prompt(prompt, cwd, &tx).await?;
-        Ok(AgentOutput::text(self.id(), raw))
+        output_from_raw_text(self.id(), cwd, raw)
     }
 
     async fn review(
@@ -268,7 +268,7 @@ impl ModelAdapter for SubprocessAdapter {
             task.prompt, previous_output.raw_text, feedback.raw_text
         );
         let raw = self.run_prompt(prompt, cwd, &tx).await?;
-        Ok(AgentOutput::text(self.id(), raw))
+        output_from_raw_text(self.id(), cwd, raw)
     }
 }
 
@@ -324,6 +324,46 @@ fn feedback_from_text(reviewer_id: &str, raw_text: String) -> ReviewerFeedback {
     }
 }
 
+fn output_from_raw_text(agent_id: &str, cwd: &Path, raw_text: String) -> Result<AgentOutput> {
+    let patch_input = extract_patch_candidate_text(&raw_text);
+    match NvPatch::from_unified_diff(cwd, &patch_input)? {
+        Some(patch) if !patch.is_empty() => Ok(AgentOutput::with_patch(agent_id, raw_text, patch)),
+        _ => Ok(AgentOutput::text(agent_id, raw_text)),
+    }
+}
+
+fn extract_patch_candidate_text(raw_text: &str) -> String {
+    let mut out = String::from(raw_text);
+    for line in raw_text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+
+        collect_json_strings(&value, &mut out);
+    }
+    out
+}
+
+fn collect_json_strings(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::String(value) => {
+            out.push('\n');
+            out.push_str(value);
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_strings(value, out);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_json_strings(value, out);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
 async fn send_stdout(tx: &mpsc::Sender<AgentEvent>, agent_id: &str, line: &str) {
     let _ = tx
         .send(AgentEvent::Stdout {
@@ -340,4 +380,53 @@ async fn send_stderr(tx: &mpsc::Sender<AgentEvent>, agent_id: &str, line: &str) 
             line: line.to_string(),
         })
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_raw_unified_diff_to_structured_agent_output() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "before\n").unwrap();
+        let raw = "\
+Lead notes before the patch.
+
+--- a/file.txt
++++ b/file.txt
+@@ -1 +1 @@
+-before
++after
+"
+        .to_string();
+
+        let output = output_from_raw_text("claude-code", dir.path(), raw).unwrap();
+
+        let patch = output.proposed_patch.unwrap();
+        assert_eq!(patch.files.len(), 1);
+        assert_eq!(patch.files[0].modified, "after\n");
+    }
+
+    #[test]
+    fn leaves_plain_text_output_unstructured() {
+        let dir = tempfile::tempdir().unwrap();
+        let output =
+            output_from_raw_text("claude-code", dir.path(), "no diff here".to_string()).unwrap();
+
+        assert!(output.proposed_patch.is_none());
+    }
+
+    #[test]
+    fn extracts_structured_patch_from_jsonl_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "before\n").unwrap();
+        let raw = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-before\n+after\n"}]}}"#
+            .to_string();
+
+        let output = output_from_raw_text("claude-code", dir.path(), raw).unwrap();
+
+        let patch = output.proposed_patch.unwrap();
+        assert_eq!(patch.files[0].modified, "after\n");
+    }
 }

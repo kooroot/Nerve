@@ -495,6 +495,8 @@ dependencies = [
  "async-trait",
  "nerve-patch",
  "nerve-types",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -509,6 +511,7 @@ dependencies = [
  "nerve-config",
  "nerve-core",
  "nerve-types",
+ "tempfile",
  "tokio",
  "tracing-subscriber",
 ]

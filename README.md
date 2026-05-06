@@ -53,12 +53,12 @@ Nerve is in a Phase 1 MVP state.
 | Mock lead/reviewer loop | Implemented and tested |
 | Hash-checked patch apply/rollback | Implemented and tested |
 | Claude/Codex subprocess boundary | Scaffolded |
-| Real CLI JSON parsing | Basic raw output capture |
-| Real unified-diff to `NvPatch` conversion | Next milestone |
+| Real CLI JSON parsing | Generic JSONL string extraction |
+| Real unified-diff to `NvPatch` conversion | Implemented for create/modify diffs |
 | Persistent history / patch index | Roadmap |
 | Real-time cross-firing / TUI | Roadmap |
 
-Important: the mock adapter path produces structured `NvPatch` values today. The real subprocess adapters currently capture raw CLI output, so real-agent `--apply` should not be considered complete until unified diffs are parsed into safe, cwd-confined `NvPatch` values.
+Important: the mock adapter path produces structured `NvPatch` values directly. The real subprocess path now extracts unified diffs from raw text or JSONL string fields and converts create/modify diffs into safe `NvPatch` values. File deletion and rename are rejected until the patch model represents those operations explicitly.
 
 ## Quick Start
 
@@ -251,11 +251,12 @@ Nerve is built around conservative file mutation:
 - `--apply` is required for file writes.
 - `NvPatch` validates the current file SHA-256 before applying.
 - `NvPatch` validates the modified file SHA-256 before rollback.
+- `NvPatch` rejects absolute paths, `..` traversal, and symlinked directories that resolve outside the working directory.
 - Missing files are represented as empty original content.
 - Reviewer `BLOCK` can prevent application depending on conflict policy.
 - Generated runtime state under `.nerve/` is ignored by Git.
 
-The next safety-critical task is path confinement for model-produced patches: real diffs must not be allowed to write outside `Task.cwd`.
+The next real-adapter task is fixture-based E2E coverage with fake `claude` and `codex` binaries, followed by manual verification against the installed CLIs.
 
 ## Development
 
@@ -274,6 +275,10 @@ Current test coverage verifies:
 - Mock lead/reviewer refinement until `LGTM`
 - Patch apply and rollback round trip
 - Hash mismatch rejection
+- Unified diff parsing for existing and new files
+- Unsafe path rejection for traversal and symlink escapes
+- Real adapter raw text / JSONL diff extraction
+- Fixture-based real adapter CLI dry-run and apply paths
 - CLI smoke test with dry-run diff output
 
 ## How It Works
@@ -305,9 +310,8 @@ User: "add a health endpoint"
 
 ### Phase 1 Completion
 
-- Parse real subprocess unified diffs into structured `NvPatch`.
-- Reject unsafe absolute paths and `..` traversal.
-- Add fixture-based real adapter tests using fake `claude` and `codex` binaries.
+- Verify actual `claude -p --output-format stream-json` and `codex exec --json` output shapes.
+- Add explicit deletion and rename support to the patch model.
 - Emit machine-readable session reports.
 
 ### Phase 2

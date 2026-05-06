@@ -17,3 +17,6 @@ nerve-core = { path = "../nerve-core" }
 nerve-types = { path = "../nerve-types" }
 tokio.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
