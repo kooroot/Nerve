@@ -534,6 +534,7 @@ name = "nerve-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "nerve-adapter",
  "nerve-config",
  "nerve-patch",

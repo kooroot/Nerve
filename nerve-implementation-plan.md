@@ -257,6 +257,9 @@ pub struct RoundRecord { round: u8, lead: AgentOutput, reviewer: ReviewerFeedbac
    재검토.
 4. **비용 통제**: refinement loop이 무한 반복되지 않도록
    `max_refinement_rounds` 외에 **token budget** 상한도 필요 (Phase 2).
+   2026-05-06 현재 `orchestration.max_total_tokens`와
+   `orchestration.max_estimated_cost_microusd`를 지원하며, adapter가
+   `UsageStats`를 보고하면 초과 시 loop을 중단하고 apply를 막는다.
 5. **Codex CLI 행동**: `codex exec`이 stateful session을 가질지 stateless
    one-shot인지에 따라 reviewer prompt 전략이 달라짐 → Phase 1 spike
    필요 (codex CLI 동작 1시간 조사).

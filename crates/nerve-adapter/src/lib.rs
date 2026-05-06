@@ -106,6 +106,7 @@ impl ModelAdapter for MockAdapter {
                 message: "Add refinement marker before accepting the patch".to_string(),
             }],
             suggested_patch: None,
+            cost: None,
             raw_text: "Request changes: add refinement marker".to_string(),
         })
     }
@@ -319,6 +320,7 @@ fn feedback_from_text(reviewer_id: &str, raw_text: String) -> ReviewerFeedback {
         verdict,
         issues,
         suggested_patch: None,
+        cost: None,
         raw_text,
     }
 }

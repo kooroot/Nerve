@@ -232,7 +232,9 @@ Default shape:
   "orchestration": {
     "default_strategy": "consensus",
     "max_refinement_rounds": 2,
-    "conflict_policy": "lead_priority"
+    "conflict_policy": "lead_priority",
+    "max_total_tokens": 200000,
+    "max_estimated_cost_microusd": 5000000
   },
   "roles": {
     "architect": "claude-code",
@@ -279,6 +281,15 @@ The config schema includes:
 | `abort_on_conflict` | Block on reviewer `BLOCK` |
 | `reviewer_block` | Block on reviewer `BLOCK` |
 | `manual` | Block on reviewer `BLOCK` |
+
+### Session Budgets
+
+Optional orchestration budgets stop refinement and prevent apply when reported model usage exceeds a configured ceiling:
+
+- `max_total_tokens`: maximum input plus output tokens for the session.
+- `max_estimated_cost_microusd`: maximum estimated session cost in micro-USD.
+
+Adapters that do not report usage leave these counters at zero; budget enforcement applies when usage is available.
 
 ## Safety Model
 
@@ -327,6 +338,7 @@ Current test coverage verifies:
 - CLI smoke test with dry-run diff output
 - CLI JSON report output
 - Persistent session history and patch index commands
+- Token and estimated-cost budget enforcement when adapter usage is reported
 
 ## How It Works
 
@@ -364,7 +376,7 @@ User: "add a health endpoint"
 - Persisted session history and `.nerve/patches/index.json` are implemented.
 - `nv history`, `nv resume`, `nv list`, `nv apply <id>`, and `nv rollback <id>` are implemented.
 - Temp-file based write staging is implemented for patch file writes.
-- Add token and cost budgets per session.
+- Token and estimated-cost budgets are implemented for adapters that report usage.
 - Real-time cross-firing remains roadmap.
 
 ### Phase 3

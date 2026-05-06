@@ -66,10 +66,32 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UsageStats {
+    #[serde(default)]
     pub input_tokens: u64,
+    #[serde(default)]
     pub output_tokens: u64,
+    #[serde(default)]
+    pub estimated_cost_microusd: Option<u64>,
+}
+
+impl UsageStats {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    pub fn add_assign(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.estimated_cost_microusd =
+            match (self.estimated_cost_microusd, other.estimated_cost_microusd) {
+                (Some(current), Some(next)) => Some(current.saturating_add(next)),
+                (Some(current), None) => Some(current),
+                (None, Some(next)) => Some(next),
+                (None, None) => None,
+            };
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +100,8 @@ pub struct ReviewerFeedback {
     pub verdict: Verdict,
     pub issues: Vec<Issue>,
     pub suggested_patch: Option<NvPatch>,
+    #[serde(default)]
+    pub cost: Option<UsageStats>,
     pub raw_text: String,
 }
 
@@ -88,6 +112,7 @@ impl ReviewerFeedback {
             verdict: Verdict::Lgtm,
             issues: Vec::new(),
             suggested_patch: None,
+            cost: None,
             raw_text: raw_text.into(),
         }
     }

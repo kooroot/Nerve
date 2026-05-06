@@ -210,8 +210,23 @@ fn print_report(report: &nerve_core::RunReport, apply_requested: bool) {
     );
     print_events(&report.events);
     println!("Verdict: {:?}", report.final_feedback.verdict);
+    println!(
+        "Usage: input={} output={} total={} cost_microusd={}",
+        report.usage.input_tokens,
+        report.usage.output_tokens,
+        report.usage.total_tokens(),
+        report
+            .usage
+            .estimated_cost_microusd
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
 
-    if report.blocked {
+    if report.budget_exceeded {
+        println!("Session budget exceeded; no files were changed.");
+    }
+
+    if report.blocked && !report.budget_exceeded {
         println!("Patch blocked by reviewer policy; no files were changed.");
     }
 

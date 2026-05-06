@@ -26,6 +26,10 @@ pub struct Orchestration {
     pub max_refinement_rounds: u8,
     #[serde(default = "default_conflict_policy")]
     pub conflict_policy: ConflictPolicy,
+    #[serde(default)]
+    pub max_total_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_estimated_cost_microusd: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +126,14 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.orchestration.max_refinement_rounds > 5 {
             anyhow::bail!("orchestration.max_refinement_rounds must be <= 5");
+        }
+        if self.orchestration.max_total_tokens == Some(0) {
+            anyhow::bail!("orchestration.max_total_tokens must be greater than 0 when set");
+        }
+        if self.orchestration.max_estimated_cost_microusd == Some(0) {
+            anyhow::bail!(
+                "orchestration.max_estimated_cost_microusd must be greater than 0 when set"
+            );
         }
         if self.roles.architect.trim().is_empty() {
             anyhow::bail!("roles.architect must not be empty");
