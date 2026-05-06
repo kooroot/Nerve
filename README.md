@@ -43,7 +43,7 @@ Single-agent coding has a predictable failure mode: the same model that writes a
 
 ## Current Status
 
-Nerve is in a Phase 1 MVP state.
+Nerve has the Phase 1 MVP plus the planned Phase 2/3 CLI execution features implemented.
 
 | Area | Status |
 |------|--------|
@@ -59,7 +59,7 @@ Nerve is in a Phase 1 MVP state.
 | Persistent history / patch index | Implemented under `.nerve/` |
 | Strategy dispatch | Implemented for `consensus`, `pipeline`, and `tournament` |
 | Real-time cross-firing | Implemented for `.nerve/scratch` watcher feedback |
-| TUI / cmux | Roadmap |
+| Terminal TUI / daemon | Implemented with `--tui` and `daemon` |
 
 Important: the mock adapter path produces structured `NvPatch` values directly. The real subprocess path now extracts unified diffs from raw text or JSONL string fields and converts create/modify/delete/rename diffs into safe `NvPatch` values.
 

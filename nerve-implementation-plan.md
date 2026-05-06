@@ -269,16 +269,16 @@ pub struct RoundRecord { round: u8, lead: AgentOutput, reviewer: ReviewerFeedbac
    있다. → adapter 단에서 schema versioning 가드 필요. Phase 1에서는
    "필드 누락 시 raw text fallback".
 2. **인증**: 두 CLI 모두 사용자 머신에 미리 로그인되어 있다고 가정.
-   `nv doctor` 커맨드(Phase 2)로 사전 체크 추가 예정.
+   `nv doctor` 커맨드로 사전 체크한다.
    2026-05-06 현재 `nv doctor`는 config를 검증하고 real adapter 모드에서
    `claude`, `codex` 바이너리가 `PATH`에 있는지 확인한다. mock adapter
    모드는 외부 바이너리 없이 통과한다.
 3. **동시 파일 쓰기 충돌**: 두 모델이 동시에 같은 파일을 수정하려 할
    때 — MVP는 lead만 실제 파일 시스템에 쓰고, reviewer는 항상
-   `.nerve/scratch/reviewer/` 로 격리. Phase 2에서 cross-firing 도입 시
-   재검토.
+   `.nerve/scratch/reviewer/` 로 격리. 2026-05-06 현재 cross-firing은
+   `.nerve/scratch` watcher와 reviewer hook으로 처리한다.
 4. **비용 통제**: refinement loop이 무한 반복되지 않도록
-   `max_refinement_rounds` 외에 **token budget** 상한도 필요 (Phase 2).
+   `max_refinement_rounds` 외에 **token budget** 상한을 둔다.
    2026-05-06 현재 `orchestration.max_total_tokens`와
    `orchestration.max_estimated_cost_microusd`를 지원하며, adapter가
    `UsageStats`를 보고하면 초과 시 loop을 중단하고 apply를 막는다.
