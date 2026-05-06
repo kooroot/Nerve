@@ -1,0 +1,12 @@
+[package]
+name = "nerve-types"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+nerve-patch = { path = "../nerve-patch" }
+serde.workspace = true
+uuid.workspace = true
+

@@ -1,0 +1,26 @@
+{
+  "orchestration": {
+    "default_strategy": "consensus",
+    "max_refinement_rounds": 2,
+    "conflict_policy": "lead_priority"
+  },
+  "roles": {
+    "architect": "claude-code",
+    "reviewer": "codex"
+  },
+  "profiles": [
+    {
+      "id": "blockchain_dev",
+      "match_rules": ["*.rs", "*.sol", "contract"],
+      "lead": "claude-code",
+      "reviewer": "codex",
+      "review_strictness": "high"
+    },
+    {
+      "id": "rapid_fix",
+      "match_rules": ["fix", "ui"],
+      "lead": "codex",
+      "reviewer": "claude-code"
+    }
+  ]
+}

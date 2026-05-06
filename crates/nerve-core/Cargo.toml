@@ -1,0 +1,17 @@
+[package]
+name = "nerve-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+nerve-adapter = { path = "../nerve-adapter" }
+nerve-config = { path = "../nerve-config" }
+nerve-patch = { path = "../nerve-patch" }
+nerve-types = { path = "../nerve-types" }
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

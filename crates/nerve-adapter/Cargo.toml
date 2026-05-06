@@ -1,0 +1,14 @@
+[package]
+name = "nerve-adapter"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+nerve-patch = { path = "../nerve-patch" }
+nerve-types = { path = "../nerve-types" }
+tokio.workspace = true
+tracing.workspace = true
+

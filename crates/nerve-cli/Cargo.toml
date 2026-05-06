@@ -1,0 +1,19 @@
+[package]
+name = "nerve-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "nv"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+nerve-adapter = { path = "../nerve-adapter" }
+nerve-config = { path = "../nerve-config" }
+nerve-core = { path = "../nerve-core" }
+nerve-types = { path = "../nerve-types" }
+tokio.workspace = true
+tracing-subscriber.workspace = true

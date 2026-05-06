@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/nerve-adapter",
+    "crates/nerve-cli",
+    "crates/nerve-config",
+    "crates/nerve-core",
+    "crates/nerve-patch",
+    "crates/nerve-types",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/kooroot/Nerve"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+globset = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+similar = "2.7"
+tempfile = "3.14"
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
