@@ -29,6 +29,13 @@ pub enum PatchError {
     Unsupported { message: String },
     #[error("invalid patch state for `{path}`: {message}")]
     InvalidOperationState { path: PathBuf, message: String },
+    #[error(
+        "patch apply failed and automatic rollback failed: apply error: {apply_error}; rollback error: {rollback_error}"
+    )]
+    RollbackFailed {
+        apply_error: String,
+        rollback_error: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, PatchError>;
@@ -129,18 +136,24 @@ impl NvPatch {
 
     pub fn apply(&self, cwd: &Path, dry_run: bool) -> Result<ApplyReport> {
         self.validate(cwd, false)?;
+        let changed_files = self.changed_files();
         if !dry_run {
+            let snapshots = self.capture_snapshots(cwd)?;
             for file in &self.files {
-                file.apply(cwd)?;
+                if let Err(apply_error) = file.apply(cwd) {
+                    if let Err(rollback_error) = restore_snapshots(cwd, &snapshots) {
+                        return Err(PatchError::RollbackFailed {
+                            apply_error: apply_error.to_string(),
+                            rollback_error: rollback_error.to_string(),
+                        });
+                    }
+                    return Err(apply_error);
+                }
             }
         }
         Ok(ApplyReport {
             patch_id: self.id.clone(),
-            changed_files: self
-                .files
-                .iter()
-                .flat_map(FilePatch::changed_paths)
-                .collect(),
+            changed_files,
             dry_run,
         })
     }
@@ -154,14 +167,62 @@ impl NvPatch {
         }
         Ok(ApplyReport {
             patch_id: self.id.clone(),
-            changed_files: self
-                .files
-                .iter()
-                .flat_map(FilePatch::changed_paths)
-                .collect(),
+            changed_files: self.changed_files(),
             dry_run,
         })
     }
+
+    fn changed_files(&self) -> Vec<PathBuf> {
+        self.files
+            .iter()
+            .flat_map(FilePatch::changed_paths)
+            .collect()
+    }
+
+    fn capture_snapshots(&self, cwd: &Path) -> Result<Vec<FileSnapshot>> {
+        self.changed_files()
+            .into_iter()
+            .map(|path| FileSnapshot::capture(cwd, path))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileSnapshot {
+    path: PathBuf,
+    state: FileState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileState {
+    Present(String),
+    Missing,
+}
+
+impl FileSnapshot {
+    fn capture(cwd: &Path, path: PathBuf) -> Result<Self> {
+        ensure_safe_relative_path(cwd, &path)?;
+        let state = if target_exists(cwd, &path) {
+            FileState::Present(read_to_string(cwd, &path)?)
+        } else {
+            FileState::Missing
+        };
+        Ok(Self { path, state })
+    }
+
+    fn restore(&self, cwd: &Path) -> Result<()> {
+        match &self.state {
+            FileState::Present(value) => write_string(cwd, &self.path, value),
+            FileState::Missing => remove_file(cwd, &self.path),
+        }
+    }
+}
+
+fn restore_snapshots(cwd: &Path, snapshots: &[FileSnapshot]) -> Result<()> {
+    for snapshot in snapshots.iter().rev() {
+        snapshot.restore(cwd)?;
+    }
+    Ok(())
 }
 
 impl FilePatch {
@@ -380,7 +441,14 @@ fn remove_file(cwd: &Path, relative: &Path) -> Result<()> {
     let path = cwd.join(relative);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source)
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(())
+        }
         Err(source) => Err(PatchError::Io {
             path: relative.to_path_buf(),
             source,
@@ -1146,5 +1214,22 @@ rename to new.txt
         patch.rollback(dir.path(), false).unwrap();
         assert_eq!(fs::read_to_string(&old_path).unwrap(), "before\n");
         assert!(!new_path.exists());
+    }
+
+    #[test]
+    fn apply_rolls_back_prior_files_when_later_file_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocking_path = dir.path().join("blocked");
+        let nested_path = dir.path().join("blocked/child.txt");
+        let patch = NvPatch::new(vec![
+            FilePatch::create("blocked", "file, not a directory\n"),
+            FilePatch::create("blocked/child.txt", "child\n"),
+        ]);
+
+        let err = patch.apply(dir.path(), false).unwrap_err();
+
+        assert!(matches!(err, PatchError::Io { .. }));
+        assert!(!blocking_path.exists());
+        assert!(!nested_path.exists());
     }
 }

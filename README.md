@@ -258,12 +258,13 @@ Nerve is built around conservative file mutation:
 - `NvPatch` validates the current file SHA-256 before applying.
 - `NvPatch` validates the modified file SHA-256 before rollback.
 - `NvPatch` rejects absolute paths, `..` traversal, and symlinked directories that resolve outside the working directory.
+- Multi-file apply captures pre-apply snapshots and restores them automatically if any file operation fails.
 - Created files are removed during rollback.
 - Deleted files are restored from the original content during rollback.
 - Reviewer `BLOCK` can prevent application depending on conflict policy.
 - Generated runtime state under `.nerve/` is ignored by Git.
 
-The next patch-model task is atomic multi-file apply with automatic rollback on failure.
+The next core task is machine-readable session reports for downstream tooling.
 
 ## Development
 
@@ -283,6 +284,7 @@ Current test coverage verifies:
 - Patch apply and rollback round trip
 - Hash mismatch rejection
 - Unified diff parsing for existing, new, deleted, and renamed files
+- Atomic multi-file apply rollback on mid-apply failure
 - Created-file rollback removal and deleted-file rollback restore
 - Pure rename and rename-with-content-change apply/rollback
 - Unsafe path rejection for traversal and symlink escapes
@@ -327,7 +329,7 @@ User: "add a health endpoint"
 - Persist Synapse history under `.nerve/`.
 - Add `.nerve/patches/index.json`.
 - Add `nv history`, `nv resume`, `nv list`, `nv apply <id>`, and `nv rollback <id>`.
-- Add atomic multi-file apply with automatic rollback on failure.
+- Add temp-file based write staging for stronger crash safety.
 - Add token and cost budgets per session.
 
 ### Phase 3
