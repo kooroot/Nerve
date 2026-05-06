@@ -10,6 +10,7 @@ nerve-adapter = { path = "../nerve-adapter" }
 nerve-config = { path = "../nerve-config" }
 nerve-patch = { path = "../nerve-patch" }
 nerve-types = { path = "../nerve-types" }
+serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

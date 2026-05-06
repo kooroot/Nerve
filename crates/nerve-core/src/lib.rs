@@ -3,6 +3,7 @@ use nerve_adapter::ModelAdapter;
 use nerve_config::{Config, ConflictPolicy, ProfileSelection, ReviewStrictness};
 use nerve_patch::NvPatch;
 use nerve_types::{AgentEvent, AgentOutput, ReviewerFeedback, RoundRecord, Task, Verdict};
+use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
 
@@ -21,7 +22,7 @@ pub struct SynapseState {
     pub events: Vec<AgentEvent>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RunReport {
     pub task: Task,
     pub selection: ProfileSelection,

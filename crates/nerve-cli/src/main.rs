@@ -18,6 +18,9 @@ struct Cli {
     #[arg(long, help = "Apply the final patch after review")]
     apply: bool,
 
+    #[arg(long, help = "Emit a machine-readable JSON session report")]
+    json: bool,
+
     #[arg(long, env = "NERVE_ADAPTER", default_value = "real")]
     adapter: AdapterMode,
 }
@@ -64,17 +67,28 @@ async fn main() -> Result<()> {
             let prompt = cli
                 .prompt
                 .context("missing prompt; usage: nv \"add a /health endpoint\"")?;
-            run_prompt(prompt, cli.apply, matches!(cli.adapter, AdapterMode::Mock)).await
+            run_prompt(
+                prompt,
+                cli.apply,
+                cli.json,
+                matches!(cli.adapter, AdapterMode::Mock),
+            )
+            .await
         }
     }
 }
 
-async fn run_prompt(prompt: String, apply: bool, mock: bool) -> Result<()> {
+async fn run_prompt(prompt: String, apply: bool, json: bool, mock: bool) -> Result<()> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let config = Config::load_from(&cwd)?;
     let task = Task::new(prompt, &cwd);
     let adapters = default_adapters(mock);
     let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply }).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
 
     println!("Nerve session {}", report.task.id);
     println!(

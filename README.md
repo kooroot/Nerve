@@ -55,6 +55,7 @@ Nerve is in a Phase 1 MVP state.
 | Claude/Codex subprocess boundary | Scaffolded |
 | Real CLI JSON parsing | Generic JSONL string extraction |
 | Real unified-diff to `NvPatch` conversion | Implemented for create/modify/delete/rename diffs |
+| Machine-readable session reports | Implemented with `--json` |
 | Persistent history / patch index | Roadmap |
 | Real-time cross-firing / TUI | Roadmap |
 
@@ -116,6 +117,7 @@ Nerve exposes one CLI today:
 | `nv --apply "<task>"` | Apply the accepted structured patch |
 | `nv --adapter mock "<task>"` | Use deterministic local mock adapters |
 | `nv --adapter real "<task>"` | Spawn real `claude` and `codex` subprocesses |
+| `nv --json "<task>"` | Emit a structured session report for downstream tooling |
 | `nv config validate` | Validate `nerve.config.json` |
 
 Real adapter mode expects these CLIs on `PATH` and already authenticated:
@@ -132,6 +134,16 @@ Verified real output shapes:
 - Both shapes are parsed through generic JSON string extraction before unified diff parsing.
 
 The subprocess boundary is intentionally CLI-first. Nerve does not depend on a vendor SDK in Phase 1; it treats model tools as external executables and streams their output into the orchestration state.
+
+### Session Reports
+
+Use `--json` when another tool needs to consume the session result:
+
+```bash
+NERVE_ADAPTER=mock cargo run -p nerve-cli -- --json "add a health endpoint"
+```
+
+The JSON report includes the task, selected profile, round records, final reviewer verdict, final patch, captured agent events, and whether the patch was applied or blocked.
 
 ## Architecture
 
@@ -264,7 +276,7 @@ Nerve is built around conservative file mutation:
 - Reviewer `BLOCK` can prevent application depending on conflict policy.
 - Generated runtime state under `.nerve/` is ignored by Git.
 
-The next core task is machine-readable session reports for downstream tooling.
+Runtime persistence and patch indexing remain Phase 2 roadmap work.
 
 ## Development
 
@@ -292,6 +304,7 @@ Current test coverage verifies:
 - Fenced Claude JSONL diff extraction
 - Fixture-based real adapter CLI dry-run and apply paths
 - CLI smoke test with dry-run diff output
+- CLI JSON report output
 
 ## How It Works
 
@@ -320,9 +333,9 @@ User: "add a health endpoint"
 
 ## Roadmap
 
-### Phase 1 Completion
+### Phase 1
 
-- Emit machine-readable session reports.
+- Phase 1 MVP is implemented, including machine-readable session reports.
 
 ### Phase 2
 
