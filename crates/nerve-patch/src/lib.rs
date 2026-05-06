@@ -57,6 +57,7 @@ pub enum FileOperation {
     Modify,
     Create,
     Delete,
+    Rename { from: PathBuf },
 }
 
 fn default_file_operation() -> FileOperation {
@@ -88,13 +89,13 @@ impl NvPatch {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.files.iter().all(|file| file.original == file.modified)
+        self.files.iter().all(FilePatch::is_noop)
     }
 
     pub fn to_unified_diff(&self) -> String {
         let mut out = String::new();
         for file in &self.files {
-            if file.original == file.modified {
+            if file.is_noop() {
                 continue;
             }
             if !out.is_empty() {
@@ -135,7 +136,11 @@ impl NvPatch {
         }
         Ok(ApplyReport {
             patch_id: self.id.clone(),
-            changed_files: self.files.iter().map(|file| file.path.clone()).collect(),
+            changed_files: self
+                .files
+                .iter()
+                .flat_map(FilePatch::changed_paths)
+                .collect(),
             dry_run,
         })
     }
@@ -149,7 +154,11 @@ impl NvPatch {
         }
         Ok(ApplyReport {
             patch_id: self.id.clone(),
-            changed_files: self.files.iter().map(|file| file.path.clone()).collect(),
+            changed_files: self
+                .files
+                .iter()
+                .flat_map(FilePatch::changed_paths)
+                .collect(),
             dry_run,
         })
     }
@@ -172,6 +181,20 @@ impl FilePatch {
         Self::with_operation(path, FileOperation::Delete, original, "")
     }
 
+    pub fn rename(
+        from: impl Into<PathBuf>,
+        to: impl Into<PathBuf>,
+        original: impl Into<String>,
+        modified: impl Into<String>,
+    ) -> Self {
+        Self::with_operation(
+            to,
+            FileOperation::Rename { from: from.into() },
+            original,
+            modified,
+        )
+    }
+
     pub fn with_operation(
         path: impl Into<PathBuf>,
         operation: FileOperation,
@@ -191,13 +214,28 @@ impl FilePatch {
     }
 
     pub fn to_unified_diff(&self) -> String {
-        let old_path = match self.operation {
+        if let FileOperation::Rename { from } = &self.operation
+            && self.original == self.modified
+        {
+            return format!(
+                "diff --git a/{} b/{}\nsimilarity index 100%\nrename from {}\nrename to {}\n",
+                from.display(),
+                self.path.display(),
+                from.display(),
+                self.path.display()
+            );
+        }
+
+        let old_path = match &self.operation {
             FileOperation::Create => "/dev/null".to_string(),
+            FileOperation::Rename { from } => format!("a/{}", from.display()),
             FileOperation::Modify | FileOperation::Delete => format!("a/{}", self.path.display()),
         };
-        let new_path = match self.operation {
+        let new_path = match &self.operation {
             FileOperation::Delete => "/dev/null".to_string(),
-            FileOperation::Modify | FileOperation::Create => format!("b/{}", self.path.display()),
+            FileOperation::Modify | FileOperation::Create | FileOperation::Rename { .. } => {
+                format!("b/{}", self.path.display())
+            }
         };
         TextDiff::from_lines(&self.original, &self.modified)
             .unified_diff()
@@ -207,17 +245,21 @@ impl FilePatch {
 
     fn validate(&self, cwd: &Path, rollback: bool) -> Result<()> {
         ensure_safe_relative_path(cwd, &self.path)?;
+        if let FileOperation::Rename { from } = &self.operation {
+            ensure_safe_relative_path(cwd, from)?;
+        }
         self.validate_operation_state(cwd, rollback)?;
         let expected = if rollback {
             &self.modified_sha256
         } else {
             &self.original_sha256
         };
-        let current = read_to_string(cwd, &self.path)?;
+        let validation_path = self.validation_path(rollback);
+        let current = read_to_string(cwd, validation_path)?;
         let actual = sha256_hex(&current);
         if &actual != expected {
             return Err(PatchError::HashMismatch {
-                path: self.path.clone(),
+                path: validation_path.to_path_buf(),
                 expected: expected.clone(),
                 actual,
             });
@@ -239,13 +281,35 @@ impl FilePatch {
                     message: "delete target does not exist".to_string(),
                 })
             }
+            (FileOperation::Rename { from }, false) if !target_exists(cwd, from) => {
+                Err(PatchError::InvalidOperationState {
+                    path: from.clone(),
+                    message: "rename source does not exist".to_string(),
+                })
+            }
+            (FileOperation::Rename { .. }, false) if target_exists(cwd, &self.path) => {
+                Err(PatchError::InvalidOperationState {
+                    path: self.path.clone(),
+                    message: "rename target already exists".to_string(),
+                })
+            }
+            (FileOperation::Rename { from }, true) if target_exists(cwd, from) => {
+                Err(PatchError::InvalidOperationState {
+                    path: from.clone(),
+                    message: "rename rollback source already exists".to_string(),
+                })
+            }
             _ => Ok(()),
         }
     }
 
     fn apply(&self, cwd: &Path) -> Result<()> {
-        match self.operation {
+        match &self.operation {
             FileOperation::Delete => remove_file(cwd, &self.path),
+            FileOperation::Rename { from } => {
+                write_string(cwd, &self.path, &self.modified)?;
+                remove_file(cwd, from)
+            }
             FileOperation::Modify | FileOperation::Create => {
                 write_string(cwd, &self.path, &self.modified)
             }
@@ -253,12 +317,36 @@ impl FilePatch {
     }
 
     fn rollback(&self, cwd: &Path) -> Result<()> {
-        match self.operation {
+        match &self.operation {
             FileOperation::Create => remove_file(cwd, &self.path),
+            FileOperation::Rename { from } => {
+                write_string(cwd, from, &self.original)?;
+                remove_file(cwd, &self.path)
+            }
             FileOperation::Modify | FileOperation::Delete => {
                 write_string(cwd, &self.path, &self.original)
             }
         }
+    }
+
+    fn validation_path(&self, rollback: bool) -> &Path {
+        match (&self.operation, rollback) {
+            (FileOperation::Rename { from }, false) => from,
+            _ => &self.path,
+        }
+    }
+
+    fn changed_paths(&self) -> Vec<PathBuf> {
+        match &self.operation {
+            FileOperation::Rename { from } => vec![from.clone(), self.path.clone()],
+            FileOperation::Modify | FileOperation::Create | FileOperation::Delete => {
+                vec![self.path.clone()]
+            }
+        }
+    }
+
+    fn is_noop(&self) -> bool {
+        self.original == self.modified && !matches!(self.operation, FileOperation::Rename { .. })
     }
 }
 
@@ -308,26 +396,40 @@ fn target_exists(cwd: &Path, relative: &Path) -> bool {
 struct ParsedFileDiff {
     old_path: Option<PathBuf>,
     new_path: Option<PathBuf>,
+    rename_from: Option<PathBuf>,
+    rename_to: Option<PathBuf>,
     hunks: Vec<ParsedHunk>,
 }
 
 impl ParsedFileDiff {
     fn to_file_patch(&self, cwd: &Path) -> Result<FilePatch> {
         let (path, operation) = match (&self.old_path, &self.new_path) {
+            _ if self.rename_from.is_some() || self.rename_to.is_some() => {
+                let from =
+                    self.rename_from
+                        .clone()
+                        .ok_or_else(|| PatchError::InvalidUnifiedDiff {
+                            message: "rename diff is missing `rename from`".to_string(),
+                        })?;
+                let to = self
+                    .rename_to
+                    .clone()
+                    .ok_or_else(|| PatchError::InvalidUnifiedDiff {
+                        message: "rename diff is missing `rename to`".to_string(),
+                    })?;
+                (to, FileOperation::Rename { from })
+            }
             (None, Some(new_path)) => (new_path.clone(), FileOperation::Create),
             (Some(old_path), None) => (old_path.clone(), FileOperation::Delete),
             (Some(old_path), Some(new_path)) if old_path == new_path => {
                 (new_path.clone(), FileOperation::Modify)
             }
-            (Some(old_path), Some(new_path)) => {
-                return Err(PatchError::Unsupported {
-                    message: format!(
-                        "file rename from `{}` to `{}` is not supported by NvPatch yet",
-                        old_path.display(),
-                        new_path.display()
-                    ),
-                });
-            }
+            (Some(old_path), Some(new_path)) => (
+                new_path.clone(),
+                FileOperation::Rename {
+                    from: old_path.clone(),
+                },
+            ),
             (None, None) => {
                 return Err(PatchError::InvalidUnifiedDiff {
                     message: "file diff has neither old nor new path".to_string(),
@@ -336,11 +438,26 @@ impl ParsedFileDiff {
         };
 
         ensure_safe_relative_path(cwd, &path)?;
-        let original = match operation {
+        if let FileOperation::Rename { from } = &operation {
+            ensure_safe_relative_path(cwd, from)?;
+        }
+        let original = match &operation {
             FileOperation::Create => String::new(),
+            FileOperation::Rename { from } => read_to_string(cwd, from)?,
             FileOperation::Modify | FileOperation::Delete => read_to_string(cwd, &path)?,
         };
-        let modified = apply_hunks(&original, &self.hunks)?;
+        let modified = if self.hunks.is_empty() {
+            match &operation {
+                FileOperation::Rename { .. } => original.clone(),
+                _ => {
+                    return Err(PatchError::InvalidUnifiedDiff {
+                        message: "file diff has no hunks".to_string(),
+                    });
+                }
+            }
+        } else {
+            apply_hunks(&original, &self.hunks)?
+        };
 
         Ok(FilePatch::with_operation(
             path, operation, original, modified,
@@ -413,12 +530,72 @@ fn parse_file_diffs(diff: &str) -> Result<Vec<ParsedFileDiff>> {
             files.push(ParsedFileDiff {
                 old_path: old_header,
                 new_path: new_header,
+                rename_from: None,
+                rename_to: None,
                 hunks,
             });
         }
     }
 
+    files.extend(parse_pure_rename_diffs(&lines)?);
+
     Ok(files)
+}
+
+fn parse_pure_rename_diffs(lines: &[&str]) -> Result<Vec<ParsedFileDiff>> {
+    let mut files = Vec::new();
+    let mut index = 0;
+
+    while index < lines.len() {
+        if !lines[index].starts_with("diff --git ") {
+            index += 1;
+            continue;
+        }
+
+        let block_start = index;
+        index += 1;
+        while index < lines.len() && !lines[index].starts_with("diff --git ") {
+            index += 1;
+        }
+
+        let block = &lines[block_start..index];
+        if block
+            .iter()
+            .any(|line| parse_file_header(line, "--- ").is_some())
+        {
+            continue;
+        }
+
+        let rename_from = parse_rename_path(block, "rename from ")?;
+        let rename_to = parse_rename_path(block, "rename to ")?;
+        if rename_from.is_some() || rename_to.is_some() {
+            files.push(ParsedFileDiff {
+                old_path: None,
+                new_path: None,
+                rename_from,
+                rename_to,
+                hunks: Vec::new(),
+            });
+        }
+    }
+
+    Ok(files)
+}
+
+fn parse_rename_path(lines: &[&str], prefix: &str) -> Result<Option<PathBuf>> {
+    let Some(line) = lines
+        .iter()
+        .find_map(|line| line.trim_end_matches(['\r', '\n']).strip_prefix(prefix))
+    else {
+        return Ok(None);
+    };
+
+    let token =
+        parse_diff_path_token(line.trim_start()).ok_or_else(|| PatchError::InvalidUnifiedDiff {
+            message: format!("empty `{}` path", prefix.trim_end()),
+        })?;
+
+    normalize_diff_path(&token)
 }
 
 fn parse_file_header(line: &str, prefix: &str) -> Option<Option<PathBuf>> {
@@ -887,5 +1064,87 @@ diff --git a/new.txt b/new.txt
 
         patch.rollback(dir.path(), false).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "remove\n");
+    }
+
+    #[test]
+    fn parses_and_applies_pure_file_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old.txt");
+        let new_path = dir.path().join("new.txt");
+        fs::write(&old_path, "same\n").unwrap();
+        let diff = "\
+diff --git a/old.txt b/new.txt
+similarity index 100%
+rename from old.txt
+rename to new.txt
+";
+
+        let patch = NvPatch::from_unified_diff(dir.path(), diff)
+            .unwrap()
+            .unwrap();
+
+        assert!(!patch.is_empty());
+        assert_eq!(patch.files[0].path, PathBuf::from("new.txt"));
+        assert_eq!(
+            patch.files[0].operation,
+            FileOperation::Rename {
+                from: PathBuf::from("old.txt")
+            }
+        );
+        assert_eq!(patch.files[0].original, "same\n");
+        assert_eq!(patch.files[0].modified, "same\n");
+        assert!(patch.to_unified_diff().contains("rename from old.txt"));
+
+        let report = patch.apply(dir.path(), false).unwrap();
+        assert_eq!(
+            report.changed_files,
+            vec![PathBuf::from("old.txt"), PathBuf::from("new.txt")]
+        );
+        assert!(!old_path.exists());
+        assert_eq!(fs::read_to_string(&new_path).unwrap(), "same\n");
+
+        patch.rollback(dir.path(), false).unwrap();
+        assert_eq!(fs::read_to_string(&old_path).unwrap(), "same\n");
+        assert!(!new_path.exists());
+    }
+
+    #[test]
+    fn parses_and_applies_rename_with_content_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old.txt");
+        let new_path = dir.path().join("new.txt");
+        fs::write(&old_path, "before\n").unwrap();
+        let diff = "\
+diff --git a/old.txt b/new.txt
+similarity index 80%
+rename from old.txt
+rename to new.txt
+--- a/old.txt
++++ b/new.txt
+@@ -1 +1 @@
+-before
++after
+";
+
+        let patch = NvPatch::from_unified_diff(dir.path(), diff)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            patch.files[0].operation,
+            FileOperation::Rename {
+                from: PathBuf::from("old.txt")
+            }
+        );
+        assert_eq!(patch.files[0].original, "before\n");
+        assert_eq!(patch.files[0].modified, "after\n");
+
+        patch.apply(dir.path(), false).unwrap();
+        assert!(!old_path.exists());
+        assert_eq!(fs::read_to_string(&new_path).unwrap(), "after\n");
+
+        patch.rollback(dir.path(), false).unwrap();
+        assert_eq!(fs::read_to_string(&old_path).unwrap(), "before\n");
+        assert!(!new_path.exists());
     }
 }

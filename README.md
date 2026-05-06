@@ -54,11 +54,11 @@ Nerve is in a Phase 1 MVP state.
 | Hash-checked patch apply/rollback | Implemented and tested |
 | Claude/Codex subprocess boundary | Scaffolded |
 | Real CLI JSON parsing | Generic JSONL string extraction |
-| Real unified-diff to `NvPatch` conversion | Implemented for create/modify/delete diffs |
+| Real unified-diff to `NvPatch` conversion | Implemented for create/modify/delete/rename diffs |
 | Persistent history / patch index | Roadmap |
 | Real-time cross-firing / TUI | Roadmap |
 
-Important: the mock adapter path produces structured `NvPatch` values directly. The real subprocess path now extracts unified diffs from raw text or JSONL string fields and converts create/modify/delete diffs into safe `NvPatch` values. File rename is rejected until the patch model represents moves explicitly.
+Important: the mock adapter path produces structured `NvPatch` values directly. The real subprocess path now extracts unified diffs from raw text or JSONL string fields and converts create/modify/delete/rename diffs into safe `NvPatch` values.
 
 ## Quick Start
 
@@ -263,7 +263,7 @@ Nerve is built around conservative file mutation:
 - Reviewer `BLOCK` can prevent application depending on conflict policy.
 - Generated runtime state under `.nerve/` is ignored by Git.
 
-The next patch-model task is explicit rename support; renames are currently rejected instead of being approximated as delete/create.
+The next patch-model task is atomic multi-file apply with automatic rollback on failure.
 
 ## Development
 
@@ -282,8 +282,9 @@ Current test coverage verifies:
 - Mock lead/reviewer refinement until `LGTM`
 - Patch apply and rollback round trip
 - Hash mismatch rejection
-- Unified diff parsing for existing, new, and deleted files
+- Unified diff parsing for existing, new, deleted, and renamed files
 - Created-file rollback removal and deleted-file rollback restore
+- Pure rename and rename-with-content-change apply/rollback
 - Unsafe path rejection for traversal and symlink escapes
 - Real adapter raw text / JSONL diff extraction
 - Fenced Claude JSONL diff extraction
@@ -319,7 +320,6 @@ User: "add a health endpoint"
 
 ### Phase 1 Completion
 
-- Add explicit rename support to the patch model.
 - Emit machine-readable session reports.
 
 ### Phase 2
