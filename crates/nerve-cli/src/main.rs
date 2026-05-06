@@ -6,9 +6,14 @@ use nerve_core::store::NerveStore;
 use nerve_core::{RunOptions, run_synaptic_loop};
 use nerve_types::{AgentEvent, Task, Verdict};
 use std::env;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
-#[command(name = "nv", about = "Nerve reflexive AI orchestration CLI")]
+#[command(
+    name = "nv",
+    about = "Nerve reflexive AI orchestration CLI",
+    subcommand_precedence_over_arg = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -65,6 +70,8 @@ enum Command {
         #[arg(help = "Patch id from `nv list`")]
         patch_id: String,
     },
+    #[command(about = "Check config and adapter prerequisites")]
+    Doctor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -167,6 +174,29 @@ async fn main() -> Result<()> {
             print_changed_files(&report.changed_files);
             Ok(())
         }
+        Some(Command::Doctor) => {
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            Config::load_from(&cwd)?;
+            println!("config: ok");
+
+            match cli.adapter {
+                AdapterMode::Mock => {
+                    println!("adapter: mock ok");
+                    Ok(())
+                }
+                AdapterMode::Real => {
+                    let claude = find_on_path("claude");
+                    let codex = find_on_path("codex");
+                    print_doctor_check("claude", &claude);
+                    print_doctor_check("codex", &codex);
+                    if claude.is_some() && codex.is_some() {
+                        Ok(())
+                    } else {
+                        anyhow::bail!("real adapter prerequisites are missing")
+                    }
+                }
+            }
+        }
         None => {
             let prompt = cli
                 .prompt
@@ -268,5 +298,23 @@ fn print_events(events: &[AgentEvent]) {
 fn print_changed_files(paths: &[std::path::PathBuf]) {
     for path in paths {
         println!("- {}", path.display());
+    }
+}
+
+fn find_on_path(binary: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(binary))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn print_doctor_check(binary: &str, path: &Option<PathBuf>) {
+    match path {
+        Some(path) => println!("{binary}: {}", path.display()),
+        None => println!("{binary}: missing"),
     }
 }

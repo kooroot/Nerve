@@ -124,6 +124,7 @@ Nerve exposes one CLI today:
 | `nv list` | List indexed patches from `.nerve/patches/index.json` |
 | `nv apply <patch-id>` | Apply a stored patch by id |
 | `nv rollback <patch-id>` | Roll back a stored patch by id |
+| `nv doctor` | Check config and adapter prerequisites |
 | `nv config validate` | Validate `nerve.config.json` |
 
 Real adapter mode expects these CLIs on `PATH` and already authenticated:
@@ -164,6 +165,10 @@ nv rollback <patch-id>
 ```
 
 Use `--json` with `history`, `resume`, and `list` when another tool needs the stored data.
+
+### Doctor
+
+Use `nv doctor` to validate local prerequisites. In real adapter mode it checks that `claude` and `codex` are available on `PATH`; in mock mode it validates config and the built-in mock adapter path.
 
 ## Architecture
 
@@ -350,6 +355,7 @@ Current test coverage verifies:
 - CLI smoke test with dry-run diff output
 - CLI JSON report output
 - Persistent session history and patch index commands
+- Doctor checks for config and adapter prerequisites
 - Token and estimated-cost budget enforcement when adapter usage is reported
 - Strategy dispatch for `consensus`, `pipeline`, and `tournament`
 
@@ -390,6 +396,7 @@ User: "add a health endpoint"
 - `nv history`, `nv resume`, `nv list`, `nv apply <id>`, and `nv rollback <id>` are implemented.
 - Temp-file based write staging is implemented for patch file writes.
 - Token and estimated-cost budgets are implemented for adapters that report usage.
+- `nv doctor` checks config validity and real adapter binaries.
 - Real-time cross-firing remains roadmap.
 
 ### Phase 3

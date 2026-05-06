@@ -117,6 +117,22 @@ fn mock_cli_lists_applies_and_rolls_back_indexed_patch() {
     assert!(!fixture.mock_output().exists());
 }
 
+#[test]
+fn mock_cli_doctor_passes_without_external_adapters() {
+    let fixture = MockCliFixture::new();
+    let output = fixture
+        .command()
+        .args(["--adapter", "mock"])
+        .arg("doctor")
+        .output()
+        .expect("failed to run nv doctor");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("config: ok"));
+    assert!(stdout.contains("adapter: mock ok"));
+}
+
 struct MockCliFixture {
     _tempdir: tempfile::TempDir,
     cwd: PathBuf,
