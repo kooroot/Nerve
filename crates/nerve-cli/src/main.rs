@@ -239,6 +239,12 @@ fn print_report(report: &nerve_core::RunReport, apply_requested: bool) {
         report.rounds.len()
     );
     print_events(&report.events);
+    if !report.crossfire_feedback.is_empty() {
+        println!(
+            "Crossfire feedback: {} event(s)",
+            report.crossfire_feedback.len()
+        );
+    }
     println!("Verdict: {:?}", report.final_feedback.verdict);
     println!(
         "Usage: input={} output={} total={} cost_microusd={}",

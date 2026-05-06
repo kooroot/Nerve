@@ -58,7 +58,8 @@ Nerve is in a Phase 1 MVP state.
 | Machine-readable session reports | Implemented with `--json` |
 | Persistent history / patch index | Implemented under `.nerve/` |
 | Strategy dispatch | Implemented for `consensus`, `pipeline`, and `tournament` |
-| Real-time cross-firing / TUI | Roadmap |
+| Real-time cross-firing | Implemented for `.nerve/scratch` watcher feedback |
+| TUI / cmux | Roadmap |
 
 Important: the mock adapter path produces structured `NvPatch` values directly. The real subprocess path now extracts unified diffs from raw text or JSONL string fields and converts create/modify/delete/rename diffs into safe `NvPatch` values.
 
@@ -367,6 +368,7 @@ Current test coverage verifies:
 - Strategy dispatch for `consensus`, `pipeline`, and `tournament`
 - Profile `all` / `any` match rule groups
 - `merge_attempt` conflict policy patch merging
+- Scratch-file crossfire watcher feedback during lead execution
 
 ## How It Works
 
@@ -406,11 +408,11 @@ User: "add a health endpoint"
 - Temp-file based write staging is implemented for patch file writes.
 - Token and estimated-cost budgets are implemented for adapters that report usage.
 - `nv doctor` checks config validity and real adapter binaries.
-- Real-time cross-firing remains roadmap.
+- Scratch-file crossfire feedback is implemented for lead execution.
 
 ### Phase 3
 
-- Real-time cross-firing between lead and reviewer.
+- Real-time scratch-file cross-firing between lead and reviewer is implemented.
 - Profile `all` / `any` match rule groups are implemented.
 - Strategy dispatch for `consensus`, `pipeline`, and `tournament` is implemented.
 - cmux or TUI layout for lead stream, reviewer stream, and orchestrator state.

@@ -34,6 +34,18 @@ pub trait ModelAdapter: Send + Sync {
         cwd: &Path,
         tx: mpsc::Sender<AgentEvent>,
     ) -> Result<AgentOutput>;
+
+    async fn crossfire(
+        &self,
+        task: &Task,
+        scratch_summary: &str,
+        cwd: &Path,
+        strictness: &str,
+        tx: mpsc::Sender<AgentEvent>,
+    ) -> Result<ReviewerFeedback> {
+        let lead_output = AgentOutput::text("scratch", scratch_summary);
+        self.review(task, &lead_output, cwd, strictness, tx).await
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -142,6 +142,9 @@ MVP가 "순차+1라운드"에 머무른 부분을 **진짜 병렬 + 실시간 cr
 - `notify` crate로 lead가 만들어내는 임시 파일(`.nerve/scratch/`)을 감시.
 - 변경 감지 시 reviewer에게 incremental prompt 전송 — "지금까지의 변경분만
   보고 보안/성능 이슈 보고하라".
+- 2026-05-06 현재: 외부 watcher dependency 없이 `.nerve/scratch`를 polling해
+  lead 실행 중 파일 변경을 감지하고 reviewer `crossfire` hook을 호출한다.
+  결과는 `RunReport.crossfire_feedback`에 기록된다.
 
 ### 2.2 Synapse 영속화
 - `sled` 또는 `redb`로 round history를 디스크에 저장.

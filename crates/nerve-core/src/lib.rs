@@ -9,10 +9,15 @@ use nerve_types::{
     Verdict,
 };
 use serde::Serialize;
+use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::time::{Duration, sleep};
 
 pub mod store;
 
@@ -28,6 +33,7 @@ pub struct SynapseState {
     pub lead_output: Option<AgentOutput>,
     pub reviewer_feedback: Option<ReviewerFeedback>,
     pub rounds: Vec<RoundRecord>,
+    pub crossfire_feedback: Vec<ReviewerFeedback>,
     pub events: Vec<AgentEvent>,
 }
 
@@ -36,6 +42,8 @@ pub struct RunReport {
     pub task: Task,
     pub selection: ProfileSelection,
     pub rounds: Vec<RoundRecord>,
+    #[serde(default)]
+    pub crossfire_feedback: Vec<ReviewerFeedback>,
     pub final_output: AgentOutput,
     pub final_feedback: ReviewerFeedback,
     pub final_patch: Option<NvPatch>,
@@ -62,6 +70,7 @@ impl Synapse {
                 lead_output: None,
                 reviewer_feedback: None,
                 rounds: Vec::new(),
+                crossfire_feedback: Vec::new(),
                 events: Vec::new(),
             })),
             events,
@@ -84,8 +93,16 @@ impl Synapse {
         inner.rounds.push(round);
     }
 
+    pub async fn record_crossfire_feedback(&self, feedback: ReviewerFeedback) {
+        self.inner.write().await.crossfire_feedback.push(feedback);
+    }
+
     pub async fn rounds(&self) -> Vec<RoundRecord> {
         self.inner.read().await.rounds.clone()
+    }
+
+    pub async fn crossfire_feedback(&self) -> Vec<ReviewerFeedback> {
+        self.inner.read().await.crossfire_feedback.clone()
     }
 
     pub async fn events(&self) -> Vec<AgentEvent> {
@@ -116,10 +133,16 @@ pub async fn run_synaptic_loop(
         }
     });
 
-    let mut lead_output = lead
-        .implement(&task, &task.cwd, tx.clone())
-        .await
-        .with_context(|| format!("lead adapter `{}` failed", lead.id()))?;
+    let mut lead_output = collect_output_with_crossfire(
+        lead.implement(&task, &task.cwd, tx.clone()),
+        reviewer,
+        &task,
+        &selection,
+        &synapse,
+        tx.clone(),
+    )
+    .await
+    .with_context(|| format!("lead adapter `{}` failed", lead.id()))?;
     let mut usage = UsageStats::default();
     accumulate_output_usage(&mut usage, &lead_output);
 
@@ -175,10 +198,16 @@ pub async fn run_synaptic_loop(
             break;
         }
 
-        lead_output = lead
-            .refine(&task, &lead_output, &final_feedback, &task.cwd, tx.clone())
-            .await
-            .with_context(|| format!("lead adapter `{}` failed during refinement", lead.id()))?;
+        lead_output = collect_output_with_crossfire(
+            lead.refine(&task, &lead_output, &final_feedback, &task.cwd, tx.clone()),
+            reviewer,
+            &task,
+            &selection,
+            &synapse,
+            tx.clone(),
+        )
+        .await
+        .with_context(|| format!("lead adapter `{}` failed during refinement", lead.id()))?;
         accumulate_output_usage(&mut usage, &lead_output);
         budget_exceeded = exceeds_budget(&usage, &config.orchestration);
         if budget_exceeded {
@@ -212,6 +241,7 @@ pub async fn run_synaptic_loop(
         task,
         selection,
         rounds: synapse.rounds().await,
+        crossfire_feedback: synapse.crossfire_feedback().await,
         final_output: lead_output,
         final_feedback,
         final_patch,
@@ -335,6 +365,7 @@ async fn run_tournament_strategy(
         task,
         selection,
         rounds: synapse.rounds().await,
+        crossfire_feedback: synapse.crossfire_feedback().await,
         final_output,
         final_feedback,
         final_patch,
@@ -389,6 +420,117 @@ fn budget_exceeded_feedback(reviewer_id: &str, usage: &UsageStats) -> ReviewerFe
             usage.total_tokens()
         ),
     }
+}
+
+async fn collect_output_with_crossfire<F>(
+    output_future: F,
+    reviewer: &dyn ModelAdapter,
+    task: &Task,
+    selection: &ProfileSelection,
+    synapse: &Synapse,
+    tx: mpsc::Sender<AgentEvent>,
+) -> Result<AgentOutput>
+where
+    F: Future<Output = Result<AgentOutput>>,
+{
+    let mut watcher = ScratchWatcher::new(task.cwd.join(".nerve/scratch"))?;
+    tokio::pin!(output_future);
+
+    loop {
+        tokio::select! {
+            output = &mut output_future => return output,
+            change = watcher.next_change() => {
+                if let Some(summary) = change? {
+                    let feedback = reviewer
+                        .crossfire(
+                            task,
+                            &summary,
+                            &task.cwd,
+                            strictness_label(&selection.review_strictness),
+                            tx.clone(),
+                        )
+                        .await?;
+                    synapse.record_crossfire_feedback(feedback).await;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScratchWatcher {
+    root: PathBuf,
+    known: BTreeMap<PathBuf, SystemTime>,
+}
+
+impl ScratchWatcher {
+    fn new(root: PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("failed to create scratch dir `{}`", root.display()))?;
+        let known = scan_scratch_files(&root)?;
+        Ok(Self { root, known })
+    }
+
+    async fn next_change(&mut self) -> Result<Option<String>> {
+        sleep(Duration::from_millis(100)).await;
+        let current = scan_scratch_files(&self.root)?;
+        let changed = current.iter().find_map(|(path, modified)| {
+            let previous = self.known.get(path);
+            if previous.is_none_or(|previous| previous < modified) {
+                Some(path.clone())
+            } else {
+                None
+            }
+        });
+        self.known = current;
+
+        let Some(path) = changed else {
+            return Ok(None);
+        };
+        let contents = std::fs::read_to_string(&path).unwrap_or_default();
+        let relative = path.strip_prefix(&self.root).unwrap_or(&path);
+        Ok(Some(format!(
+            "scratch changed: {}\n{}",
+            relative.display(),
+            truncate_for_crossfire(&contents)
+        )))
+    }
+}
+
+fn scan_scratch_files(root: &Path) -> Result<BTreeMap<PathBuf, SystemTime>> {
+    let mut files = BTreeMap::new();
+    scan_scratch_files_inner(root, &mut files)?;
+    Ok(files)
+}
+
+fn scan_scratch_files_inner(root: &Path, files: &mut BTreeMap<PathBuf, SystemTime>) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("failed to read scratch dir `{}`", root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            scan_scratch_files_inner(&path, files)?;
+        } else if metadata.is_file() {
+            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            files.insert(path, modified);
+        }
+    }
+
+    Ok(())
+}
+
+fn truncate_for_crossfire(contents: &str) -> String {
+    const LIMIT: usize = 8192;
+    if contents.len() <= LIMIT {
+        return contents.to_string();
+    }
+    format!("{}…", &contents[..LIMIT])
 }
 
 fn find_adapter<'a>(
@@ -671,6 +813,43 @@ mod tests {
         assert_eq!(report.rounds.len(), 1);
     }
 
+    #[tokio::test]
+    async fn crossfire_records_scratch_feedback_during_lead_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("watch scratch", dir.path());
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 1,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": {
+                "architect": "scratch-lead",
+                "reviewer": "scratch-reviewer"
+              },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        let adapters = vec![
+            Box::new(ScratchLeadAdapter) as Box<dyn ModelAdapter>,
+            Box::new(ScratchReviewerAdapter) as Box<dyn ModelAdapter>,
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply: false })
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
+        assert_eq!(report.crossfire_feedback.len(), 1);
+        assert!(
+            report.crossfire_feedback[0]
+                .raw_text
+                .contains("scratch changed")
+        );
+    }
+
     #[test]
     fn merge_attempt_combines_non_overlapping_patch_files() {
         let lead = AgentOutput::with_patch(
@@ -857,6 +1036,103 @@ mod tests {
             _tx: mpsc::Sender<AgentEvent>,
         ) -> Result<AgentOutput> {
             Ok(AgentOutput::text(self.id, "unused refinement"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScratchLeadAdapter;
+
+    #[async_trait::async_trait]
+    impl ModelAdapter for ScratchLeadAdapter {
+        fn id(&self) -> &str {
+            "scratch-lead"
+        }
+
+        async fn implement(
+            &self,
+            _task: &Task,
+            cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            let scratch = cwd.join(".nerve/scratch/lead");
+            std::fs::create_dir_all(&scratch)?;
+            std::fs::write(scratch.join("note.txt"), "partial implementation\n")?;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Ok(AgentOutput::text(self.id(), "lead done"))
+        }
+
+        async fn review(
+            &self,
+            _task: &Task,
+            _lead_output: &AgentOutput,
+            _cwd: &Path,
+            _strictness: &str,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<ReviewerFeedback> {
+            Ok(ReviewerFeedback::lgtm(self.id(), "LGTM"))
+        }
+
+        async fn refine(
+            &self,
+            _task: &Task,
+            _previous_output: &AgentOutput,
+            _feedback: &ReviewerFeedback,
+            _cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            Ok(AgentOutput::text(self.id(), "unused"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScratchReviewerAdapter;
+
+    #[async_trait::async_trait]
+    impl ModelAdapter for ScratchReviewerAdapter {
+        fn id(&self) -> &str {
+            "scratch-reviewer"
+        }
+
+        async fn implement(
+            &self,
+            _task: &Task,
+            _cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            Ok(AgentOutput::text(self.id(), "unused"))
+        }
+
+        async fn review(
+            &self,
+            _task: &Task,
+            _lead_output: &AgentOutput,
+            _cwd: &Path,
+            _strictness: &str,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<ReviewerFeedback> {
+            Ok(ReviewerFeedback::lgtm(self.id(), "LGTM"))
+        }
+
+        async fn refine(
+            &self,
+            _task: &Task,
+            _previous_output: &AgentOutput,
+            _feedback: &ReviewerFeedback,
+            _cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            Ok(AgentOutput::text(self.id(), "unused"))
+        }
+
+        async fn crossfire(
+            &self,
+            _task: &Task,
+            scratch_summary: &str,
+            _cwd: &Path,
+            _strictness: &str,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<ReviewerFeedback> {
+            Ok(ReviewerFeedback::lgtm(self.id(), scratch_summary))
         }
     }
 }
