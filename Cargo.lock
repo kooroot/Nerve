@@ -539,6 +539,7 @@ dependencies = [
  "nerve-patch",
  "nerve-types",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

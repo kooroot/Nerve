@@ -7,6 +7,8 @@ use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
 
+pub mod store;
+
 #[derive(Debug, Clone)]
 pub struct Synapse {
     inner: Arc<RwLock<SynapseState>>,
@@ -22,7 +24,7 @@ pub struct SynapseState {
     pub events: Vec<AgentEvent>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct RunReport {
     pub task: Task,
     pub selection: ProfileSelection,

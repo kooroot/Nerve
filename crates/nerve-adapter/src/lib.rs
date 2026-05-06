@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use nerve_patch::NvPatch;
+use nerve_patch::{FilePatch, NvPatch};
 use nerve_types::{AgentEvent, AgentOutput, Issue, IssueSeverity, ReviewerFeedback, Task, Verdict};
 use std::path::Path;
 use tokio::process::Command;
@@ -68,11 +68,10 @@ impl ModelAdapter for MockAdapter {
         tx: mpsc::Sender<AgentEvent>,
     ) -> Result<AgentOutput> {
         send_stdout(&tx, self.id(), "mock lead produced initial patch").await;
-        let patch = NvPatch::single(
+        let patch = NvPatch::new(vec![FilePatch::create(
             ".nerve/mock-output.txt",
-            "",
             format!("Task: {}\nStatus: initial\n", task.prompt),
-        );
+        )]);
         Ok(AgentOutput::with_patch(
             self.id(),
             "Initial mock implementation",
@@ -120,14 +119,13 @@ impl ModelAdapter for MockAdapter {
         tx: mpsc::Sender<AgentEvent>,
     ) -> Result<AgentOutput> {
         send_stdout(&tx, self.id(), "mock lead refined patch").await;
-        let patch = NvPatch::single(
+        let patch = NvPatch::new(vec![FilePatch::create(
             ".nerve/mock-output.txt",
-            "",
             format!(
                 "Task: {}\nStatus: refined\nReviewer: {}\n",
                 task.prompt, feedback.raw_text
             ),
-        );
+        )]);
         Ok(AgentOutput::with_patch(
             self.id(),
             "Refined mock implementation",

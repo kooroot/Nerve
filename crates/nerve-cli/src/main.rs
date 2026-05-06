@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerve_adapter::default_adapters;
 use nerve_config::Config;
+use nerve_core::store::NerveStore;
 use nerve_core::{RunOptions, run_synaptic_loop};
 use nerve_types::{AgentEvent, Task, Verdict};
 use std::env;
@@ -37,6 +38,33 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    #[command(about = "List stored Nerve sessions")]
+    History {
+        #[arg(long, help = "Emit stored sessions as JSON")]
+        json: bool,
+    },
+    #[command(about = "Print a stored session report")]
+    Resume {
+        #[arg(help = "Stored task/session id")]
+        task_id: String,
+        #[arg(long, help = "Emit the stored session report as JSON")]
+        json: bool,
+    },
+    #[command(about = "List indexed patches")]
+    List {
+        #[arg(long, help = "Emit indexed patches as JSON")]
+        json: bool,
+    },
+    #[command(about = "Apply an indexed patch")]
+    Apply {
+        #[arg(help = "Patch id from `nv list`")]
+        patch_id: String,
+    },
+    #[command(about = "Rollback an indexed patch")]
+    Rollback {
+        #[arg(help = "Patch id from `nv list`")]
+        patch_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -63,6 +91,82 @@ async fn main() -> Result<()> {
             println!("nerve.config.json is valid");
             Ok(())
         }
+        Some(Command::History { json }) => {
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            let sessions = NerveStore::new(cwd).list_sessions()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
+            } else if sessions.is_empty() {
+                println!("No Nerve sessions found.");
+            } else {
+                for session in sessions {
+                    println!(
+                        "{} | {:?} | rounds={} | applied={} | patch={} | {}",
+                        session.id,
+                        session.verdict,
+                        session.rounds,
+                        session.applied,
+                        session.patch_id.as_deref().unwrap_or("-"),
+                        session.prompt
+                    );
+                }
+            }
+            Ok(())
+        }
+        Some(Command::Resume { task_id, json }) => {
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            let report = NerveStore::new(cwd).load_report(&task_id)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_report(&report, false);
+            }
+            Ok(())
+        }
+        Some(Command::List { json }) => {
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            let patches = NerveStore::new(cwd).list_patches()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&patches)?);
+            } else if patches.is_empty() {
+                println!("No indexed patches found.");
+            } else {
+                for patch in patches {
+                    println!(
+                        "{} | {:?} | files={} | applied={} | session={} | {}",
+                        patch.id,
+                        patch.verdict,
+                        patch.file_count,
+                        patch.applied,
+                        patch.session_id,
+                        patch.prompt
+                    );
+                }
+            }
+            Ok(())
+        }
+        Some(Command::Apply { patch_id }) => {
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            let report = NerveStore::new(cwd).apply_patch(&patch_id)?;
+            println!(
+                "Applied patch {} to {} path(s).",
+                report.patch_id,
+                report.changed_files.len()
+            );
+            print_changed_files(&report.changed_files);
+            Ok(())
+        }
+        Some(Command::Rollback { patch_id }) => {
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            let report = NerveStore::new(cwd).rollback_patch(&patch_id)?;
+            println!(
+                "Rolled back patch {} across {} path(s).",
+                report.patch_id,
+                report.changed_files.len()
+            );
+            print_changed_files(&report.changed_files);
+            Ok(())
+        }
         None => {
             let prompt = cli
                 .prompt
@@ -84,12 +188,18 @@ async fn run_prompt(prompt: String, apply: bool, json: bool, mock: bool) -> Resu
     let task = Task::new(prompt, &cwd);
     let adapters = default_adapters(mock);
     let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply }).await?;
+    NerveStore::new(&cwd).save_report(&report)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
 
+    print_report(&report, apply);
+    Ok(())
+}
+
+fn print_report(report: &nerve_core::RunReport, apply_requested: bool) {
     println!("Nerve session {}", report.task.id);
     println!(
         "Profile: {} | lead={} reviewer={} rounds={}",
@@ -114,7 +224,7 @@ async fn run_prompt(prompt: String, apply: bool, json: bool, mock: bool) -> Resu
         }
         if report.applied {
             println!("Applied patch {}", patch.id);
-        } else if !apply {
+        } else if !apply_requested {
             println!("Dry run only. Re-run with --apply to change files.");
         }
     } else {
@@ -125,8 +235,6 @@ async fn run_prompt(prompt: String, apply: bool, json: bool, mock: bool) -> Resu
     if report.final_feedback.verdict != Verdict::Lgtm {
         println!("\nReviewer feedback:\n{}", report.final_feedback.raw_text);
     }
-
-    Ok(())
 }
 
 fn print_events(events: &[AgentEvent]) {
@@ -139,5 +247,11 @@ fn print_events(events: &[AgentEvent]) {
             }
             AgentEvent::Done { agent_id } => println!("[{agent_id}] done"),
         }
+    }
+}
+
+fn print_changed_files(paths: &[std::path::PathBuf]) {
+    for path in paths {
+        println!("- {}", path.display());
     }
 }

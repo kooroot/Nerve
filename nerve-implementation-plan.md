@@ -147,11 +147,18 @@ MVP가 "순차+1라운드"에 머무른 부분을 **진짜 병렬 + 실시간 cr
 - `sled` 또는 `redb`로 round history를 디스크에 저장.
 - 키: `task_id/round_n/{lead|reviewer}`, 값: `AgentOutput` JSON.
 - `nv history`, `nv resume <task-id>` 커맨드 추가.
+- 2026-05-06 현재: Phase 2의 첫 영속화 경로는 별도 DB 없이
+  `.nerve/sessions/{task_id}.json`에 `RunReport` 전체를 저장하는 파일 기반
+  구현으로 시작했다. `nv history`와 `nv resume <task-id>`가 이 저장소를
+  읽는다.
 
 ### 2.3 `nv-patch` 인덱스
 - `.nerve/patches/{ulid}.patch` + `.nerve/patches/index.json`.
 - `nv apply <id>` / `nv rollback <id>` / `nv list` 활성화.
 - atomic 보장: temp file → rename, 실패 시 자동 rollback.
+- 2026-05-06 현재: patch 본문은 `.nerve/patches/{id}.json`, 인덱스는
+  `.nerve/patches/index.json`에 저장한다. `nv list`, `nv apply <id>`,
+  `nv rollback <id>`가 활성화됐고, JSON 저장은 temp file 후 rename한다.
 
 ### 2.4 Conflict Policy 확장
 - `lead_priority` (default), `reviewer_priority`, `merge_attempt`,

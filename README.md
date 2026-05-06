@@ -56,7 +56,7 @@ Nerve is in a Phase 1 MVP state.
 | Real CLI JSON parsing | Generic JSONL string extraction |
 | Real unified-diff to `NvPatch` conversion | Implemented for create/modify/delete/rename diffs |
 | Machine-readable session reports | Implemented with `--json` |
-| Persistent history / patch index | Roadmap |
+| Persistent history / patch index | Implemented under `.nerve/` |
 | Real-time cross-firing / TUI | Roadmap |
 
 Important: the mock adapter path produces structured `NvPatch` values directly. The real subprocess path now extracts unified diffs from raw text or JSONL string fields and converts create/modify/delete/rename diffs into safe `NvPatch` values.
@@ -118,6 +118,11 @@ Nerve exposes one CLI today:
 | `nv --adapter mock "<task>"` | Use deterministic local mock adapters |
 | `nv --adapter real "<task>"` | Spawn real `claude` and `codex` subprocesses |
 | `nv --json "<task>"` | Emit a structured session report for downstream tooling |
+| `nv history` | List stored session summaries from `.nerve/sessions/` |
+| `nv resume <session-id>` | Print a stored session report |
+| `nv list` | List indexed patches from `.nerve/patches/index.json` |
+| `nv apply <patch-id>` | Apply a stored patch by id |
+| `nv rollback <patch-id>` | Roll back a stored patch by id |
 | `nv config validate` | Validate `nerve.config.json` |
 
 Real adapter mode expects these CLIs on `PATH` and already authenticated:
@@ -144,6 +149,20 @@ NERVE_ADAPTER=mock cargo run -p nerve-cli -- --json "add a health endpoint"
 ```
 
 The JSON report includes the task, selected profile, round records, final reviewer verdict, final patch, captured agent events, and whether the patch was applied or blocked.
+
+### Stored History And Patches
+
+Every run writes a session report to `.nerve/sessions/{session-id}.json`. Accepted structured patches are written to `.nerve/patches/{patch-id}.json` and indexed in `.nerve/patches/index.json`.
+
+```bash
+nv history
+nv resume <session-id>
+nv list
+nv apply <patch-id>
+nv rollback <patch-id>
+```
+
+Use `--json` with `history`, `resume`, and `list` when another tool needs the stored data.
 
 ## Architecture
 
@@ -276,7 +295,7 @@ Nerve is built around conservative file mutation:
 - Reviewer `BLOCK` can prevent application depending on conflict policy.
 - Generated runtime state under `.nerve/` is ignored by Git.
 
-Runtime persistence and patch indexing remain Phase 2 roadmap work.
+Runtime persistence and patch indexing are implemented under `.nerve/`.
 
 ## Development
 
@@ -305,6 +324,7 @@ Current test coverage verifies:
 - Fixture-based real adapter CLI dry-run and apply paths
 - CLI smoke test with dry-run diff output
 - CLI JSON report output
+- Persistent session history and patch index commands
 
 ## How It Works
 
@@ -339,11 +359,11 @@ User: "add a health endpoint"
 
 ### Phase 2
 
-- Persist Synapse history under `.nerve/`.
-- Add `.nerve/patches/index.json`.
-- Add `nv history`, `nv resume`, `nv list`, `nv apply <id>`, and `nv rollback <id>`.
+- Persisted session history and `.nerve/patches/index.json` are implemented.
+- `nv history`, `nv resume`, `nv list`, `nv apply <id>`, and `nv rollback <id>` are implemented.
 - Add temp-file based write staging for stronger crash safety.
 - Add token and cost budgets per session.
+- Real-time cross-firing remains roadmap.
 
 ### Phase 3
 
