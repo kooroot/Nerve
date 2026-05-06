@@ -3,10 +3,11 @@ use clap::{Parser, Subcommand};
 use nerve_adapter::default_adapters;
 use nerve_config::Config;
 use nerve_core::store::NerveStore;
-use nerve_core::{RunOptions, run_synaptic_loop};
+use nerve_core::{RunOptions, RunReport, run_synaptic_loop};
 use nerve_types::{AgentEvent, Task, Verdict};
 use std::env;
 use std::path::{Path, PathBuf};
+use tokio::io::{self, AsyncBufReadExt};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -72,6 +73,11 @@ enum Command {
     },
     #[command(about = "Check config and adapter prerequisites")]
     Doctor,
+    #[command(about = "Run a line-oriented daemon for editor and shell integrations")]
+    Daemon {
+        #[arg(long, help = "Process one prompt from stdin and exit")]
+        once: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -197,6 +203,9 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Some(Command::Daemon { once }) => {
+            run_daemon(cli.apply, matches!(cli.adapter, AdapterMode::Mock), once).await
+        }
         None => {
             let prompt = cli
                 .prompt
@@ -213,12 +222,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_prompt(prompt: String, apply: bool, json: bool, mock: bool) -> Result<()> {
-    let cwd = env::current_dir().context("failed to read current directory")?;
-    let config = Config::load_from(&cwd)?;
-    let task = Task::new(prompt, &cwd);
-    let adapters = default_adapters(mock);
-    let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply }).await?;
-    NerveStore::new(&cwd).save_report(&report)?;
+    let report = run_report(prompt, apply, mock).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -227,6 +231,37 @@ async fn run_prompt(prompt: String, apply: bool, json: bool, mock: bool) -> Resu
 
     print_report(&report, apply);
     Ok(())
+}
+
+async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
+    let stdin = io::BufReader::new(io::stdin());
+    let mut lines = stdin.lines();
+
+    while let Some(line) = lines.next_line().await? {
+        let prompt = line.trim();
+        if prompt.is_empty() {
+            continue;
+        }
+
+        let report = run_report(prompt.to_string(), apply, mock).await?;
+        println!("{}", serde_json::to_string(&report)?);
+
+        if once {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_report(prompt: String, apply: bool, mock: bool) -> Result<RunReport> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let config = Config::load_from(&cwd)?;
+    let task = Task::new(prompt, &cwd);
+    let adapters = default_adapters(mock);
+    let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply }).await?;
+    NerveStore::new(&cwd).save_report(&report)?;
+    Ok(report)
 }
 
 fn print_report(report: &nerve_core::RunReport, apply_requested: bool) {

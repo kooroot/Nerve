@@ -214,6 +214,9 @@ MVP가 "순차+1라운드"에 머무른 부분을 **진짜 병렬 + 실시간 cr
 ### 3.4 Phase 3 검증
 - ratatui snapshot 테스트 (`insta`).
 - cmux session 내에서 수동 E2E.
+- 2026-05-06 현재: editor/shell integration용으로 `nv daemon`을 구현했다.
+  stdin 한 줄당 prompt 하나를 처리하고 stdout 한 줄당 JSON `RunReport` 하나를
+  출력한다. `--once`는 단일 prompt 처리 후 종료한다.
 
 ---
 

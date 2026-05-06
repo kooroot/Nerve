@@ -126,6 +126,7 @@ Nerve exposes one CLI today:
 | `nv apply <patch-id>` | Apply a stored patch by id |
 | `nv rollback <patch-id>` | Roll back a stored patch by id |
 | `nv doctor` | Check config and adapter prerequisites |
+| `nv daemon` | Run a line-oriented daemon for editor and shell integrations |
 | `nv config validate` | Validate `nerve.config.json` |
 
 Real adapter mode expects these CLIs on `PATH` and already authenticated:
@@ -170,6 +171,10 @@ Use `--json` with `history`, `resume`, and `list` when another tool needs the st
 ### Doctor
 
 Use `nv doctor` to validate local prerequisites. In real adapter mode it checks that `claude` and `codex` are available on `PATH`; in mock mode it validates config and the built-in mock adapter path.
+
+### Daemon Mode
+
+Use `nv daemon` for simple editor and shell integrations. It reads one prompt per stdin line, runs the configured loop, stores the report, and writes one compact JSON report per stdout line. Add `--once` to process a single prompt and exit.
 
 ## Architecture
 
@@ -369,6 +374,7 @@ Current test coverage verifies:
 - Profile `all` / `any` match rule groups
 - `merge_attempt` conflict policy patch merging
 - Scratch-file crossfire watcher feedback during lead execution
+- Line-oriented `nv daemon` mode for editor and shell integrations
 
 ## How It Works
 
@@ -416,7 +422,7 @@ User: "add a health endpoint"
 - Profile `all` / `any` match rule groups are implemented.
 - Strategy dispatch for `consensus`, `pipeline`, and `tournament` is implemented.
 - cmux or TUI layout for lead stream, reviewer stream, and orchestrator state.
-- Long-running daemon mode for editor and shell integrations.
+- Long-running daemon mode for editor and shell integrations is implemented.
 
 ## Design Documents
 

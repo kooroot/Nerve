@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[test]
 fn mock_cli_prints_reviewed_diff_without_applying() {
@@ -131,6 +132,33 @@ fn mock_cli_doctor_passes_without_external_adapters() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("config: ok"));
     assert!(stdout.contains("adapter: mock ok"));
+}
+
+#[test]
+fn mock_cli_daemon_processes_one_prompt_as_json_line() {
+    let fixture = MockCliFixture::new();
+    let mut child = fixture
+        .command()
+        .args(["daemon", "--once"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn nv daemon");
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"daemon health endpoint\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(report["task"]["prompt"], "daemon health endpoint");
+    assert_eq!(report["final_feedback"]["verdict"], "lgtm");
+    assert!(fixture.cwd.join(".nerve/sessions").exists());
 }
 
 struct MockCliFixture {
