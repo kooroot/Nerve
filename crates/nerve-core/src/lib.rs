@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use nerve_adapter::ModelAdapter;
-use nerve_config::{Config, ConflictPolicy, Orchestration, ProfileSelection, ReviewStrictness};
+use nerve_config::{
+    Config, ConflictPolicy, Orchestration, ProfileSelection, ReviewStrictness, Strategy,
+};
 use nerve_patch::NvPatch;
 use nerve_types::{
     AgentEvent, AgentOutput, Issue, IssueSeverity, ReviewerFeedback, RoundRecord, Task, UsageStats,
@@ -98,6 +100,10 @@ pub async fn run_synaptic_loop(
     let selection = config.select_profile(&task)?;
     let lead = find_adapter(adapters, &selection.lead)?;
     let reviewer = find_adapter(adapters, &selection.reviewer)?;
+    if matches!(config.orchestration.default_strategy, Strategy::Tournament) {
+        return run_tournament_strategy(task, config, selection, lead, reviewer, options).await;
+    }
+
     let synapse = Synapse::new(task.clone());
     let (tx, mut rx) = mpsc::channel(1024);
     let event_synapse = synapse.clone();
@@ -122,7 +128,13 @@ pub async fn run_synaptic_loop(
         final_feedback = budget_exceeded_feedback(reviewer.id(), &usage);
     }
 
-    for round_index in 0..=selection.max_refinement_rounds {
+    let max_refinement_rounds = match config.orchestration.default_strategy {
+        Strategy::Consensus => selection.max_refinement_rounds,
+        Strategy::Pipeline => 0,
+        Strategy::Tournament => unreachable!("tournament strategy returns before consensus loop"),
+    };
+
+    for round_index in 0..=max_refinement_rounds {
         if budget_exceeded {
             break;
         }
@@ -157,7 +169,7 @@ pub async fn run_synaptic_loop(
             break;
         }
 
-        if round_index == selection.max_refinement_rounds {
+        if round_index == max_refinement_rounds {
             break;
         }
 
@@ -199,6 +211,129 @@ pub async fn run_synaptic_loop(
         selection,
         rounds: synapse.rounds().await,
         final_output: lead_output,
+        final_feedback,
+        final_patch,
+        events: synapse.events().await,
+        usage,
+        budget_exceeded,
+        applied,
+        blocked,
+    })
+}
+
+async fn run_tournament_strategy(
+    task: Task,
+    config: &Config,
+    selection: ProfileSelection,
+    lead: &dyn ModelAdapter,
+    reviewer: &dyn ModelAdapter,
+    options: RunOptions,
+) -> Result<RunReport> {
+    let synapse = Synapse::new(task.clone());
+    let (tx, mut rx) = mpsc::channel(1024);
+    let event_synapse = synapse.clone();
+
+    let event_task = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            event_synapse.record_event(event).await;
+        }
+    });
+
+    let (lead_output, reviewer_output) = tokio::try_join!(
+        lead.implement(&task, &task.cwd, tx.clone()),
+        reviewer.implement(&task, &task.cwd, tx.clone())
+    )
+    .with_context(|| "tournament candidate generation failed")?;
+    let mut usage = UsageStats::default();
+    accumulate_output_usage(&mut usage, &lead_output);
+    accumulate_output_usage(&mut usage, &reviewer_output);
+
+    let mut budget_exceeded = exceeds_budget(&usage, &config.orchestration);
+    let mut final_output = lead_output.clone();
+    let final_feedback = if budget_exceeded {
+        budget_exceeded_feedback(reviewer.id(), &usage)
+    } else {
+        let lead_review = reviewer
+            .review(
+                &task,
+                &lead_output,
+                &task.cwd,
+                strictness_label(&selection.review_strictness),
+                tx.clone(),
+            )
+            .await
+            .with_context(|| format!("reviewer adapter `{}` failed", reviewer.id()))?;
+        accumulate_feedback_usage(&mut usage, &lead_review);
+
+        let reviewer_review = lead
+            .review(
+                &task,
+                &reviewer_output,
+                &task.cwd,
+                strictness_label(&selection.review_strictness),
+                tx.clone(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "lead adapter `{}` failed during tournament review",
+                    lead.id()
+                )
+            })?;
+        accumulate_feedback_usage(&mut usage, &reviewer_review);
+
+        budget_exceeded = exceeds_budget(&usage, &config.orchestration);
+        if budget_exceeded {
+            budget_exceeded_feedback(reviewer.id(), &usage)
+        } else if lead_review.verdict.is_terminal_success() {
+            lead_review
+        } else if reviewer_review.verdict.is_terminal_success()
+            || matches!(
+                config.orchestration.conflict_policy,
+                ConflictPolicy::ReviewerPriority
+            )
+        {
+            final_output = reviewer_output.clone();
+            reviewer_review
+        } else {
+            lead_review
+        }
+    };
+
+    let round = RoundRecord {
+        round: 0,
+        lead: final_output.clone(),
+        reviewer: final_feedback.clone(),
+    };
+    synapse.record_round(round).await;
+
+    drop(tx);
+    event_task.await.context("event collector task failed")?;
+
+    let final_patch = select_final_patch(
+        &final_output,
+        &final_feedback,
+        &config.orchestration.conflict_policy,
+    );
+    let blocked =
+        budget_exceeded || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
+
+    let applied = if options.apply && !blocked {
+        if let Some(patch) = &final_patch {
+            patch.apply(&task.cwd, false)?;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    Ok(RunReport {
+        task,
+        selection,
+        rounds: synapse.rounds().await,
+        final_output,
         final_feedback,
         final_patch,
         events: synapse.events().await,
@@ -377,6 +512,72 @@ mod tests {
         assert!(report.rounds.is_empty());
     }
 
+    #[tokio::test]
+    async fn pipeline_strategy_runs_single_review_without_refinement() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("add a health endpoint", dir.path());
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "pipeline",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": {
+                "architect": "claude-code",
+                "reviewer": "codex"
+              },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        let adapters = vec![
+            Box::new(MockAdapter::lead()) as Box<dyn ModelAdapter>,
+            Box::new(MockAdapter::reviewer()) as Box<dyn ModelAdapter>,
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply: false })
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::RequestChanges);
+        assert_eq!(report.rounds.len(), 1);
+        assert_eq!(report.final_output.raw_text, "Initial mock implementation");
+    }
+
+    #[tokio::test]
+    async fn tournament_strategy_can_select_reviewer_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("choose best candidate", dir.path());
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "tournament",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": {
+                "architect": "candidate-a",
+                "reviewer": "candidate-b"
+              },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        let adapters = vec![
+            Box::new(TournamentAdapter::new("candidate-a")) as Box<dyn ModelAdapter>,
+            Box::new(TournamentAdapter::new("candidate-b")) as Box<dyn ModelAdapter>,
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply: false })
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
+        assert_eq!(report.final_output.agent_id, "candidate-b");
+        assert_eq!(report.rounds.len(), 1);
+    }
+
     #[derive(Debug)]
     struct BudgetAdapter {
         id: &'static str,
@@ -439,6 +640,69 @@ mod tests {
             _tx: mpsc::Sender<AgentEvent>,
         ) -> Result<AgentOutput> {
             Ok(self.output())
+        }
+    }
+
+    #[derive(Debug)]
+    struct TournamentAdapter {
+        id: &'static str,
+    }
+
+    impl TournamentAdapter {
+        fn new(id: &'static str) -> Self {
+            Self { id }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelAdapter for TournamentAdapter {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        async fn implement(
+            &self,
+            _task: &Task,
+            _cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            Ok(AgentOutput::text(self.id, format!("{} patch", self.id)))
+        }
+
+        async fn review(
+            &self,
+            _task: &Task,
+            lead_output: &AgentOutput,
+            _cwd: &Path,
+            _strictness: &str,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<ReviewerFeedback> {
+            if lead_output.agent_id == "candidate-b" {
+                Ok(ReviewerFeedback::lgtm(self.id, "LGTM candidate-b"))
+            } else {
+                Ok(ReviewerFeedback {
+                    reviewer_id: self.id.to_string(),
+                    verdict: Verdict::RequestChanges,
+                    issues: vec![Issue {
+                        severity: IssueSeverity::Warning,
+                        message: "candidate-a loses tournament".to_string(),
+                    }],
+                    suggested_patch: None,
+                    cost: None,
+                    raw_text: "REQUEST_CHANGES: candidate-a loses tournament".to_string(),
+                })
+            }
+        }
+
+        async fn refine(
+            &self,
+            _task: &Task,
+            _previous_output: &AgentOutput,
+            _feedback: &ReviewerFeedback,
+            _cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            Ok(AgentOutput::text(self.id, "unused refinement"))
         }
     }
 }

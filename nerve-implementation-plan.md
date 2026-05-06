@@ -197,6 +197,10 @@ MVP가 "순차+1라운드"에 머무른 부분을 **진짜 병렬 + 실시간 cr
   - `tournament`: 두 모델이 각자 patch 생성 → 제3 reviewer가 선택
   - `pipeline`: lead → reviewer → lead 단방향 1패스
 - `Strategy`는 `ModelAdapter`처럼 trait 객체로 plug.
+- 2026-05-06 현재: trait plugin화 전 단계로 core strategy dispatch를
+  구현했다. `consensus`는 기존 refinement loop, `pipeline`은 1회 구현+1회
+  리뷰 후 종료, `tournament`는 lead/reviewer 양쪽 candidate 생성 후
+  cross-review로 수락 candidate를 고른다.
 
 ### 3.4 Phase 3 검증
 - ratatui snapshot 테스트 (`insta`).

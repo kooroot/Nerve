@@ -57,6 +57,7 @@ Nerve is in a Phase 1 MVP state.
 | Real unified-diff to `NvPatch` conversion | Implemented for create/modify/delete/rename diffs |
 | Machine-readable session reports | Implemented with `--json` |
 | Persistent history / patch index | Implemented under `.nerve/` |
+| Strategy dispatch | Implemented for `consensus`, `pipeline`, and `tournament` |
 | Real-time cross-firing / TUI | Roadmap |
 
 Important: the mock adapter path produces structured `NvPatch` values directly. The real subprocess path now extracts unified diffs from raw text or JSONL string fields and converts create/modify/delete/rename diffs into safe `NvPatch` values.
@@ -209,6 +210,7 @@ Core flow:
 ```text
 Task
   -> Config profile selection
+  -> Strategy selection: consensus / pipeline / tournament
   -> Lead adapter implementation
   -> Reviewer adapter critique
   -> Optional lead refinement
@@ -291,6 +293,16 @@ Optional orchestration budgets stop refinement and prevent apply when reported m
 
 Adapters that do not report usage leave these counters at zero; budget enforcement applies when usage is available.
 
+### Strategies
+
+`orchestration.default_strategy` controls the core execution mode:
+
+| Strategy | Behavior |
+|----------|----------|
+| `consensus` | Lead implements, reviewer critiques, and lead refines until `LGTM` or the round limit. |
+| `pipeline` | Lead implements once and reviewer critiques once; no refinement loop runs. |
+| `tournament` | Lead and reviewer both generate candidate outputs, cross-review each other, and Nerve selects the accepted candidate. |
+
 ## Safety Model
 
 Nerve is built around conservative file mutation:
@@ -339,6 +351,7 @@ Current test coverage verifies:
 - CLI JSON report output
 - Persistent session history and patch index commands
 - Token and estimated-cost budget enforcement when adapter usage is reported
+- Strategy dispatch for `consensus`, `pipeline`, and `tournament`
 
 ## How It Works
 
@@ -382,7 +395,7 @@ User: "add a health endpoint"
 ### Phase 3
 
 - Real-time cross-firing between lead and reviewer.
-- Strategy plugins: `consensus`, `pipeline`, and `tournament`.
+- Strategy dispatch for `consensus`, `pipeline`, and `tournament` is implemented.
 - cmux or TUI layout for lead stream, reviewer stream, and orchestrator state.
 - Long-running daemon mode for editor and shell integrations.
 
