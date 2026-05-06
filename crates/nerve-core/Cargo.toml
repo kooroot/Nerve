@@ -12,9 +12,9 @@ nerve-patch = { path = "../nerve-patch" }
 nerve-types = { path = "../nerve-types" }
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-tempfile.workspace = true

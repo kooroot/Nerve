@@ -3,12 +3,14 @@ use nerve_adapter::ModelAdapter;
 use nerve_config::{
     Config, ConflictPolicy, Orchestration, ProfileSelection, ReviewStrictness, Strategy,
 };
-use nerve_patch::NvPatch;
+use nerve_patch::{FileOperation, FilePatch, NvPatch};
 use nerve_types::{
     AgentEvent, AgentOutput, Issue, IssueSeverity, ReviewerFeedback, RoundRecord, Task, UsageStats,
     Verdict,
 };
 use serde::Serialize;
+use std::io::Write as _;
+use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
 
@@ -191,7 +193,7 @@ pub async fn run_synaptic_loop(
         &lead_output,
         &final_feedback,
         &config.orchestration.conflict_policy,
-    );
+    )?;
     let blocked =
         budget_exceeded || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
 
@@ -314,7 +316,7 @@ async fn run_tournament_strategy(
         &final_output,
         &final_feedback,
         &config.orchestration.conflict_policy,
-    );
+    )?;
     let blocked =
         budget_exceeded || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
 
@@ -412,14 +414,105 @@ fn select_final_patch(
     lead_output: &AgentOutput,
     feedback: &ReviewerFeedback,
     policy: &ConflictPolicy,
-) -> Option<NvPatch> {
+) -> Result<Option<NvPatch>> {
     match policy {
-        ConflictPolicy::ReviewerPriority => feedback
+        ConflictPolicy::ReviewerPriority => Ok(feedback
             .suggested_patch
             .clone()
-            .or_else(|| lead_output.proposed_patch.clone()),
-        _ => lead_output.proposed_patch.clone(),
+            .or_else(|| lead_output.proposed_patch.clone())),
+        ConflictPolicy::MergeAttempt => merge_patches(
+            lead_output.proposed_patch.as_ref(),
+            feedback.suggested_patch.as_ref(),
+        )
+        .context("failed to merge lead and reviewer patches"),
+        _ => Ok(lead_output.proposed_patch.clone()),
     }
+}
+
+fn merge_patches(lead: Option<&NvPatch>, reviewer: Option<&NvPatch>) -> Result<Option<NvPatch>> {
+    let Some(lead) = lead else {
+        return Ok(reviewer.cloned());
+    };
+    let Some(reviewer) = reviewer else {
+        return Ok(Some(lead.clone()));
+    };
+
+    let mut files = lead.files.clone();
+    for reviewer_file in &reviewer.files {
+        let Some(index) = files
+            .iter()
+            .position(|lead_file| lead_file.path == reviewer_file.path)
+        else {
+            files.push(reviewer_file.clone());
+            continue;
+        };
+
+        if files[index] == *reviewer_file {
+            continue;
+        }
+
+        files[index] = merge_file_patch(&files[index], reviewer_file)?;
+    }
+
+    Ok(Some(NvPatch::new(files)))
+}
+
+fn merge_file_patch(lead: &FilePatch, reviewer: &FilePatch) -> Result<FilePatch> {
+    if lead.operation != reviewer.operation {
+        anyhow::bail!(
+            "cannot merge different operations for `{}`",
+            lead.path.display()
+        );
+    }
+    if lead.original_sha256 != reviewer.original_sha256 {
+        anyhow::bail!(
+            "cannot merge patches with different bases for `{}`",
+            lead.path.display()
+        );
+    }
+    if !matches!(
+        lead.operation,
+        FileOperation::Modify | FileOperation::Create
+    ) {
+        anyhow::bail!(
+            "merge_attempt only supports modify/create conflicts, got {:?} for `{}`",
+            lead.operation,
+            lead.path.display()
+        );
+    }
+
+    let merged = git_merge_file(&lead.original, &lead.modified, &reviewer.modified)
+        .with_context(|| format!("git merge-file failed for `{}`", lead.path.display()))?;
+    Ok(FilePatch::with_operation(
+        lead.path.clone(),
+        lead.operation.clone(),
+        lead.original.clone(),
+        merged,
+    ))
+}
+
+fn git_merge_file(base: &str, lead: &str, reviewer: &str) -> Result<String> {
+    let mut base_file = tempfile::NamedTempFile::new()?;
+    let mut lead_file = tempfile::NamedTempFile::new()?;
+    let mut reviewer_file = tempfile::NamedTempFile::new()?;
+    base_file.write_all(base.as_bytes())?;
+    lead_file.write_all(lead.as_bytes())?;
+    reviewer_file.write_all(reviewer.as_bytes())?;
+
+    let output = Command::new("git")
+        .arg("merge-file")
+        .arg("-p")
+        .arg(lead_file.path())
+        .arg(base_file.path())
+        .arg(reviewer_file.path())
+        .output()
+        .context("failed to run `git merge-file`")?;
+
+    if !output.status.success() {
+        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn is_blocked(feedback: &ReviewerFeedback, policy: &ConflictPolicy) -> bool {
@@ -576,6 +669,67 @@ mod tests {
         assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
         assert_eq!(report.final_output.agent_id, "candidate-b");
         assert_eq!(report.rounds.len(), 1);
+    }
+
+    #[test]
+    fn merge_attempt_combines_non_overlapping_patch_files() {
+        let lead = AgentOutput::with_patch(
+            "lead",
+            "lead",
+            NvPatch::new(vec![FilePatch::new("a.txt", "old\n", "lead\n")]),
+        );
+        let feedback = ReviewerFeedback {
+            reviewer_id: "reviewer".to_string(),
+            verdict: Verdict::Lgtm,
+            issues: Vec::new(),
+            suggested_patch: Some(NvPatch::new(vec![FilePatch::new(
+                "b.txt",
+                "old\n",
+                "reviewer\n",
+            )])),
+            cost: None,
+            raw_text: "LGTM".to_string(),
+        };
+
+        let patch = select_final_patch(&lead, &feedback, &ConflictPolicy::MergeAttempt)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(patch.files.len(), 2);
+        assert_eq!(patch.files[0].path, Path::new("a.txt"));
+        assert_eq!(patch.files[1].path, Path::new("b.txt"));
+    }
+
+    #[test]
+    fn merge_attempt_uses_git_merge_file_for_same_file_changes() {
+        let lead = AgentOutput::with_patch(
+            "lead",
+            "lead",
+            NvPatch::new(vec![FilePatch::new(
+                "file.txt",
+                "one\ntwo\nthree\n",
+                "ONE\ntwo\nthree\n",
+            )]),
+        );
+        let feedback = ReviewerFeedback {
+            reviewer_id: "reviewer".to_string(),
+            verdict: Verdict::Lgtm,
+            issues: Vec::new(),
+            suggested_patch: Some(NvPatch::new(vec![FilePatch::new(
+                "file.txt",
+                "one\ntwo\nthree\n",
+                "one\ntwo\nTHREE\n",
+            )])),
+            cost: None,
+            raw_text: "LGTM".to_string(),
+        };
+
+        let patch = select_final_patch(&lead, &feedback, &ConflictPolicy::MergeAttempt)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(patch.files.len(), 1);
+        assert_eq!(patch.files[0].modified, "ONE\ntwo\nTHREE\n");
     }
 
     #[derive(Debug)]

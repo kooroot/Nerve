@@ -166,6 +166,10 @@ MVP가 "순차+1라운드"에 머무른 부분을 **진짜 병렬 + 실시간 cr
 - `lead_priority` (default), `reviewer_priority`, `merge_attempt`,
   `abort_on_conflict` 4가지를 `enum ConflictPolicy`로 구현.
 - `merge_attempt`은 `git merge-file` 호출 (system `git` 의존).
+- 2026-05-06 현재: `merge_attempt`는 lead patch와 reviewer suggested patch를
+  합성한다. 서로 다른 파일은 결합하고, 같은 파일의 create/modify 충돌은
+  `git merge-file -p`로 병합한다. delete/rename 등 지원하지 않는 조합이나
+  merge conflict는 오류로 중단한다.
 
 ### 2.5 Phase 2 검증
 - 통합 테스트에 `tempdir` + 실제 파일 변경 시나리오 추가.

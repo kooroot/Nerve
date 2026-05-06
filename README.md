@@ -291,7 +291,7 @@ The config schema includes:
 |--------|------------------|
 | `lead_priority` | Prefer the lead patch |
 | `reviewer_priority` | Prefer reviewer suggested patch when present |
-| `merge_attempt` | Accepted by config, full merge behavior is roadmap |
+| `merge_attempt` | Merge lead and reviewer patches with `git merge-file` when both touch the same file |
 | `abort_on_conflict` | Block on reviewer `BLOCK` |
 | `reviewer_block` | Block on reviewer `BLOCK` |
 | `manual` | Block on reviewer `BLOCK` |
@@ -366,6 +366,7 @@ Current test coverage verifies:
 - Token and estimated-cost budget enforcement when adapter usage is reported
 - Strategy dispatch for `consensus`, `pipeline`, and `tournament`
 - Profile `all` / `any` match rule groups
+- `merge_attempt` conflict policy patch merging
 
 ## How It Works
 
