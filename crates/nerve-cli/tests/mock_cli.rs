@@ -46,6 +46,23 @@ fn mock_cli_emits_machine_readable_json_report() {
 }
 
 #[test]
+fn mock_cli_renders_three_pane_tui_summary() {
+    let fixture = MockCliFixture::new();
+    let output = fixture
+        .command()
+        .args(["--tui", "add a health endpoint"])
+        .output()
+        .expect("failed to run nv binary");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Nerve TUI"));
+    assert!(stdout.contains("[ Lead ]"));
+    assert!(stdout.contains("[ Reviewer ]"));
+    assert!(stdout.contains("[ Orchestrator ]"));
+}
+
+#[test]
 fn mock_cli_lists_applies_and_rolls_back_indexed_patch() {
     let fixture = MockCliFixture::new();
     let output = fixture

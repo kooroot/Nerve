@@ -28,6 +28,9 @@ struct Cli {
     #[arg(long, help = "Emit a machine-readable JSON session report")]
     json: bool,
 
+    #[arg(long, help = "Render a three-pane terminal summary")]
+    tui: bool,
+
     #[arg(long, env = "NERVE_ADAPTER", default_value = "real")]
     adapter: AdapterMode,
 }
@@ -214,6 +217,7 @@ async fn main() -> Result<()> {
                 prompt,
                 cli.apply,
                 cli.json,
+                cli.tui,
                 matches!(cli.adapter, AdapterMode::Mock),
             )
             .await
@@ -221,7 +225,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_prompt(prompt: String, apply: bool, json: bool, mock: bool) -> Result<()> {
+async fn run_prompt(prompt: String, apply: bool, json: bool, tui: bool, mock: bool) -> Result<()> {
     let report = run_report(prompt, apply, mock).await?;
 
     if json {
@@ -229,7 +233,11 @@ async fn run_prompt(prompt: String, apply: bool, json: bool, mock: bool) -> Resu
         return Ok(());
     }
 
-    print_report(&report, apply);
+    if tui {
+        print_tui_report(&report);
+    } else {
+        print_report(&report, apply);
+    }
     Ok(())
 }
 
@@ -334,6 +342,59 @@ fn print_events(events: &[AgentEvent]) {
             AgentEvent::Done { agent_id } => println!("[{agent_id}] done"),
         }
     }
+}
+
+fn print_tui_report(report: &RunReport) {
+    println!("Nerve TUI {}", report.task.id);
+    println!("{}", "=".repeat(72));
+    println!("[ Lead ]");
+    println!("agent: {}", report.final_output.agent_id);
+    println!("{}", truncate_panel_text(&report.final_output.raw_text));
+    if let Some(patch) = &report.final_patch {
+        println!("patch: {} file(s), id={}", patch.files.len(), patch.id);
+    } else {
+        println!("patch: none");
+    }
+    println!("{}", "-".repeat(72));
+    println!("[ Reviewer ]");
+    println!(
+        "agent: {} | verdict: {:?}",
+        report.final_feedback.reviewer_id, report.final_feedback.verdict
+    );
+    println!("{}", truncate_panel_text(&report.final_feedback.raw_text));
+    if !report.crossfire_feedback.is_empty() {
+        println!("crossfire events: {}", report.crossfire_feedback.len());
+    }
+    println!("{}", "-".repeat(72));
+    println!("[ Orchestrator ]");
+    println!(
+        "profile={} rounds={} applied={} blocked={} budget_exceeded={}",
+        report.selection.id.as_deref().unwrap_or("default"),
+        report.rounds.len(),
+        report.applied,
+        report.blocked,
+        report.budget_exceeded
+    );
+    println!(
+        "usage: input={} output={} total={} cost_microusd={}",
+        report.usage.input_tokens,
+        report.usage.output_tokens,
+        report.usage.total_tokens(),
+        report
+            .usage
+            .estimated_cost_microusd
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!("{}", "=".repeat(72));
+}
+
+fn truncate_panel_text(value: &str) -> String {
+    const LIMIT: usize = 1200;
+    if value.len() <= LIMIT {
+        return value.to_string();
+    }
+    format!("{}...", &value[..LIMIT])
 }
 
 fn print_changed_files(paths: &[std::path::PathBuf]) {

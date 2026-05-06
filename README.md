@@ -120,6 +120,7 @@ Nerve exposes one CLI today:
 | `nv --adapter mock "<task>"` | Use deterministic local mock adapters |
 | `nv --adapter real "<task>"` | Spawn real `claude` and `codex` subprocesses |
 | `nv --json "<task>"` | Emit a structured session report for downstream tooling |
+| `nv --tui "<task>"` | Render a three-pane terminal summary |
 | `nv history` | List stored session summaries from `.nerve/sessions/` |
 | `nv resume <session-id>` | Print a stored session report |
 | `nv list` | List indexed patches from `.nerve/patches/index.json` |
@@ -175,6 +176,10 @@ Use `nv doctor` to validate local prerequisites. In real adapter mode it checks 
 ### Daemon Mode
 
 Use `nv daemon` for simple editor and shell integrations. It reads one prompt per stdin line, runs the configured loop, stores the report, and writes one compact JSON report per stdout line. Add `--once` to process a single prompt and exit.
+
+### Terminal TUI
+
+Use `--tui` to render the final run as a three-pane terminal summary: Lead, Reviewer, and Orchestrator. This is the built-in fallback layout when a cmux-specific integration is not available.
 
 ## Architecture
 
@@ -375,6 +380,7 @@ Current test coverage verifies:
 - `merge_attempt` conflict policy patch merging
 - Scratch-file crossfire watcher feedback during lead execution
 - Line-oriented `nv daemon` mode for editor and shell integrations
+- Three-pane terminal TUI summary
 
 ## How It Works
 
@@ -421,7 +427,7 @@ User: "add a health endpoint"
 - Real-time scratch-file cross-firing between lead and reviewer is implemented.
 - Profile `all` / `any` match rule groups are implemented.
 - Strategy dispatch for `consensus`, `pipeline`, and `tournament` is implemented.
-- cmux or TUI layout for lead stream, reviewer stream, and orchestrator state.
+- Terminal TUI layout for lead, reviewer, and orchestrator state is implemented.
 - Long-running daemon mode for editor and shell integrations is implemented.
 
 ## Design Documents

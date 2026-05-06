@@ -189,6 +189,9 @@ MVP가 "순차+1라운드"에 머무른 부분을 **진짜 병렬 + 실시간 cr
   - 우측 하단: orchestrator 상태 (round, conflict policy, elapsed)
 - cmux이 없으면 단일 stream으로 fallback.
 - 구현: `crates/nerve-tui/` 별도 crate, `ratatui` 사용 (cmux 미사용 시).
+- 2026-05-06 현재: 별도 TUI crate 전 단계로 `nv --tui "<task>"` fallback을
+  구현했다. 실행 결과를 Lead / Reviewer / Orchestrator 3분할 terminal
+  summary로 렌더링한다.
 
 ### 3.2 Profile 매칭 고도화
 - `match_rules`에 **AND/OR 조합** 지원:
