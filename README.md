@@ -121,9 +121,15 @@ Nerve exposes one CLI today:
 Real adapter mode expects these CLIs on `PATH` and already authenticated:
 
 ```bash
-claude -p "{prompt}" --output-format stream-json
+claude -p "{prompt}" --output-format stream-json --verbose
 codex exec --json "{prompt}"
 ```
+
+Verified real output shapes:
+
+- Claude Code 2.1.128 requires `--verbose` with `stream-json` and emits assistant text under `message.content[].text`.
+- Codex CLI 0.128.0 emits assistant text under `item.text` in `item.completed` events.
+- Both shapes are parsed through generic JSON string extraction before unified diff parsing.
 
 The subprocess boundary is intentionally CLI-first. Nerve does not depend on a vendor SDK in Phase 1; it treats model tools as external executables and streams their output into the orchestration state.
 
@@ -278,6 +284,7 @@ Current test coverage verifies:
 - Unified diff parsing for existing and new files
 - Unsafe path rejection for traversal and symlink escapes
 - Real adapter raw text / JSONL diff extraction
+- Fenced Claude JSONL diff extraction
 - Fixture-based real adapter CLI dry-run and apply paths
 - CLI smoke test with dry-run diff output
 
@@ -310,7 +317,6 @@ User: "add a health endpoint"
 
 ### Phase 1 Completion
 
-- Verify actual `claude -p --output-format stream-json` and `codex exec --json` output shapes.
 - Add explicit deletion and rename support to the patch model.
 - Emit machine-readable session reports.
 

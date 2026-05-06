@@ -161,6 +161,7 @@ impl SubprocessAdapter {
                 "{prompt}".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
+                "--verbose".to_string(),
             ],
         )
     }
@@ -428,5 +429,27 @@ Lead notes before the patch.
 
         let patch = output.proposed_patch.unwrap();
         assert_eq!(patch.files[0].modified, "after\n");
+    }
+
+    #[test]
+    fn extracts_structured_patch_from_fenced_claude_jsonl_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "before\n").unwrap();
+        let raw = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"```diff\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-before\n+after\n```"}]}}"#
+            .to_string();
+
+        let output = output_from_raw_text("claude-code", dir.path(), raw).unwrap();
+
+        let patch = output.proposed_patch.unwrap();
+        assert_eq!(patch.files[0].modified, "after\n");
+    }
+
+    #[test]
+    fn claude_adapter_uses_verbose_stream_json() {
+        let adapter = SubprocessAdapter::claude_code();
+
+        assert!(adapter.args.contains(&"--output-format".to_string()));
+        assert!(adapter.args.contains(&"stream-json".to_string()));
+        assert!(adapter.args.contains(&"--verbose".to_string()));
     }
 }

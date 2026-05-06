@@ -76,9 +76,12 @@ pub trait ModelAdapter: Send + Sync {
 ```
 
 - `AgentEvent`: `Stdout(String) | Stderr(String) | ToolCall(...) | Done(AgentOutput)`.
-- `ClaudeCodeAdapter`: `claude -p "<prompt>" --output-format stream-json`
+- `ClaudeCodeAdapter`: `claude -p "<prompt>" --output-format stream-json --verbose`
   spawn, JSON 라인을 `AgentEvent`로 파싱.
 - `CodexAdapter`: `codex exec --json "<prompt>"` 동일 패턴.
+- 2026-05-06 실제 shape 확인: Claude Code 2.1.128은 `stream-json`에
+  `--verbose`가 필요하며 assistant text는 `message.content[].text`,
+  Codex CLI 0.128.0은 `item.completed.item.text`에 출력한다.
 - 각 adapter는 자신만의 prompt template을 보유 (Lead용 / Reviewer용 분리).
 - 종료 코드 != 0 이면 stderr를 포함한 `AdapterError` 반환.
 
@@ -233,7 +236,7 @@ pub struct RoundRecord { round: u8, lead: AgentOutput, reviewer: ReviewerFeedbac
 
 ## 위험 요소 & 미결 사항
 
-1. **CLI 출력 포맷 변동성**: `claude -p --output-format stream-json` /
+1. **CLI 출력 포맷 변동성**: `claude -p --output-format stream-json --verbose` /
    `codex exec --json` 의 스키마가 두 도구 모두 비공식적으로 변할 수
    있다. → adapter 단에서 schema versioning 가드 필요. Phase 1에서는
    "필드 누락 시 raw text fallback".
