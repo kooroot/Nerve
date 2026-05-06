@@ -159,6 +159,8 @@ MVP가 "순차+1라운드"에 머무른 부분을 **진짜 병렬 + 실시간 cr
 - 2026-05-06 현재: patch 본문은 `.nerve/patches/{id}.json`, 인덱스는
   `.nerve/patches/index.json`에 저장한다. `nv list`, `nv apply <id>`,
   `nv rollback <id>`가 활성화됐고, JSON 저장은 temp file 후 rename한다.
+- 2026-05-06 현재: `NvPatch`의 파일 쓰기 역시 sibling temp file에 먼저
+  기록한 뒤 rename으로 commit한다. rename 실패 시 temp file을 정리한다.
 
 ### 2.4 Conflict Policy 확장
 - `lead_priority` (default), `reviewer_priority`, `merge_attempt`,

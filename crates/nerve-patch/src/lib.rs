@@ -431,10 +431,31 @@ fn write_string(cwd: &Path, relative: &Path, value: &str) -> Result<()> {
             source,
         })?;
     }
-    fs::write(&path, value).map_err(|source| PatchError::Io {
-        path: relative.to_path_buf(),
+
+    let tmp_path = temp_write_path(&path);
+    fs::write(&tmp_path, value).map_err(|source| PatchError::Io {
+        path: tmp_path.clone(),
         source,
-    })
+    })?;
+
+    if let Err(source) = fs::rename(&tmp_path, &path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(PatchError::Io {
+            path: relative.to_path_buf(),
+            source,
+        });
+    }
+
+    Ok(())
+}
+
+fn temp_write_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("target");
+    parent.join(format!(".{file_name}.nerve-write-{}.tmp", Uuid::new_v4()))
 }
 
 fn remove_file(cwd: &Path, relative: &Path) -> Result<()> {
@@ -1067,6 +1088,30 @@ diff --git a/new.txt b/new.txt
     }
 
     #[test]
+    fn staged_write_replaces_file_without_leaving_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, "old\n").unwrap();
+        let patch = NvPatch::single("file.txt", "old\n", "new\n");
+
+        patch.apply(dir.path(), false).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        assert_no_staged_write_temps(dir.path());
+    }
+
+    #[test]
+    fn staged_write_cleans_up_temp_file_when_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("target")).unwrap();
+
+        let err = write_string(dir.path(), Path::new("target"), "value\n").unwrap_err();
+
+        assert!(matches!(err, PatchError::Io { .. }));
+        assert_no_staged_write_temps(dir.path());
+    }
+
+    #[test]
     fn rejects_parent_directory_patch_path() {
         let dir = tempfile::tempdir().unwrap();
         let diff = "\
@@ -1231,5 +1276,18 @@ rename to new.txt
         assert!(matches!(err, PatchError::Io { .. }));
         assert!(!blocking_path.exists());
         assert!(!nested_path.exists());
+    }
+
+    fn assert_no_staged_write_temps(path: &Path) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.contains(".nerve-write-"),
+                "unexpected staged write temp file: {}",
+                entry.path().display()
+            );
+        }
     }
 }
