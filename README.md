@@ -1,34 +1,166 @@
-# Nerve
+<p align="center">
+  <h1 align="center">Nerve</h1>
+  <p align="center">
+    <strong>Reflexive AI orchestration for coding agents - one lead, one reviewer, one auditable patch.</strong>
+  </p>
+  <p align="center">
+    <a href="#quick-start">Quick Start</a> &middot;
+    <a href="#agent-loop">Agent Loop</a> &middot;
+    <a href="#architecture">Architecture</a> &middot;
+    <a href="#configuration">Configuration</a> &middot;
+    <a href="#roadmap">Roadmap</a>
+  </p>
+</p>
 
-Nerve is a Rust CLI for reflexive AI orchestration: one lead coding agent proposes an implementation, a reviewer agent critiques it, and the orchestrator converges on a reviewed patch before anything is written to disk.
+---
 
-The long-term goal is not "run two models next to each other." The goal is a practical execution layer where Claude Code, Codex, and future coding agents can create friction, exchange review feedback, preserve the full decision trail, and apply changes through an auditable patch system.
+Nerve is a Rust CLI that routes a coding task through a **lead/reviewer loop**. The lead agent proposes an implementation, the reviewer critiques it, and the orchestrator keeps refining until the configured policy accepts a final patch.
 
-## Current Goal
+It is designed for agent pairs like Claude Code and Codex, but the core abstraction is generic: any model or tool that can implement the `ModelAdapter` trait can participate.
 
-Nerve is currently targeting a conservative Phase 1 MVP:
+```text
+User asks for a code change
+  -> nv "add a /health endpoint"
+  -> Lead agent proposes a patch
+  -> Reviewer returns LGTM / REQUEST_CHANGES / BLOCK
+  -> Lead refines when needed
+  -> Nerve prints the reviewed diff
+  -> Files change only when --apply is passed
+```
 
-- `nv "<task>"` dispatches a task through a lead/reviewer loop.
-- The lead proposes work, the reviewer returns `LGTM`, `REQUEST_CHANGES`, or `BLOCK`.
-- Refinement continues until `LGTM` or `max_refinement_rounds` is reached.
-- Patches are dry-run by default and require `--apply` before files are changed.
-- Mock adapters provide deterministic end-to-end behavior for local verification.
-- Real adapters spawn `claude` and `codex` subprocesses as the integration boundary.
+## Why Nerve?
 
-Important current limitation: the real subprocess adapters collect raw CLI output today. Structured `NvPatch` extraction from real unified diffs is the next core milestone before real-agent `--apply` should be treated as complete.
+Single-agent coding has a predictable failure mode: the same model that writes a patch often rationalizes it. Nerve makes review a first-class execution step instead of a final afterthought.
 
-## Why It Exists
+| Problem | Traditional Agent Flow | Nerve |
+|---------|------------------------|-------|
+| Patch quality | One model writes and self-justifies | Separate lead and reviewer roles |
+| Review loop | Manual, ad hoc, often skipped | Built into the orchestrator |
+| File writes | Agent may edit directly | Dry-run by default, `--apply` required |
+| Patch safety | Trust the generated diff | SHA-256 checked `NvPatch` apply/rollback |
+| Role routing | One prompt fits all | Config profiles choose lead/reviewer per task |
+| Auditability | Lost terminal scrollback | Round records and event stream in `Synapse` |
 
-Single-agent coding has a predictable failure mode: the same model that writes a patch often rationalizes it. Nerve makes review a first-class part of the execution path. It keeps the lead and reviewer roles separate, records each round, and only promotes a patch after the configured conflict policy allows it.
+## Current Status
+
+Nerve is in a Phase 1 MVP state.
+
+| Area | Status |
+|------|--------|
+| Cargo workspace | Implemented |
+| `nv` CLI | Implemented |
+| Config loading and profile matching | Implemented |
+| Mock lead/reviewer loop | Implemented and tested |
+| Hash-checked patch apply/rollback | Implemented and tested |
+| Claude/Codex subprocess boundary | Scaffolded |
+| Real CLI JSON parsing | Basic raw output capture |
+| Real unified-diff to `NvPatch` conversion | Next milestone |
+| Persistent history / patch index | Roadmap |
+| Real-time cross-firing / TUI | Roadmap |
+
+Important: the mock adapter path produces structured `NvPatch` values today. The real subprocess adapters currently capture raw CLI output, so real-agent `--apply` should not be considered complete until unified diffs are parsed into safe, cwd-confined `NvPatch` values.
+
+## Quick Start
+
+### Build
+
+```bash
+git clone https://github.com/kooroot/Nerve.git
+cd Nerve
+cargo build
+```
+
+### Validate config
+
+```bash
+cargo run -p nerve-cli -- config validate
+```
+
+### Run the deterministic mock loop
+
+```bash
+NERVE_ADAPTER=mock cargo run -p nerve-cli -- "add a health endpoint"
+```
+
+Expected behavior:
+
+- Nerve creates a session.
+- The mock lead proposes an initial patch.
+- The mock reviewer requests one refinement.
+- The lead refines.
+- The reviewer returns `LGTM`.
+- A unified diff is printed.
+- No files are changed.
+
+### Apply a reviewed mock patch
+
+```bash
+NERVE_ADAPTER=mock cargo run -p nerve-cli -- --apply "add a health endpoint"
+```
+
+### Install the CLI locally
+
+```bash
+cargo install --path crates/nerve-cli
+nv config validate
+NERVE_ADAPTER=mock nv "add a health endpoint"
+```
+
+## Agent Loop
+
+Nerve exposes one CLI today:
+
+| Command | Purpose |
+|---------|---------|
+| `nv "<task>"` | Run the lead/reviewer orchestration loop |
+| `nv --apply "<task>"` | Apply the accepted structured patch |
+| `nv --adapter mock "<task>"` | Use deterministic local mock adapters |
+| `nv --adapter real "<task>"` | Spawn real `claude` and `codex` subprocesses |
+| `nv config validate` | Validate `nerve.config.json` |
+
+Real adapter mode expects these CLIs on `PATH` and already authenticated:
+
+```bash
+claude -p "{prompt}" --output-format stream-json
+codex exec --json "{prompt}"
+```
+
+The subprocess boundary is intentionally CLI-first. Nerve does not depend on a vendor SDK in Phase 1; it treats model tools as external executables and streams their output into the orchestration state.
 
 ## Architecture
 
-The workspace is split into small crates with one-way dependencies:
+```text
+                         +-------------------------+
+                         |        nv CLI           |
+                         | prompt / config / apply |
+                         +-----------+-------------+
+                                     |
+                         +-----------v-------------+
+                         |      nerve-core         |
+                         | Synapse + orchestrator  |
+                         +-----------+-------------+
+                                     |
+          +--------------------------+--------------------------+
+          |                          |                          |
+ +--------v---------+       +--------v---------+       +--------v---------+
+ |  nerve-config    |       | nerve-adapter    |       |  nerve-patch    |
+ | profiles + rules |       | mock/subprocess  |       | NvPatch safety  |
+ +--------+---------+       +--------+---------+       +--------+---------+
+          |                          |                          |
+          +--------------------------+--------------------------+
+                                     |
+                         +-----------v-------------+
+                         |      nerve-types        |
+                         | Task / Event / Verdict  |
+                         +-------------------------+
+```
+
+Workspace layout:
 
 ```text
 crates/
-  nerve-cli/       nv binary, clap args, terminal output
-  nerve-core/      Synapse state and orchestration loop
+  nerve-cli/       `nv` binary, clap args, terminal output
+  nerve-core/      Synapse state and refinement loop
   nerve-adapter/   ModelAdapter trait, mock adapter, subprocess adapters
   nerve-config/    nerve.config.json loading and profile matching
   nerve-patch/     NvPatch model, hash validation, apply, rollback
@@ -48,78 +180,15 @@ Task
   -> Dry-run output or --apply
 ```
 
-## Installation
-
-Requirements:
-
-- Rust stable with edition 2024 support
-- `cargo`
-- Optional for real adapters: authenticated `claude` and `codex` CLIs available on `PATH`
-
-Build:
-
-```bash
-cargo build
-```
-
-Run the CLI through Cargo:
-
-```bash
-cargo run -p nerve-cli -- config validate
-```
-
-Install locally from the workspace:
-
-```bash
-cargo install --path crates/nerve-cli
-```
-
-After install, the binary is named `nv`.
-
-## Quick Start
-
-Validate the default config:
-
-```bash
-cargo run -p nerve-cli -- config validate
-```
-
-Run the deterministic mock loop:
-
-```bash
-NERVE_ADAPTER=mock cargo run -p nerve-cli -- "add a health endpoint"
-```
-
-By default this prints the reviewed diff and does not change files.
-
-Apply the final mock patch:
-
-```bash
-NERVE_ADAPTER=mock cargo run -p nerve-cli -- --apply "add a health endpoint"
-```
-
-Run with real subprocess adapters:
-
-```bash
-cargo run -p nerve-cli -- "rename foo to bar in src/lib.rs"
-```
-
-Real mode expects:
-
-- `claude -p "{prompt}" --output-format stream-json`
-- `codex exec --json "{prompt}"`
-
-Both tools must already be installed and authenticated by the user.
-
 ## Configuration
 
-Nerve loads config in this order:
+Nerve loads configuration in this order:
 
 1. `./nerve.config.json`
 2. `~/.config/nerve/config.json`
 3. Embedded default config
 
-Example:
+Default shape:
 
 ```json
 {
@@ -150,29 +219,45 @@ Example:
 }
 ```
 
-Profile matching supports:
+### Profile Matching
 
-- Keyword matching against the task prompt
-- Glob matching against `Task.context_paths`
-- Per-profile lead/reviewer selection
-- Per-profile review strictness
+Profiles can route work by:
+
+- Keyword rules matched against the task prompt
+- Glob rules matched against task context paths
+- Per-profile `lead`
+- Per-profile `reviewer`
+- Per-profile `review_strictness`
 - Optional per-profile `max_refinement_rounds`
+
+### Conflict Policies
+
+The config schema includes:
+
+| Policy | Phase 1 behavior |
+|--------|------------------|
+| `lead_priority` | Prefer the lead patch |
+| `reviewer_priority` | Prefer reviewer suggested patch when present |
+| `merge_attempt` | Accepted by config, full merge behavior is roadmap |
+| `abort_on_conflict` | Block on reviewer `BLOCK` |
+| `reviewer_block` | Block on reviewer `BLOCK` |
+| `manual` | Block on reviewer `BLOCK` |
 
 ## Safety Model
 
-Nerve is intentionally conservative:
+Nerve is built around conservative file mutation:
 
 - Dry-run is the default behavior.
 - `--apply` is required for file writes.
-- `NvPatch` validates SHA-256 hashes before applying or rolling back.
+- `NvPatch` validates the current file SHA-256 before applying.
+- `NvPatch` validates the modified file SHA-256 before rollback.
+- Missing files are represented as empty original content.
 - Reviewer `BLOCK` can prevent application depending on conflict policy.
 - Generated runtime state under `.nerve/` is ignored by Git.
 
-Before accepting model-generated real patches, the next implementation step should add a real unified-diff parser that converts subprocess output into hash-checked `NvPatch` values and rejects unsafe paths.
+The next safety-critical task is path confinement for model-produced patches: real diffs must not be allowed to write outside `Task.cwd`.
 
-## Verification
-
-Run the full local verification set:
+## Development
 
 ```bash
 cargo test
@@ -182,39 +267,68 @@ cargo run -p nerve-cli -- config validate
 NERVE_ADAPTER=mock cargo run -p nerve-cli -- "add log line to main.rs"
 ```
 
-Current verified behavior:
+Current test coverage verifies:
 
-- Config loading and profile matching
-- Mock lead/reviewer refinement loop
+- Default config loading
+- Keyword and glob profile matching
+- Mock lead/reviewer refinement until `LGTM`
 - Patch apply and rollback round trip
+- Hash mismatch rejection
 - CLI smoke test with dry-run diff output
+
+## How It Works
+
+```text
+User: "add a health endpoint"
+
+1. Config::select_profile(task)
+   -> choose lead, reviewer, strictness, max rounds
+
+2. lead.implement(task)
+   -> AgentOutput { raw_text, proposed_patch }
+
+3. reviewer.review(task, lead_output)
+   -> ReviewerFeedback { verdict, issues, suggested_patch }
+
+4. If verdict is REQUEST_CHANGES and rounds remain:
+   lead.refine(task, previous_output, feedback)
+
+5. Fusion:
+   select_final_patch(lead_output, reviewer_feedback, conflict_policy)
+
+6. Output:
+   - print reviewed diff
+   - apply only when --apply and policy allows it
+```
 
 ## Roadmap
 
-Phase 1 completion:
+### Phase 1 Completion
 
 - Parse real subprocess unified diffs into structured `NvPatch`.
-- Confine patch paths to the task `cwd`.
-- Add real-adapter E2E tests with fixture CLIs.
-- Emit clearer machine-readable session reports.
+- Reject unsafe absolute paths and `..` traversal.
+- Add fixture-based real adapter tests using fake `claude` and `codex` binaries.
+- Emit machine-readable session reports.
 
-Phase 2:
+### Phase 2
 
 - Persist Synapse history under `.nerve/`.
+- Add `.nerve/patches/index.json`.
 - Add `nv history`, `nv resume`, `nv list`, `nv apply <id>`, and `nv rollback <id>`.
-- Add an on-disk patch index.
-- Add atomic apply with automatic rollback on failure.
+- Add atomic multi-file apply with automatic rollback on failure.
+- Add token and cost budgets per session.
 
-Phase 3:
+### Phase 3
 
 - Real-time cross-firing between lead and reviewer.
 - Strategy plugins: `consensus`, `pipeline`, and `tournament`.
 - cmux or TUI layout for lead stream, reviewer stream, and orchestrator state.
-- Token and cost budgets per session.
+- Long-running daemon mode for editor and shell integrations.
 
-## Repository Status
+## Design Documents
 
-This repository is early-stage and intentionally transparent about what is finished. The mock path is suitable for verifying orchestration and patch safety. The real-agent path is a scaffold for subprocess integration and needs structured patch parsing before it should be used for automatic file changes.
+- [Architecture](./nerve-architecture.md)
+- [Implementation Plan](./nerve-implementation-plan.md)
 
 ## License
 
