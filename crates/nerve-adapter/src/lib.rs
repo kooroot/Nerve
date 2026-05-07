@@ -299,16 +299,7 @@ pub fn default_adapters(mock: bool) -> Vec<Box<dyn ModelAdapter>> {
 }
 
 fn feedback_from_text(reviewer_id: &str, raw_text: String) -> ReviewerFeedback {
-    let upper = raw_text.to_uppercase();
-    let verdict = if upper.contains("BLOCK") {
-        Verdict::Block
-    } else if upper.contains("REQUEST_CHANGES") || upper.contains("REQUEST CHANGES") {
-        Verdict::RequestChanges
-    } else if upper.contains("LGTM") {
-        Verdict::Lgtm
-    } else {
-        Verdict::RequestChanges
-    };
+    let verdict = parse_verdict(&raw_text);
 
     let issues = if verdict == Verdict::Lgtm {
         Vec::new()
@@ -319,11 +310,7 @@ fn feedback_from_text(reviewer_id: &str, raw_text: String) -> ReviewerFeedback {
             } else {
                 IssueSeverity::Warning
             },
-            message: raw_text
-                .lines()
-                .next()
-                .unwrap_or("review requested changes")
-                .to_string(),
+            message: issue_summary_from_text(&raw_text),
         }]
     };
 
@@ -337,6 +324,72 @@ fn feedback_from_text(reviewer_id: &str, raw_text: String) -> ReviewerFeedback {
     }
 }
 
+fn parse_verdict(raw_text: &str) -> Verdict {
+    let Some(first_line) = raw_text.lines().find(|line| !line.trim().is_empty()) else {
+        return Verdict::RequestChanges;
+    };
+    let upper = first_line.trim_start().to_uppercase();
+    if has_verdict_prefix(&upper, "LGTM") {
+        Verdict::Lgtm
+    } else if has_verdict_prefix(&upper, "REQUEST_CHANGES")
+        || has_verdict_prefix(&upper, "REQUEST CHANGES")
+    {
+        Verdict::RequestChanges
+    } else if has_verdict_prefix(&upper, "BLOCK") {
+        Verdict::Block
+    } else {
+        Verdict::RequestChanges
+    }
+}
+
+fn has_verdict_prefix(line: &str, prefix: &str) -> bool {
+    let Some(rest) = line.strip_prefix(prefix) else {
+        return false;
+    };
+    rest.chars()
+        .next()
+        .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
+}
+
+fn issue_summary_from_text(raw_text: &str) -> String {
+    let mut saw_verdict = false;
+    for line in raw_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if !saw_verdict {
+            saw_verdict = true;
+            if let Some(summary) = strip_verdict_prefix(trimmed) {
+                if !summary.is_empty() {
+                    return summary.to_string();
+                }
+                continue;
+            }
+            return trimmed.to_string();
+        }
+
+        return trimmed.to_string();
+    }
+
+    "review requested changes".to_string()
+}
+
+fn strip_verdict_prefix(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    for prefix in ["REQUEST_CHANGES", "REQUEST CHANGES", "BLOCK", "LGTM"] {
+        if trimmed
+            .get(..prefix.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+            && has_verdict_prefix(&trimmed.to_uppercase(), prefix)
+        {
+            return Some(trimmed[prefix.len()..].trim_start_matches([':', '-', ' ']));
+        }
+    }
+    None
+}
+
 fn output_from_raw_text(agent_id: &str, cwd: &Path, raw_text: String) -> Result<AgentOutput> {
     let patch_input = extract_patch_candidate_text(&raw_text);
     match NvPatch::from_unified_diff(cwd, &patch_input)? {
@@ -346,35 +399,63 @@ fn output_from_raw_text(agent_id: &str, cwd: &Path, raw_text: String) -> Result<
 }
 
 fn extract_patch_candidate_text(raw_text: &str) -> String {
-    let mut out = String::from(raw_text);
+    let mut out = String::new();
     for line in raw_text.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
 
-        collect_json_strings(&value, &mut out);
+        collect_adapter_message_text(&value, &mut out);
     }
-    out
+
+    if out.is_empty() {
+        raw_text.to_string()
+    } else {
+        out
+    }
 }
 
-fn collect_json_strings(value: &serde_json::Value, out: &mut String) {
-    match value {
-        serde_json::Value::String(value) => {
-            out.push('\n');
-            out.push_str(value);
+fn collect_adapter_message_text(value: &serde_json::Value, out: &mut String) {
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("assistant") {
+        collect_content_text(&value["message"]["content"], out);
+    }
+
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("item.completed") {
+        if let Some(text) = value["item"]["text"].as_str() {
+            push_candidate_text(out, text);
         }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_json_strings(value, out);
+        collect_content_text(&value["item"]["content"], out);
+    }
+}
+
+fn collect_content_text(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::String(text) => push_candidate_text(out, text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    && let Some(text) = item.get("text").and_then(serde_json::Value::as_str)
+                {
+                    push_candidate_text(out, text);
+                }
             }
         }
-        serde_json::Value::Object(values) => {
-            for value in values.values() {
-                collect_json_strings(value, out);
+        serde_json::Value::Object(item) => {
+            if item.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                && let Some(text) = item.get("text").and_then(serde_json::Value::as_str)
+            {
+                push_candidate_text(out, text);
             }
         }
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
+}
+
+fn push_candidate_text(out: &mut String, text: &str) {
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(text);
 }
 
 async fn send_stdout(tx: &mpsc::Sender<AgentEvent>, agent_id: &str, line: &str) {
@@ -431,6 +512,37 @@ Lead notes before the patch.
     }
 
     #[test]
+    fn parses_verdict_from_leading_token_only() {
+        let feedback = feedback_from_text("codex", "LGTM: no blockers remain".to_string());
+
+        assert_eq!(feedback.verdict, Verdict::Lgtm);
+        assert!(feedback.issues.is_empty());
+    }
+
+    #[test]
+    fn issue_message_skips_bare_verdict_line() {
+        let feedback = feedback_from_text(
+            "codex",
+            "REQUEST_CHANGES\n\nThe patch leaks a file descriptor.\nAdd a regression test."
+                .to_string(),
+        );
+
+        assert_eq!(feedback.verdict, Verdict::RequestChanges);
+        assert_eq!(
+            feedback.issues[0].message,
+            "The patch leaks a file descriptor."
+        );
+    }
+
+    #[test]
+    fn issue_message_keeps_first_line_without_explicit_verdict() {
+        let feedback = feedback_from_text("codex", "Please fix the missing test.".to_string());
+
+        assert_eq!(feedback.verdict, Verdict::RequestChanges);
+        assert_eq!(feedback.issues[0].message, "Please fix the missing test.");
+    }
+
+    #[test]
     fn extracts_structured_patch_from_jsonl_strings() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("file.txt"), "before\n").unwrap();
@@ -440,6 +552,22 @@ Lead notes before the patch.
         let output = output_from_raw_text("claude-code", dir.path(), raw).unwrap();
 
         let patch = output.proposed_patch.unwrap();
+        assert_eq!(patch.files[0].modified, "after\n");
+    }
+
+    #[test]
+    fn ignores_tool_result_diffs_when_extracting_jsonl_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "before\n").unwrap();
+        let raw = r#"{"type":"tool_result","content":"--- /dev/null\n+++ b/tool.txt\n@@ -0,0 +1 @@\n+wrong\n"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-before\n+after\n"}]}}"#
+            .to_string();
+
+        let output = output_from_raw_text("claude-code", dir.path(), raw).unwrap();
+
+        let patch = output.proposed_patch.unwrap();
+        assert_eq!(patch.files.len(), 1);
+        assert_eq!(patch.files[0].path, Path::new("file.txt"));
         assert_eq!(patch.files[0].modified, "after\n");
     }
 

@@ -530,7 +530,15 @@ fn truncate_for_crossfire(contents: &str) -> String {
     if contents.len() <= LIMIT {
         return contents.to_string();
     }
-    format!("{}…", &contents[..LIMIT])
+    format!("{}...", truncate_at_char_boundary(contents, LIMIT))
+}
+
+fn truncate_at_char_boundary(value: &str, limit: usize) -> &str {
+    let mut boundary = limit.min(value.len());
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &value[..boundary]
 }
 
 fn find_adapter<'a>(
@@ -558,6 +566,10 @@ fn select_final_patch(
     policy: &ConflictPolicy,
 ) -> Result<Option<NvPatch>> {
     match policy {
+        ConflictPolicy::LeadPriority
+        | ConflictPolicy::AbortOnConflict
+        | ConflictPolicy::ReviewerBlock
+        | ConflictPolicy::Manual => Ok(lead_output.proposed_patch.clone()),
         ConflictPolicy::ReviewerPriority => Ok(feedback
             .suggested_patch
             .clone()
@@ -567,7 +579,6 @@ fn select_final_patch(
             feedback.suggested_patch.as_ref(),
         )
         .context("failed to merge lead and reviewer patches"),
-        _ => Ok(lead_output.proposed_patch.clone()),
     }
 }
 
@@ -650,22 +661,31 @@ fn git_merge_file(base: &str, lead: &str, reviewer: &str) -> Result<String> {
         .output()
         .context("failed to run `git merge-file`")?;
 
-    if !output.status.success() {
-        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    match output.status.code() {
+        Some(0) => {}
+        Some(code) if (1..128).contains(&code) => {}
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "`git merge-file` failed with status {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn is_blocked(feedback: &ReviewerFeedback, policy: &ConflictPolicy) -> bool {
-    if feedback.verdict != Verdict::Block {
-        return false;
+    match policy {
+        ConflictPolicy::LeadPriority | ConflictPolicy::ReviewerPriority => false,
+        ConflictPolicy::AbortOnConflict => feedback.verdict != Verdict::Lgtm,
+        ConflictPolicy::MergeAttempt | ConflictPolicy::ReviewerBlock => {
+            feedback.verdict == Verdict::Block
+        }
+        ConflictPolicy::Manual => true,
     }
-
-    !matches!(
-        policy,
-        ConflictPolicy::LeadPriority | ConflictPolicy::ReviewerPriority
-    )
 }
 
 #[cfg(test)]
@@ -911,6 +931,144 @@ mod tests {
         assert_eq!(patch.files[0].modified, "ONE\ntwo\nTHREE\n");
     }
 
+    #[test]
+    fn merge_attempt_preserves_git_conflict_markers() {
+        let lead = AgentOutput::with_patch(
+            "lead",
+            "lead",
+            NvPatch::new(vec![FilePatch::new("file.txt", "one\ntwo\n", "ONE\ntwo\n")]),
+        );
+        let feedback = ReviewerFeedback {
+            reviewer_id: "reviewer".to_string(),
+            verdict: Verdict::Lgtm,
+            issues: Vec::new(),
+            suggested_patch: Some(NvPatch::new(vec![FilePatch::new(
+                "file.txt",
+                "one\ntwo\n",
+                "TWO\ntwo\n",
+            )])),
+            cost: None,
+            raw_text: "LGTM".to_string(),
+        };
+
+        let patch = select_final_patch(&lead, &feedback, &ConflictPolicy::MergeAttempt)
+            .unwrap()
+            .unwrap();
+
+        assert!(patch.files[0].modified.contains("<<<<<<<"));
+        assert!(patch.files[0].modified.contains(">>>>>>>"));
+    }
+
+    #[test]
+    fn crossfire_truncation_preserves_utf8_boundaries() {
+        let mut value = "a".repeat(8191);
+        value.push_str("한글");
+
+        let truncated = truncate_for_crossfire(&value);
+
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[tokio::test]
+    async fn max_refinement_rounds_counts_lead_refinements_not_reviews() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("never accepted", dir.path());
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": {
+                "architect": "stubborn-lead",
+                "reviewer": "stubborn-reviewer"
+              },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        let adapters = vec![
+            Box::new(StubbornAdapter::new("stubborn-lead")) as Box<dyn ModelAdapter>,
+            Box::new(StubbornAdapter::new("stubborn-reviewer")) as Box<dyn ModelAdapter>,
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply: false })
+            .await
+            .unwrap();
+
+        assert_eq!(report.rounds.len(), 3);
+        assert_eq!(report.final_output.raw_text, "refinement 2");
+    }
+
+    #[tokio::test]
+    async fn abort_on_conflict_blocks_request_changes_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("add a health endpoint", dir.path());
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "pipeline",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "abort_on_conflict"
+              },
+              "roles": {
+                "architect": "claude-code",
+                "reviewer": "codex"
+              },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        let adapters = vec![
+            Box::new(MockAdapter::lead()) as Box<dyn ModelAdapter>,
+            Box::new(MockAdapter::reviewer()) as Box<dyn ModelAdapter>,
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply: true })
+            .await
+            .unwrap();
+
+        assert!(report.blocked);
+        assert!(!report.applied);
+        assert!(!dir.path().join(".nerve/mock-output.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn manual_policy_never_auto_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("add a health endpoint", dir.path());
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "manual"
+              },
+              "roles": {
+                "architect": "claude-code",
+                "reviewer": "codex"
+              },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        let adapters = vec![
+            Box::new(MockAdapter::lead()) as Box<dyn ModelAdapter>,
+            Box::new(MockAdapter::reviewer()) as Box<dyn ModelAdapter>,
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply: true })
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
+        assert!(report.blocked);
+        assert!(!report.applied);
+        assert!(!dir.path().join(".nerve/mock-output.txt").exists());
+    }
+
     #[derive(Debug)]
     struct BudgetAdapter {
         id: &'static str,
@@ -973,6 +1131,70 @@ mod tests {
             _tx: mpsc::Sender<AgentEvent>,
         ) -> Result<AgentOutput> {
             Ok(self.output())
+        }
+    }
+
+    #[derive(Debug)]
+    struct StubbornAdapter {
+        id: &'static str,
+    }
+
+    impl StubbornAdapter {
+        fn new(id: &'static str) -> Self {
+            Self { id }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelAdapter for StubbornAdapter {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        async fn implement(
+            &self,
+            _task: &Task,
+            _cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            Ok(AgentOutput::text(self.id, "implementation 0"))
+        }
+
+        async fn review(
+            &self,
+            _task: &Task,
+            _lead_output: &AgentOutput,
+            _cwd: &Path,
+            _strictness: &str,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<ReviewerFeedback> {
+            Ok(ReviewerFeedback {
+                reviewer_id: self.id.to_string(),
+                verdict: Verdict::RequestChanges,
+                issues: vec![Issue {
+                    severity: IssueSeverity::Warning,
+                    message: "still not accepted".to_string(),
+                }],
+                suggested_patch: None,
+                cost: None,
+                raw_text: "REQUEST_CHANGES".to_string(),
+            })
+        }
+
+        async fn refine(
+            &self,
+            _task: &Task,
+            previous_output: &AgentOutput,
+            _feedback: &ReviewerFeedback,
+            _cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            let next = if previous_output.raw_text.ends_with('0') {
+                1
+            } else {
+                2
+            };
+            Ok(AgentOutput::text(self.id, format!("refinement {next}")))
         }
     }
 

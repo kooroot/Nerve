@@ -141,7 +141,7 @@ Verified real output shapes:
 
 - Claude Code 2.1.128 requires `--verbose` with `stream-json` and emits assistant text under `message.content[].text`.
 - Codex CLI 0.128.0 emits assistant text under `item.text` in `item.completed` events.
-- Both shapes are parsed through generic JSON string extraction before unified diff parsing.
+- Only assistant-authored text fields are considered for unified diff parsing; tool inputs/results and other JSON string fields are ignored.
 
 The subprocess boundary is intentionally CLI-first. Nerve does not depend on a vendor SDK in Phase 1; it treats model tools as external executables and streams their output into the orchestration state.
 
@@ -171,7 +171,7 @@ Use `--json` with `history`, `resume`, and `list` when another tool needs the st
 
 ### Doctor
 
-Use `nv doctor` to validate local prerequisites. In real adapter mode it checks that `claude` and `codex` are available on `PATH`; in mock mode it validates config and the built-in mock adapter path.
+Use `nv doctor` to validate local prerequisites. In real adapter mode it checks that executable `claude` and `codex` files are available on `PATH`; in mock mode it validates config and the built-in mock adapter path.
 
 ### Daemon Mode
 
@@ -281,7 +281,7 @@ Default shape:
 Profiles can route work by:
 
 - Keyword rules matched against the task prompt
-- Glob rules matched against task context paths
+- Glob rules matched against task context paths collected from prompt path tokens and changed Git paths
 - Combined `all` / `any` rule groups
 - Per-profile `lead`
 - Per-profile `reviewer`
@@ -303,9 +303,9 @@ The config schema includes:
 | `lead_priority` | Prefer the lead patch |
 | `reviewer_priority` | Prefer reviewer suggested patch when present |
 | `merge_attempt` | Merge lead and reviewer patches with `git merge-file` when both touch the same file |
-| `abort_on_conflict` | Block on reviewer `BLOCK` |
+| `abort_on_conflict` | Block apply unless the reviewer returns `LGTM` |
 | `reviewer_block` | Block on reviewer `BLOCK` |
-| `manual` | Block on reviewer `BLOCK` |
+| `manual` | Always block auto-apply and leave the patch for manual handling |
 
 ### Session Budgets
 
@@ -326,6 +326,8 @@ Adapters that do not report usage leave these counters at zero; budget enforceme
 | `pipeline` | Lead implements once and reviewer critiques once; no refinement loop runs. |
 | `tournament` | Lead and reviewer both generate candidate outputs, cross-review each other, and Nerve selects the accepted candidate. |
 
+`max_refinement_rounds` counts lead refinement attempts. A consensus run may therefore perform one initial review plus one review after each allowed refinement.
+
 ## Safety Model
 
 Nerve is built around conservative file mutation:
@@ -336,6 +338,7 @@ Nerve is built around conservative file mutation:
 - `NvPatch` validates the modified file SHA-256 before rollback.
 - `NvPatch` rejects absolute paths, `..` traversal, and symlinked directories that resolve outside the working directory.
 - File writes are staged through sibling temp files and committed with rename.
+- Stored JSON writes use unique same-directory temp files, and patch index updates are serialized with a lock file.
 - Multi-file apply captures pre-apply snapshots and restores them automatically if any file operation fails.
 - Created files are removed during rollback.
 - Deleted files are restored from the original content during rollback.

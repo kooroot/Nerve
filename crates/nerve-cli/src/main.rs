@@ -7,6 +7,7 @@ use nerve_core::{RunOptions, RunReport, run_synaptic_loop};
 use nerve_types::{AgentEvent, Task, Verdict};
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
 use tokio::io::{self, AsyncBufReadExt};
 
 #[derive(Debug, Parser)]
@@ -265,7 +266,8 @@ async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
 async fn run_report(prompt: String, apply: bool, mock: bool) -> Result<RunReport> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let config = Config::load_from(&cwd)?;
-    let task = Task::new(prompt, &cwd);
+    let mut task = Task::new(prompt, &cwd);
+    task.context_paths = collect_context_paths(&task.prompt, &cwd);
     let adapters = default_adapters(mock);
     let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply }).await?;
     NerveStore::new(&cwd).save_report(&report)?;
@@ -394,7 +396,15 @@ fn truncate_panel_text(value: &str) -> String {
     if value.len() <= LIMIT {
         return value.to_string();
     }
-    format!("{}...", &value[..LIMIT])
+    format!("{}...", truncate_at_char_boundary(value, LIMIT))
+}
+
+fn truncate_at_char_boundary(value: &str, limit: usize) -> &str {
+    let mut boundary = limit.min(value.len());
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &value[..boundary]
 }
 
 fn print_changed_files(paths: &[std::path::PathBuf]) {
@@ -410,6 +420,15 @@ fn find_on_path(binary: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable_file(candidate))
 }
 
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
 fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
@@ -418,5 +437,99 @@ fn print_doctor_check(binary: &str, path: &Option<PathBuf>) {
     match path {
         Some(path) => println!("{binary}: {}", path.display()),
         None => println!("{binary}: missing"),
+    }
+}
+
+fn collect_context_paths(prompt: &str, cwd: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for token in prompt.split_whitespace() {
+        let token = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '`' | '"' | '\'' | ',' | ':' | ';' | '(' | ')' | '[' | ']'
+            )
+        });
+        if looks_like_path_token(token) {
+            push_unique_path(&mut paths, PathBuf::from(token));
+        }
+    }
+
+    for path in git_changed_paths(cwd) {
+        push_unique_path(&mut paths, path);
+    }
+
+    paths
+}
+
+fn looks_like_path_token(token: &str) -> bool {
+    !token.is_empty()
+        && !token.contains("://")
+        && (token.contains('/')
+            || token
+                .rsplit_once('.')
+                .is_some_and(|(_, ext)| !ext.is_empty()))
+}
+
+fn git_changed_paths(cwd: &Path) -> Vec<PathBuf> {
+    let Ok(output) = StdCommand::new("git")
+        .args(["diff", "--name-only", "HEAD"])
+        .current_dir(cwd)
+        .output()
+    else {
+        return Vec::new();
+    };
+
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tui_truncation_preserves_utf8_boundaries() {
+        let mut value = "a".repeat(1199);
+        value.push_str("한글");
+
+        let truncated = truncate_panel_text(&value);
+
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn context_paths_include_prompt_path_tokens() {
+        let paths = collect_context_paths("audit crates/nerve-core/src/lib.rs now", Path::new("."));
+
+        assert!(paths.contains(&PathBuf::from("crates/nerve-core/src/lib.rs")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_check_rejects_files_without_execute_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("codex");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        assert!(!is_executable_file(&path));
     }
 }

@@ -4,7 +4,9 @@ use nerve_patch::{ApplyReport, NvPatch};
 use nerve_types::Verdict;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct NerveStore {
@@ -123,6 +125,7 @@ impl NerveStore {
     }
 
     fn upsert_patch_record(&self, record: PatchRecord) -> Result<()> {
+        let _lock = self.lock_index()?;
         let mut index = self.load_index()?;
         index.patches.retain(|existing| existing.id != record.id);
         index.patches.push(record);
@@ -130,12 +133,31 @@ impl NerveStore {
     }
 
     fn set_patch_applied(&self, id: &str, applied: bool) -> Result<()> {
+        let _lock = self.lock_index()?;
         let mut index = self.load_index()?;
         let Some(record) = index.patches.iter_mut().find(|record| record.id == id) else {
             anyhow::bail!("patch `{id}` is not indexed");
         };
+        let session_id = record.session_id.clone();
         record.applied = applied;
-        write_json(&self.index_path(), &index)
+        write_json(&self.index_path(), &index)?;
+        self.set_session_applied(&session_id, applied)
+    }
+
+    fn set_session_applied(&self, id: &str, applied: bool) -> Result<()> {
+        let path = self.session_path(id);
+        if !path.exists() {
+            return Ok(());
+        }
+        let mut report: RunReport = read_json(&path)?;
+        report.applied = applied;
+        write_json(&path, &report)
+    }
+
+    fn lock_index(&self) -> Result<StoreLock> {
+        fs::create_dir_all(self.patches_dir())
+            .with_context(|| format!("failed to create `{}`", self.patches_dir().display()))?;
+        StoreLock::acquire(self.patches_dir().join("index.lock"))
     }
 
     fn load_index(&self) -> Result<PatchIndex> {
@@ -213,6 +235,40 @@ impl PatchRecord {
     }
 }
 
+struct StoreLock {
+    path: PathBuf,
+    _file: fs::File,
+}
+
+impl StoreLock {
+    fn acquire(path: PathBuf) -> Result<Self> {
+        const RETRIES: usize = 200;
+        for _ in 0..RETRIES {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok(Self { path, _file: file }),
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(source) => {
+                    return Err(source)
+                        .with_context(|| format!("failed to create `{}`", path.display()));
+                }
+            }
+        }
+        anyhow::bail!("timed out waiting for `{}`", path.display())
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 fn read_json<T>(path: &Path) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -232,15 +288,61 @@ where
     }
 
     let raw = serde_json::to_vec_pretty(value)?;
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, raw)
-        .with_context(|| format!("failed to write `{}`", tmp_path.display()))?;
-    fs::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "failed to move `{}` to `{}`",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create temp file in `{}`", parent.display()))?;
+    tmp.write_all(&raw)
+        .with_context(|| format!("failed to write temp JSON for `{}`", path.display()))?;
+    tmp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to move temp JSON to `{}`", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RunReport;
+    use nerve_config::{ProfileSelection, ReviewStrictness};
+    use nerve_patch::{FilePatch, NvPatch};
+    use nerve_types::{AgentOutput, ReviewerFeedback, Task};
+
+    #[test]
+    fn apply_and_rollback_keep_session_history_in_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = NvPatch::new(vec![FilePatch::create("created.txt", "created\n")]);
+        let task = Task::new("create file", dir.path());
+        let report = RunReport {
+            task: task.clone(),
+            selection: ProfileSelection {
+                id: None,
+                lead: "lead".to_string(),
+                reviewer: "reviewer".to_string(),
+                review_strictness: ReviewStrictness::Normal,
+                max_refinement_rounds: 1,
+            },
+            rounds: Vec::new(),
+            crossfire_feedback: Vec::new(),
+            final_output: AgentOutput::with_patch("lead", "patch", patch.clone()),
+            final_feedback: ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            final_patch: Some(patch.clone()),
+            events: Vec::new(),
+            usage: Default::default(),
+            budget_exceeded: false,
+            applied: false,
+            blocked: false,
+        };
+        let store = NerveStore::new(dir.path());
+        store.save_report(&report).unwrap();
+
+        store.apply_patch(&patch.id).unwrap();
+
+        assert!(store.list_patches().unwrap()[0].applied);
+        assert!(store.load_report(&task.id).unwrap().applied);
+
+        store.rollback_patch(&patch.id).unwrap();
+
+        assert!(!store.list_patches().unwrap()[0].applied);
+        assert!(!store.load_report(&task.id).unwrap().applied);
+    }
 }

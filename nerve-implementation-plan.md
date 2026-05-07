@@ -108,7 +108,8 @@ struct SynapseState {
    초기에 "lead가 끝날 때까지 대기 후 비평" 모드로 시작 (MVP는 순수
    병렬 대신 **순차+1라운드 비평**으로 단순화).
 3. Reviewer 피드백을 lead에게 second prompt로 재전송.
-4. `max_refinement_rounds` 도달 또는 reviewer가 `LGTM` 반환 시 loop 종료.
+4. `max_refinement_rounds`만큼 lead refinement를 허용하고, reviewer가 `LGTM`
+   반환하거나 허용된 refinement를 모두 소진하면 loop 종료.
 5. `conflict_policy`(`lead_priority` 등)에 따라 최종 patch 선정.
 
 ### 1.4 `nerve-patch` — diff 데이터 모델
