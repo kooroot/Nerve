@@ -1,0 +1,47 @@
+# Changelog
+
+All notable changes to Nerve are documented here.
+
+## v0.1.0 - 2026-05-09
+
+Initial usable release of the Nerve CLI orchestration workspace.
+
+### Added
+
+- `nv` CLI for lead/reviewer coding orchestration.
+- Config loading from `./nerve.config.json`, user config, or embedded defaults.
+- Profile routing with keyword, glob, and logical `all` / `any` match rules.
+- Consensus, pipeline, and tournament orchestration strategies.
+- Mock and subprocess adapters for local tests and real `claude` / `codex` CLI runs.
+- Machine-readable `RunReport` JSON output via `--json`.
+- Terminal three-pane summary via `--tui`.
+- Line-oriented `nv daemon` mode.
+- Persistent `.nerve/` session reports, patch index, history, resume, list, apply, and rollback commands.
+- Hash-checked `NvPatch` apply and rollback for create, modify, delete, and rename operations.
+- Staged file writes and multi-file snapshot rollback on apply failure.
+- Usage budget guards for token and estimated cost ceilings.
+- `nv doctor` prerequisite checks.
+- Scratch-file crossfire feedback during lead execution.
+- `merge_attempt` patch merging through `git merge-file`.
+- `nerve-101.md` quick-start and architecture guide.
+
+### Fixed
+
+- Reviewer verdict parsing now reads the leading verdict token instead of matching incidental words such as `no blockers`.
+- JSONL diff extraction now uses assistant-authored text fields and ignores tool input/result strings.
+- Structured reviewer issues skip leading verdict lines and preserve the actual finding text.
+- Crossfire and TUI truncation preserve UTF-8 character boundaries.
+- `merge_attempt` preserves conflict-marker output from `git merge-file` instead of treating conflict exit codes as fatal.
+- Conflict policies now have explicit runtime behavior for `abort_on_conflict`, `reviewer_block`, and `manual`.
+- CLI dispatch populates context paths so glob profile rules can match production tasks.
+- `nv doctor` checks Unix executable bits for real adapter binaries.
+- Indexed apply and rollback now keep session report `applied` state in sync.
+- Store JSON writes use unique temporary files, and patch index updates are serialized with a lock file.
+
+### Verified
+
+- `cargo fmt --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test`
+- `target/debug/nv config validate`
+- Mock doctor, JSON, TUI, and daemon smoke paths.
