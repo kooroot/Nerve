@@ -28,7 +28,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
-          - os: macos-13
+          - os: macos-14
             target: x86_64-apple-darwin
             archive: tar.gz
           - os: macos-14
@@ -81,3 +81,4 @@ jobs:
           files: dist/nerve-${{ env.RELEASE_TAG }}-${{ matrix.target }}.${{ matrix.archive }}
           tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
+          overwrite_files: true
