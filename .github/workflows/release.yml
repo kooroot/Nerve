@@ -4,9 +4,18 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag to package, for example v0.1.1"
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+env:
+  RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
 
 jobs:
   build:
@@ -32,6 +41,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -46,7 +57,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME}"
+          version="${RELEASE_TAG}"
           asset="nerve-${version}-${{ matrix.target }}"
           mkdir -p "dist/${asset}"
           cp "target/${{ matrix.target }}/release/nv" "dist/${asset}/nv"
@@ -57,7 +68,7 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME
+          $version = $env:RELEASE_TAG
           $asset = "nerve-$version-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$asset" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/nv.exe" "dist/$asset/nv.exe"
@@ -67,5 +78,6 @@ jobs:
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/nerve-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive }}
+          files: dist/nerve-${{ env.RELEASE_TAG }}-${{ matrix.target }}.${{ matrix.archive }}
+          tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
