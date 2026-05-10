@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+libc.workspace = true
 nerve-adapter = { path = "../nerve-adapter" }
 nerve-config = { path = "../nerve-config" }
 nerve-core = { path = "../nerve-core" }

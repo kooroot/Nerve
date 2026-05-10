@@ -243,6 +243,7 @@ async fn run_prompt(prompt: String, apply: bool, json: bool, tui: bool, mock: bo
 }
 
 async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
+    let _echo_guard = disable_stdin_echo_if_terminal()?;
     let stdin = io::BufReader::new(io::stdin());
     let mut lines = stdin.lines();
 
@@ -261,6 +262,56 @@ async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+struct TerminalEchoGuard {
+    fd: std::os::fd::RawFd,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl Drop for TerminalEchoGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn disable_stdin_echo_if_terminal() -> Result<Option<TerminalEchoGuard>> {
+    use std::io::IsTerminal;
+    use std::os::fd::AsRawFd;
+
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        return Ok(None);
+    }
+
+    let fd = stdin.as_raw_fd();
+    let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+    unsafe {
+        if libc::tcgetattr(fd, original.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to read terminal settings");
+        }
+
+        let original = original.assume_init();
+        let mut adjusted = original;
+        adjusted.c_lflag &= !libc::ECHO;
+        if libc::tcsetattr(fd, libc::TCSANOW, &adjusted) != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to disable terminal input echo");
+        }
+
+        Ok(Some(TerminalEchoGuard { fd, original }))
+    }
+}
+
+#[cfg(not(unix))]
+fn disable_stdin_echo_if_terminal() -> Result<Option<()>> {
+    Ok(None)
 }
 
 async fn run_report(prompt: String, apply: bool, mock: bool) -> Result<RunReport> {
