@@ -101,12 +101,37 @@ Expected behavior:
 NERVE_ADAPTER=mock cargo run -p nerve-cli -- --apply "add a health endpoint"
 ```
 
-### Install the CLI locally
+### Install the CLI
+
+Download a prebuilt binary from the latest GitHub release:
+
+```bash
+curl -L https://github.com/kooroot/Nerve/releases/latest/download/nerve-v0.1.1-aarch64-apple-darwin.tar.gz | tar -xz
+sudo mv nv /usr/local/bin/
+```
+
+Choose the archive that matches your platform:
+
+| Platform | Release asset |
+|----------|---------------|
+| macOS Apple Silicon | `nerve-v0.1.1-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `nerve-v0.1.1-x86_64-apple-darwin.tar.gz` |
+| Linux x64 | `nerve-v0.1.1-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows x64 | `nerve-v0.1.1-x86_64-pc-windows-msvc.zip` |
+
+Or install from source with Cargo:
 
 ```bash
 cargo install --path crates/nerve-cli
 nv config validate
 NERVE_ADAPTER=mock nv "add a health endpoint"
+```
+
+From GitHub:
+
+```bash
+cargo install --git https://github.com/kooroot/Nerve.git nerve-cli
+nv config validate
 ```
 
 ## Agent Loop

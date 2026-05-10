@@ -2,6 +2,24 @@
 
 All notable changes to Nerve are documented here.
 
+## v0.1.1 - 2026-05-11
+
+Follow-up distribution release for the Nerve CLI.
+
+### Added
+
+- GitHub release automation for Linux, macOS, and Windows `nv` binaries.
+- README installation instructions for release downloads and `cargo install --git`.
+
+### Fixed
+
+- `nv daemon` now disables stdin echo when running under a Unix terminal or pty, then restores the original terminal settings on exit. This keeps daemon stdout as clean JSON lines for editor and shell integrations.
+
+### Verified
+
+- `cargo fmt --check`
+- `cargo test`
+
 ## v0.1.0 - 2026-05-09
 
 Initial usable release of the Nerve CLI orchestration workspace.
