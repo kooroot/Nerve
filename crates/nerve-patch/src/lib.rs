@@ -71,7 +71,7 @@ fn default_file_operation() -> FileOperation {
     FileOperation::Modify
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApplyReport {
     pub patch_id: String,
     pub changed_files: Vec<PathBuf>,

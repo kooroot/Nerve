@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerve_adapter::default_adapters;
-use nerve_config::Config;
+use nerve_config::{Config, DaemonProtocol};
 use nerve_core::store::NerveStore;
 use nerve_core::{RunOptions, RunReport, run_synaptic_loop};
 use nerve_types::{AgentEvent, Task, Verdict};
 use std::env;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use tokio::io::{self, AsyncBufReadExt};
@@ -52,6 +53,12 @@ enum Command {
     History {
         #[arg(long, help = "Emit stored sessions as JSON")]
         json: bool,
+        #[arg(long, help = "Show only sessions whose patch is applied")]
+        applied: bool,
+        #[arg(long, help = "Show only blocked sessions")]
+        blocked: bool,
+        #[arg(long, help = "Show only named sessions")]
+        named: bool,
     },
     #[command(about = "Print a stored session report")]
     Resume {
@@ -81,12 +88,51 @@ enum Command {
     Daemon {
         #[arg(long, help = "Process one prompt from stdin and exit")]
         once: bool,
+        #[arg(long, help = "Use JSONL RPC input and lifecycle events")]
+        rpc: bool,
+    },
+    #[command(about = "First-run setup and local prerequisite checks")]
+    Setup,
+    #[command(about = "Name a stored Nerve session")]
+    Name {
+        #[arg(help = "Stored task/session id")]
+        task_id: String,
+        #[arg(help = "Human-readable session name")]
+        name: String,
+    },
+    #[command(about = "Run a follow-up prompt linked to an existing session")]
+    Rerun {
+        #[arg(help = "Source task/session id")]
+        task_id: String,
+        #[arg(help = "Follow-up task prompt")]
+        prompt: String,
+    },
+    #[command(about = "List or run configured prompt templates")]
+    Template {
+        #[command(subcommand)]
+        command: TemplateCommand,
     },
 }
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
     Validate,
+}
+
+#[derive(Debug, Subcommand)]
+enum TemplateCommand {
+    #[command(about = "List configured prompt templates")]
+    List {
+        #[arg(long, help = "Emit templates as JSON")]
+        json: bool,
+    },
+    #[command(about = "Run a configured prompt template")]
+    Run {
+        #[arg(help = "Template id from `nv template list`")]
+        template_id: String,
+        #[arg(help = "Arguments substituted into {{args}}")]
+        args: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -108,9 +154,19 @@ async fn main() -> Result<()> {
             println!("nerve.config.json is valid");
             Ok(())
         }
-        Some(Command::History { json }) => {
+        Some(Command::History {
+            json,
+            applied,
+            blocked,
+            named,
+        }) => {
             let cwd = env::current_dir().context("failed to read current directory")?;
-            let sessions = NerveStore::new(cwd).list_sessions()?;
+            let mut sessions = NerveStore::new(cwd).list_sessions()?;
+            sessions.retain(|session| {
+                (!applied || session.applied)
+                    && (!blocked || session.blocked)
+                    && (!named || session.name.is_some())
+            });
             if json {
                 println!("{}", serde_json::to_string_pretty(&sessions)?);
             } else if sessions.is_empty() {
@@ -118,12 +174,13 @@ async fn main() -> Result<()> {
             } else {
                 for session in sessions {
                     println!(
-                        "{} | {:?} | rounds={} | applied={} | patch={} | {}",
+                        "{} | {:?} | rounds={} | applied={} | patch={} | name={} | {}",
                         session.id,
                         session.verdict,
                         session.rounds,
                         session.applied,
                         session.patch_id.as_deref().unwrap_or("-"),
+                        session.name.as_deref().unwrap_or("-"),
                         session.prompt
                     );
                 }
@@ -184,36 +241,59 @@ async fn main() -> Result<()> {
             print_changed_files(&report.changed_files);
             Ok(())
         }
-        Some(Command::Doctor) => {
-            let cwd = env::current_dir().context("failed to read current directory")?;
-            Config::load_from(&cwd)?;
-            println!("config: ok");
-
-            match cli.adapter {
-                AdapterMode::Mock => {
-                    println!("adapter: mock ok");
-                    Ok(())
-                }
-                AdapterMode::Real => {
-                    let claude = find_on_path("claude");
-                    let codex = find_on_path("codex");
-                    print_doctor_check("claude", &claude);
-                    print_doctor_check("codex", &codex);
-                    if claude.is_some() && codex.is_some() {
-                        Ok(())
-                    } else {
-                        anyhow::bail!("real adapter prerequisites are missing")
-                    }
-                }
+        Some(Command::Doctor) => run_doctor(matches!(cli.adapter, AdapterMode::Mock)),
+        Some(Command::Daemon { once, rpc }) => {
+            let config_prefers_rpc = Config::load()
+                .map(|config| matches!(config.daemon.protocol, DaemonProtocol::Rpc))
+                .unwrap_or(false);
+            if rpc || config_prefers_rpc {
+                run_rpc_daemon(cli.apply, matches!(cli.adapter, AdapterMode::Mock), once).await
+            } else {
+                run_daemon(cli.apply, matches!(cli.adapter, AdapterMode::Mock), once).await
             }
         }
-        Some(Command::Daemon { once }) => {
-            run_daemon(cli.apply, matches!(cli.adapter, AdapterMode::Mock), once).await
+        Some(Command::Setup) => run_setup(matches!(cli.adapter, AdapterMode::Mock)),
+        Some(Command::Name { task_id, name }) => {
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            NerveStore::new(cwd).name_session(&task_id, name)?;
+            println!("Named session {task_id}.");
+            Ok(())
+        }
+        Some(Command::Rerun { task_id, prompt }) => {
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            let store = NerveStore::new(&cwd);
+            store.load_report(&task_id)?;
+            let report =
+                run_report(prompt, cli.apply, matches!(cli.adapter, AdapterMode::Mock)).await?;
+            store.link_child_session(&report.task.id, &task_id)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if cli.tui {
+                print_tui_report(&report);
+            } else {
+                print_report(&report, cli.apply);
+                println!("Linked to parent session {task_id}.");
+            }
+            Ok(())
+        }
+        Some(Command::Template { command }) => {
+            run_template(
+                command,
+                cli.apply,
+                cli.json,
+                cli.tui,
+                matches!(cli.adapter, AdapterMode::Mock),
+            )
+            .await
         }
         None => {
-            let prompt = cli
-                .prompt
-                .context("missing prompt; usage: nv \"add a /health endpoint\"")?;
+            let Some(prompt) = cli.prompt else {
+                if std::io::stdin().is_terminal() {
+                    return run_interactive(cli.apply, matches!(cli.adapter, AdapterMode::Mock))
+                        .await;
+                }
+                anyhow::bail!("missing prompt; usage: nv \"add a /health endpoint\"");
+            };
             run_prompt(
                 prompt,
                 cli.apply,
@@ -242,6 +322,155 @@ async fn run_prompt(prompt: String, apply: bool, json: bool, tui: bool, mock: bo
     Ok(())
 }
 
+async fn run_template(
+    command: TemplateCommand,
+    apply: bool,
+    json: bool,
+    tui: bool,
+    mock: bool,
+) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let config = Config::load_from(&cwd)?;
+    match command {
+        TemplateCommand::List { json } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&config.templates)?);
+            } else if config.templates.is_empty() {
+                println!("No prompt templates configured.");
+            } else {
+                for template in config.templates {
+                    println!(
+                        "{} | {}",
+                        template.id,
+                        template.description.as_deref().unwrap_or("-")
+                    );
+                }
+            }
+            Ok(())
+        }
+        TemplateCommand::Run { template_id, args } => {
+            let Some(template) = config
+                .templates
+                .iter()
+                .find(|template| template.id == template_id)
+            else {
+                anyhow::bail!("template `{template_id}` is not configured");
+            };
+            let prompt = template.prompt.replace("{{args}}", &args.join(" "));
+            run_prompt(prompt, apply, json, tui, mock).await
+        }
+    }
+}
+
+fn run_doctor(mock: bool) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    Config::load_from(&cwd)?;
+    println!("config: ok");
+
+    if mock {
+        println!("adapter: mock ok");
+        return Ok(());
+    }
+
+    let claude = find_on_path("claude");
+    let codex = find_on_path("codex");
+    print_doctor_check("claude", &claude);
+    print_doctor_check("codex", &codex);
+    if claude.is_some() && codex.is_some() {
+        Ok(())
+    } else {
+        anyhow::bail!("real adapter prerequisites are missing")
+    }
+}
+
+fn run_setup(mock: bool) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let store = NerveStore::new(&cwd);
+    store.init()?;
+    println!("store: {}", cwd.join(".nerve").display());
+    run_doctor(mock)
+}
+
+async fn run_interactive(apply: bool, mock: bool) -> Result<()> {
+    println!("Nerve interactive. Type /help for commands, /quit to exit.");
+    let stdin = io::BufReader::new(io::stdin());
+    let mut lines = stdin.lines();
+
+    loop {
+        print!("nv> ");
+        std::io::stdout().flush()?;
+        let Some(line) = lines.next_line().await? else {
+            break;
+        };
+        let input = line.trim();
+        if input.is_empty() {
+            continue;
+        }
+        if let Some(command) = input.strip_prefix('/') {
+            if handle_interactive_command(command, apply, mock).await? {
+                break;
+            }
+            continue;
+        }
+        run_prompt(input.to_string(), apply, false, false, mock).await?;
+    }
+
+    Ok(())
+}
+
+async fn handle_interactive_command(command: &str, apply: bool, mock: bool) -> Result<bool> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let mut parts = command.split_whitespace();
+    let name = parts.next().unwrap_or("");
+    match name {
+        "help" => {
+            println!(
+                "/doctor /history /resume <id> /list /apply <patch-id> /rollback <patch-id> /quit"
+            );
+        }
+        "doctor" => run_doctor(mock)?,
+        "history" => {
+            for session in NerveStore::new(cwd).list_sessions()? {
+                println!(
+                    "{} | {:?} | applied={} | name={} | {}",
+                    session.id,
+                    session.verdict,
+                    session.applied,
+                    session.name.as_deref().unwrap_or("-"),
+                    session.prompt
+                );
+            }
+        }
+        "resume" => {
+            let id = parts.next().context("usage: /resume <session-id>")?;
+            let report = NerveStore::new(cwd).load_report(id)?;
+            print_report(&report, false);
+        }
+        "list" => {
+            for patch in NerveStore::new(cwd).list_patches()? {
+                println!(
+                    "{} | {:?} | files={} | applied={} | {}",
+                    patch.id, patch.verdict, patch.file_count, patch.applied, patch.prompt
+                );
+            }
+        }
+        "apply" => {
+            let id = parts.next().context("usage: /apply <patch-id>")?;
+            let report = NerveStore::new(cwd).apply_patch(id)?;
+            println!("Applied patch {}.", report.patch_id);
+        }
+        "rollback" => {
+            let id = parts.next().context("usage: /rollback <patch-id>")?;
+            let report = NerveStore::new(cwd).rollback_patch(id)?;
+            println!("Rolled back patch {}.", report.patch_id);
+        }
+        "quit" | "exit" => return Ok(true),
+        other => println!("Unknown command /{other}. Type /help for commands."),
+    }
+    let _ = apply;
+    Ok(false)
+}
+
 async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
     let _echo_guard = disable_stdin_echo_if_terminal()?;
     let stdin = io::BufReader::new(io::stdin());
@@ -261,6 +490,144 @@ async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn run_rpc_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
+    let _echo_guard = disable_stdin_echo_if_terminal()?;
+    let stdin = io::BufReader::new(io::stdin());
+    let mut lines = stdin.lines();
+
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(error) => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "error",
+                        "message": format!("invalid JSON: {error}")
+                    })
+                );
+                if once {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        if let Err(error) = handle_rpc_command(value, apply, mock).await {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "error",
+                    "message": error.to_string()
+                })
+            );
+        }
+
+        if once {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_rpc_command(value: serde_json::Value, apply: bool, mock: bool) -> Result<()> {
+    let command = value
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .context("missing string field `command`")?;
+    match command {
+        "prompt" => {
+            let prompt = value
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .context("missing string field `prompt`")?;
+            let report = run_report(prompt.to_string(), apply, mock).await?;
+            emit_report_events(&report)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "session_end",
+                    "session_id": report.task.id,
+                    "verdict": report.final_feedback.verdict,
+                    "applied": report.applied,
+                    "blocked": report.blocked,
+                    "patch_id": report.final_patch.as_ref().map(|patch| patch.id.clone())
+                })
+            );
+        }
+        "get_state" | "history" => {
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "history",
+                    "sessions": NerveStore::new(cwd).list_sessions()?
+                })
+            );
+        }
+        "resume" => {
+            let session_id = value
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .context("missing string field `session_id`")?;
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "session",
+                    "report": NerveStore::new(cwd).load_report(session_id)?
+                })
+            );
+        }
+        "list_patches" => {
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "patches",
+                    "patches": NerveStore::new(cwd).list_patches()?
+                })
+            );
+        }
+        "apply_patch" => {
+            let patch_id = value
+                .get("patch_id")
+                .and_then(serde_json::Value::as_str)
+                .context("missing string field `patch_id`")?;
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "apply_result",
+                    "report": NerveStore::new(cwd).apply_patch(patch_id)?
+                })
+            );
+        }
+        "rollback_patch" => {
+            let patch_id = value
+                .get("patch_id")
+                .and_then(serde_json::Value::as_str)
+                .context("missing string field `patch_id`")?;
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "apply_result",
+                    "report": NerveStore::new(cwd).rollback_patch(patch_id)?
+                })
+            );
+        }
+        other => anyhow::bail!("unknown RPC command `{other}`"),
+    }
     Ok(())
 }
 
@@ -323,6 +690,92 @@ async fn run_report(prompt: String, apply: bool, mock: bool) -> Result<RunReport
     let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply }).await?;
     NerveStore::new(&cwd).save_report(&report)?;
     Ok(report)
+}
+
+fn emit_report_events(report: &RunReport) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::json!({
+            "type": "session_start",
+            "session_id": report.task.id,
+            "prompt": report.task.prompt,
+            "profile": report.selection.id,
+            "lead": report.selection.lead,
+            "reviewer": report.selection.reviewer
+        })
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "type": "lead_start",
+            "session_id": report.task.id,
+            "agent_id": report.final_output.agent_id
+        })
+    );
+    for event in &report.events {
+        let (event_type, payload) = match event {
+            AgentEvent::Stdout { agent_id, line } => (
+                "lead_event",
+                serde_json::json!({ "agent_id": agent_id, "stream": "stdout", "line": line }),
+            ),
+            AgentEvent::Stderr { agent_id, line } => (
+                "lead_event",
+                serde_json::json!({ "agent_id": agent_id, "stream": "stderr", "line": line }),
+            ),
+            AgentEvent::Tool { agent_id, call } => (
+                "lead_event",
+                serde_json::json!({ "agent_id": agent_id, "tool": call.name, "arguments": call.arguments }),
+            ),
+            AgentEvent::Done { agent_id } => (
+                "lead_event",
+                serde_json::json!({ "agent_id": agent_id, "done": true }),
+            ),
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": event_type,
+                "session_id": report.task.id,
+                "event": payload
+            })
+        );
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "type": "review_start",
+            "session_id": report.task.id,
+            "agent_id": report.final_feedback.reviewer_id
+        })
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "type": "review_event",
+            "session_id": report.task.id,
+            "verdict": report.final_feedback.verdict,
+            "message": report.final_feedback.raw_text
+        })
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "type": "patch_ready",
+            "session_id": report.task.id,
+            "patch_id": report.final_patch.as_ref().map(|patch| patch.id.clone()),
+            "files": report.final_patch.as_ref().map(|patch| patch.files.len()).unwrap_or(0),
+            "blocked": report.blocked
+        })
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "type": "apply_result",
+            "session_id": report.task.id,
+            "applied": report.applied
+        })
+    );
+    Ok(())
 }
 
 fn print_report(report: &nerve_core::RunReport, apply_requested: bool) {

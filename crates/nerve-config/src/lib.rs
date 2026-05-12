@@ -15,6 +15,12 @@ pub struct Config {
     pub roles: Roles,
     #[serde(default)]
     pub profiles: Vec<Profile>,
+    #[serde(default)]
+    pub templates: Vec<PromptTemplate>,
+    #[serde(default)]
+    pub ui: UiConfig,
+    #[serde(default)]
+    pub daemon: DaemonConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,6 +57,59 @@ pub struct Profile {
     pub review_strictness: ReviewStrictness,
     #[serde(default)]
     pub max_refinement_rounds: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PromptTemplate {
+    pub id: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UiConfig {
+    #[serde(default = "default_ui_mode")]
+    pub default_mode: UiMode,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            default_mode: default_ui_mode(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UiMode {
+    Print,
+    Interactive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonConfig {
+    #[serde(default = "default_daemon_protocol")]
+    pub protocol: DaemonProtocol,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            protocol: default_daemon_protocol(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonProtocol {
+    Line,
+    Rpc,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -188,6 +247,14 @@ impl Config {
                 );
             }
         }
+        for template in &self.templates {
+            if template.id.trim().is_empty() {
+                anyhow::bail!("template id must not be empty");
+            }
+            if template.prompt.trim().is_empty() {
+                anyhow::bail!("template `{}` prompt must not be empty", template.id);
+            }
+        }
         Ok(())
     }
 
@@ -287,6 +354,14 @@ fn default_conflict_policy() -> ConflictPolicy {
     ConflictPolicy::LeadPriority
 }
 
+fn default_ui_mode() -> UiMode {
+    UiMode::Print
+}
+
+fn default_daemon_protocol() -> DaemonProtocol {
+    DaemonProtocol::Line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +371,9 @@ mod tests {
         let config = Config::from_json_str(DEFAULT_CONFIG).unwrap();
         assert_eq!(config.roles.architect, "claude-code");
         assert_eq!(config.profiles.len(), 2);
+        assert_eq!(config.ui.default_mode, UiMode::Print);
+        assert_eq!(config.daemon.protocol, DaemonProtocol::Line);
+        assert!(!config.templates.is_empty());
     }
 
     #[test]
@@ -353,5 +431,36 @@ mod tests {
         let selected = config.select_profile(&task).unwrap();
 
         assert_eq!(selected.id.as_deref(), Some("contract_audit"));
+    }
+
+    #[test]
+    fn loads_templates_from_config() {
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": {
+                "architect": "claude-code",
+                "reviewer": "codex"
+              },
+              "templates": [
+                {
+                  "id": "security-audit",
+                  "description": "Audit a target",
+                  "prompt": "audit {{args}}"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.templates[0].id, "security-audit");
+        assert_eq!(
+            config.templates[0].description.as_deref(),
+            Some("Audit a target")
+        );
     }
 }

@@ -24,5 +24,23 @@
       "lead": "codex",
       "reviewer": "claude-code"
     }
-  ]
+  ],
+  "templates": [
+    {
+      "id": "security-audit",
+      "description": "Review a target path for correctness, safety, and missing tests.",
+      "prompt": "audit {{args}} for correctness, safety, and missing tests"
+    },
+    {
+      "id": "rapid-fix",
+      "description": "Make a small targeted fix with reviewer validation.",
+      "prompt": "fix {{args}} with the smallest safe patch"
+    }
+  ],
+  "ui": {
+    "default_mode": "print"
+  },
+  "daemon": {
+    "protocol": "line"
+  }
 }

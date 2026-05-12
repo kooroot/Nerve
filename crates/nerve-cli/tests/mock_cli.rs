@@ -152,6 +152,100 @@ fn mock_cli_doctor_passes_without_external_adapters() {
 }
 
 #[test]
+fn mock_cli_setup_initializes_store_and_checks_mock_adapter() {
+    let fixture = MockCliFixture::new();
+    let output = fixture
+        .command()
+        .args(["--adapter", "mock"])
+        .arg("setup")
+        .output()
+        .expect("failed to run nv setup");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("store:"));
+    assert!(stdout.contains("adapter: mock ok"));
+    assert!(fixture.cwd.join(".nerve/sessions").exists());
+    assert!(fixture.cwd.join(".nerve/session-meta").exists());
+}
+
+#[test]
+fn mock_cli_names_and_reruns_sessions() {
+    let fixture = MockCliFixture::new();
+    let output = fixture
+        .command()
+        .args(["--json", "add a health endpoint"])
+        .output()
+        .expect("failed to run nv");
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session_id = report["task"]["id"].as_str().unwrap();
+
+    let name = fixture
+        .command()
+        .args(["name", session_id, "health check"])
+        .output()
+        .expect("failed to name session");
+    assert!(name.status.success());
+
+    let history = fixture
+        .command()
+        .args(["history", "--json", "--named"])
+        .output()
+        .expect("failed to run history");
+    assert!(history.status.success());
+    let sessions: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
+    assert_eq!(sessions[0]["name"], "health check");
+
+    let rerun = fixture
+        .command()
+        .args(["--json", "rerun", session_id, "follow up change"])
+        .output()
+        .expect("failed to rerun session");
+    assert!(rerun.status.success());
+    let child: serde_json::Value = serde_json::from_slice(&rerun.stdout).unwrap();
+    let child_id = child["task"]["id"].as_str().unwrap();
+
+    let child_history = fixture
+        .command()
+        .args(["history", "--json"])
+        .output()
+        .expect("failed to run history");
+    let sessions: serde_json::Value = serde_json::from_slice(&child_history.stdout).unwrap();
+    let child_summary = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|summary| summary["id"] == child_id)
+        .unwrap();
+    assert_eq!(child_summary["parent_session_id"], session_id);
+}
+
+#[test]
+fn mock_cli_runs_configured_template() {
+    let fixture = MockCliFixture::new();
+    let list = fixture
+        .command()
+        .args(["template", "list"])
+        .output()
+        .expect("failed to list templates");
+    assert!(list.status.success());
+    assert!(String::from_utf8_lossy(&list.stdout).contains("security-audit"));
+
+    let output = fixture
+        .command()
+        .args(["--json", "template", "run", "security-audit", "src/lib.rs"])
+        .output()
+        .expect("failed to run template");
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["task"]["prompt"],
+        "audit src/lib.rs for correctness, safety, and missing tests"
+    );
+}
+
+#[test]
 fn mock_cli_daemon_processes_one_prompt_as_json_line() {
     let fixture = MockCliFixture::new();
     let mut child = fixture
@@ -176,6 +270,43 @@ fn mock_cli_daemon_processes_one_prompt_as_json_line() {
     assert_eq!(report["task"]["prompt"], "daemon health endpoint");
     assert_eq!(report["final_feedback"]["verdict"], "lgtm");
     assert!(fixture.cwd.join(".nerve/sessions").exists());
+}
+
+#[test]
+fn mock_cli_rpc_daemon_emits_lifecycle_events() {
+    let fixture = MockCliFixture::new();
+    let mut child = fixture
+        .command()
+        .args(["daemon", "--rpc", "--once"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn nv daemon");
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(br#"{"command":"prompt","prompt":"rpc health endpoint"}"#)
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().any(|event| event["type"] == "session_start"));
+    assert!(events.iter().any(|event| event["type"] == "lead_start"));
+    assert!(events.iter().any(|event| event["type"] == "review_start"));
+    assert!(events.iter().any(|event| event["type"] == "patch_ready"));
+    assert!(events.iter().any(|event| event["type"] == "session_end"));
 }
 
 struct MockCliFixture {

@@ -2,6 +2,16 @@
 
 All notable changes to Nerve are documented here.
 
+## Unreleased
+
+### Added
+
+- `nv setup` for first-run store initialization and prerequisite checks.
+- Lightweight interactive mode when `nv` is run from a terminal without a prompt.
+- Session naming and linked follow-up runs through `nv name` and `nv rerun`.
+- Prompt templates through `nv template list` and `nv template run`.
+- JSONL RPC daemon mode with lifecycle events via `nv daemon --rpc`.
+
 ## v0.1.2 - 2026-05-12
 
 ### Added

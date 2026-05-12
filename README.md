@@ -57,9 +57,11 @@ Nerve has the Phase 1 MVP plus the planned Phase 2/3 CLI execution features impl
 | Real unified-diff to `NvPatch` conversion | Implemented for create/modify/delete/rename diffs |
 | Machine-readable session reports | Implemented with `--json` |
 | Persistent history / patch index | Implemented under `.nerve/` |
+| Session names and linked follow-up runs | Implemented under `.nerve/session-meta/` |
 | Strategy dispatch | Implemented for `consensus`, `pipeline`, and `tournament` |
 | Real-time cross-firing | Implemented for `.nerve/scratch` watcher feedback |
-| Terminal TUI / daemon | Implemented with `--tui` and `daemon` |
+| Prompt templates | Implemented with `nv template` |
+| Terminal TUI / daemon | Implemented with `--tui`, `daemon`, and `daemon --rpc` |
 
 Important: the mock adapter path produces structured `NvPatch` values directly. The real subprocess path now extracts unified diffs from raw text or JSONL string fields and converts create/modify/delete/rename diffs into safe `NvPatch` values.
 
@@ -150,7 +152,7 @@ nv config validate
 After installation, check local prerequisites:
 
 ```bash
-nv doctor
+nv setup
 ```
 
 ## Agent Loop
@@ -165,13 +167,21 @@ Nerve exposes one CLI today:
 | `nv --adapter real "<task>"` | Spawn real `claude` and `codex` subprocesses |
 | `nv --json "<task>"` | Emit a structured session report for downstream tooling |
 | `nv --tui "<task>"` | Render a three-pane terminal summary |
+| `nv` | Start a lightweight interactive prompt when run from a terminal |
+| `nv setup` | Initialize `.nerve/` and check config plus adapter prerequisites |
 | `nv history` | List stored session summaries from `.nerve/sessions/` |
+| `nv history --applied --blocked --named` | Filter stored session summaries |
 | `nv resume <session-id>` | Print a stored session report |
+| `nv name <session-id> <name>` | Attach a human-readable name to a session |
+| `nv rerun <session-id> "<task>"` | Run a follow-up task linked to an existing session |
 | `nv list` | List indexed patches from `.nerve/patches/index.json` |
 | `nv apply <patch-id>` | Apply a stored patch by id |
 | `nv rollback <patch-id>` | Roll back a stored patch by id |
 | `nv doctor` | Check config and adapter prerequisites |
+| `nv template list` | List configured prompt templates |
+| `nv template run <template-id> [args...]` | Run a configured prompt template |
 | `nv daemon` | Run a line-oriented daemon for editor and shell integrations |
+| `nv daemon --rpc` | Run a JSONL RPC daemon with lifecycle events |
 | `nv config validate` | Validate `nerve.config.json` |
 
 Real adapter mode expects these CLIs on `PATH` and already authenticated:
@@ -205,13 +215,27 @@ Every run writes a session report to `.nerve/sessions/{session-id}.json`. Accept
 
 ```bash
 nv history
+nv history --named
 nv resume <session-id>
+nv name <session-id> "health endpoint"
+nv rerun <session-id> "add tests for the endpoint"
 nv list
 nv apply <patch-id>
 nv rollback <patch-id>
 ```
 
 Use `--json` with `history`, `resume`, and `list` when another tool needs the stored data.
+
+Session names and parent links are stored under `.nerve/session-meta/` so older session reports remain readable.
+
+### Prompt Templates
+
+Prompt templates live in `nerve.config.json` and substitute `{{args}}` with the arguments passed on the CLI:
+
+```bash
+nv template list
+nv template run security-audit crates/nerve-core/src/lib.rs
+```
 
 ### Doctor
 
@@ -220,6 +244,14 @@ Use `nv doctor` to validate local prerequisites. In real adapter mode it checks 
 ### Daemon Mode
 
 Use `nv daemon` for simple editor and shell integrations. It reads one prompt per stdin line, runs the configured loop, stores the report, and writes one compact JSON report per stdout line. Add `--once` to process a single prompt and exit.
+
+Use `nv daemon --rpc` when integrations need structured JSONL commands and lifecycle events:
+
+```bash
+printf '%s\n' '{"command":"prompt","prompt":"add a health endpoint"}' | nv daemon --rpc --once
+```
+
+Supported RPC commands are `prompt`, `get_state`, `history`, `resume`, `list_patches`, `apply_patch`, and `rollback_patch`. Prompt runs emit `session_start`, `lead_start`, `lead_event`, `review_start`, `review_event`, `patch_ready`, `apply_result`, and `session_end` events.
 
 ### Terminal TUI
 
@@ -316,7 +348,20 @@ Default shape:
       "lead": "codex",
       "reviewer": "claude-code"
     }
-  ]
+  ],
+  "templates": [
+    {
+      "id": "security-audit",
+      "description": "Review a target path for correctness, safety, and missing tests.",
+      "prompt": "audit {{args}} for correctness, safety, and missing tests"
+    }
+  ],
+  "ui": {
+    "default_mode": "print"
+  },
+  "daemon": {
+    "protocol": "line"
+  }
 }
 ```
 

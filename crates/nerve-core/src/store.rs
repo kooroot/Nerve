@@ -1,5 +1,6 @@
 use crate::RunReport;
 use anyhow::{Context, Result};
+use chrono::Utc;
 use nerve_patch::{ApplyReport, NvPatch};
 use nerve_types::Verdict;
 use serde::{Deserialize, Serialize};
@@ -16,14 +17,31 @@ pub struct NerveStore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
     pub prompt: String,
     pub started_at: String,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    pub cwd: PathBuf,
     pub profile: Option<String>,
     pub verdict: Verdict,
     pub rounds: usize,
     pub patch_id: Option<String>,
     pub applied: bool,
     pub blocked: bool,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionMetadata {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -77,7 +95,8 @@ impl NerveStore {
                 continue;
             }
             let report = self.load_report_path(&entry.path())?;
-            summaries.push(SessionSummary::from(&report));
+            let metadata = self.load_session_metadata(&report.task.id)?;
+            summaries.push(SessionSummary::from_report(&report, metadata));
         }
 
         summaries.sort_by(|a, b| b.started_at.cmp(&a.started_at));
@@ -86,6 +105,33 @@ impl NerveStore {
 
     pub fn load_report(&self, id: &str) -> Result<RunReport> {
         self.load_report_path(&self.session_path(id))
+    }
+
+    pub fn init(&self) -> Result<()> {
+        self.ensure_dirs()
+    }
+
+    pub fn name_session(&self, id: &str, name: impl Into<String>) -> Result<()> {
+        if !self.session_path(id).exists() {
+            anyhow::bail!("session `{id}` does not exist");
+        }
+        let mut metadata = self.load_session_metadata(id)?;
+        metadata.name = Some(name.into());
+        metadata.updated_at = Some(Utc::now().to_rfc3339());
+        self.save_session_metadata(id, &metadata)
+    }
+
+    pub fn link_child_session(&self, child_id: &str, parent_id: &str) -> Result<()> {
+        if !self.session_path(child_id).exists() {
+            anyhow::bail!("session `{child_id}` does not exist");
+        }
+        if !self.session_path(parent_id).exists() {
+            anyhow::bail!("session `{parent_id}` does not exist");
+        }
+        let mut metadata = self.load_session_metadata(child_id)?;
+        metadata.parent_session_id = Some(parent_id.to_string());
+        metadata.updated_at = Some(Utc::now().to_rfc3339());
+        self.save_session_metadata(child_id, &metadata)
     }
 
     pub fn list_patches(&self) -> Result<Vec<PatchRecord>> {
@@ -111,6 +157,8 @@ impl NerveStore {
     fn ensure_dirs(&self) -> Result<()> {
         fs::create_dir_all(self.sessions_dir())
             .with_context(|| format!("failed to create `{}`", self.sessions_dir().display()))?;
+        fs::create_dir_all(self.session_meta_dir())
+            .with_context(|| format!("failed to create `{}`", self.session_meta_dir().display()))?;
         fs::create_dir_all(self.patches_dir())
             .with_context(|| format!("failed to create `{}`", self.patches_dir().display()))?;
         Ok(())
@@ -122,6 +170,18 @@ impl NerveStore {
 
     fn load_report_path(&self, path: &Path) -> Result<RunReport> {
         read_json(path)
+    }
+
+    fn load_session_metadata(&self, id: &str) -> Result<SessionMetadata> {
+        let path = self.session_meta_path(id);
+        if !path.exists() {
+            return Ok(SessionMetadata::default());
+        }
+        read_json(&path)
+    }
+
+    fn save_session_metadata(&self, id: &str, metadata: &SessionMetadata) -> Result<()> {
+        write_json(&self.session_meta_path(id), metadata)
     }
 
     fn upsert_patch_record(&self, record: PatchRecord) -> Result<()> {
@@ -176,12 +236,20 @@ impl NerveStore {
         self.root_dir().join("sessions")
     }
 
+    fn session_meta_dir(&self) -> PathBuf {
+        self.root_dir().join("session-meta")
+    }
+
     fn patches_dir(&self) -> PathBuf {
         self.root_dir().join("patches")
     }
 
     fn session_path(&self, id: &str) -> PathBuf {
         self.sessions_dir().join(format!("{id}.json"))
+    }
+
+    fn session_meta_path(&self, id: &str) -> PathBuf {
+        self.session_meta_dir().join(format!("{id}.json"))
     }
 
     fn patch_path(&self, id: &str) -> PathBuf {
@@ -194,17 +262,21 @@ impl NerveStore {
 }
 
 impl SessionSummary {
-    fn from(report: &RunReport) -> Self {
+    fn from_report(report: &RunReport, metadata: SessionMetadata) -> Self {
         Self {
             id: report.task.id.clone(),
+            name: metadata.name,
             prompt: report.task.prompt.clone(),
             started_at: report.task.started_at.to_rfc3339(),
+            updated_at: metadata.updated_at,
+            cwd: report.task.cwd.clone(),
             profile: report.selection.id.clone(),
             verdict: report.final_feedback.verdict.clone(),
             rounds: report.rounds.len(),
             patch_id: report.final_patch.as_ref().map(|patch| patch.id.clone()),
             applied: report.applied,
             blocked: report.blocked,
+            parent_session_id: metadata.parent_session_id,
         }
     }
 }
@@ -344,5 +416,40 @@ mod tests {
 
         assert!(!store.list_patches().unwrap()[0].applied);
         assert!(!store.load_report(&task.id).unwrap().applied);
+    }
+
+    #[test]
+    fn session_name_is_included_in_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = NvPatch::new(vec![FilePatch::create("created.txt", "created\n")]);
+        let task = Task::new("create file", dir.path());
+        let report = RunReport {
+            task: task.clone(),
+            selection: ProfileSelection {
+                id: None,
+                lead: "lead".to_string(),
+                reviewer: "reviewer".to_string(),
+                review_strictness: ReviewStrictness::Normal,
+                max_refinement_rounds: 1,
+            },
+            rounds: Vec::new(),
+            crossfire_feedback: Vec::new(),
+            final_output: AgentOutput::with_patch("lead", "patch", patch.clone()),
+            final_feedback: ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            final_patch: Some(patch),
+            events: Vec::new(),
+            usage: Default::default(),
+            budget_exceeded: false,
+            applied: false,
+            blocked: false,
+        };
+        let store = NerveStore::new(dir.path());
+        store.save_report(&report).unwrap();
+
+        store.name_session(&task.id, "first pass").unwrap();
+
+        let summary = store.list_sessions().unwrap().remove(0);
+        assert_eq!(summary.name.as_deref(), Some("first pass"));
+        assert_eq!(summary.cwd, dir.path());
     }
 }
