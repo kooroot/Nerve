@@ -2,6 +2,17 @@
 
 All notable changes to Nerve are documented here.
 
+## v0.1.6 - 2026-05-13
+
+### Added
+
+- `nv --version` for checking which installed binary is active.
+
+### Changed
+
+- The macOS/Linux installer now warns when the current shell resolves `nv` to a different path than the newly installed binary.
+- Installation docs now include `which -a nv`, version verification, and stale binary cleanup guidance.
+
 ## v0.1.5 - 2026-05-13
 
 ### Added

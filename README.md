@@ -149,11 +149,15 @@ cargo install --git https://github.com/kooroot/Nerve.git nerve-cli
 nv config validate
 ```
 
-After installation, check local prerequisites:
+After installation, verify which binary your shell will run and then check local prerequisites:
 
 ```bash
+which -a nv
+nv --version
 nv setup
 ```
+
+If `which -a nv` shows an older path before the newly installed binary, your shell will keep running the old CLI. Remove the stale earlier binary or put the new install directory earlier in `PATH`, then run `hash -r` in zsh. The old prompt `Nerve interactive. Type /help for commands.` means the shell is still resolving an older `nv`; the current terminal workspace starts with `Nerve Terminal` and a `nerve:<adapter>:<mode>` prompt.
 
 ## Agent Loop
 

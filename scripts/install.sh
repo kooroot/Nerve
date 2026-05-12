@@ -80,10 +80,11 @@ if [ -z "$found_bin" ]; then
   exit 1
 fi
 
-cp "$found_bin" "$install_dir/$bin_name"
-chmod 755 "$install_dir/$bin_name"
+installed_bin="$install_dir/$bin_name"
+cp "$found_bin" "$installed_bin"
+chmod 755 "$installed_bin"
 
-echo "Installed ${bin_name} to ${install_dir}/${bin_name}"
+echo "Installed ${bin_name} to ${installed_bin}"
 
 case ":${PATH:-}:" in
   *":$install_dir:"*) ;;
@@ -93,5 +94,15 @@ case ":${PATH:-}:" in
     ;;
 esac
 
-"$install_dir/$bin_name" --help >/dev/null
-echo "Run: ${bin_name} setup"
+"$installed_bin" --version >/dev/null
+
+active_bin="$(command -v "$bin_name" 2>/dev/null || true)"
+if [ -n "$active_bin" ] && [ "$active_bin" != "$installed_bin" ]; then
+  echo "Warning: this shell resolves '${bin_name}' to ${active_bin}, not ${installed_bin}."
+  echo "Run: which -a ${bin_name}"
+  echo "Then remove the stale earlier binary or put ${install_dir} earlier in PATH."
+  echo "For zsh: hash -r"
+  echo "Direct run: ${installed_bin} setup"
+else
+  echo "Run: ${bin_name} setup"
+fi

@@ -15,6 +15,7 @@ use tokio::io::{self, AsyncBufReadExt};
 #[command(
     name = "nv",
     about = "Nerve reflexive AI orchestration CLI",
+    version,
     subcommand_precedence_over_arg = true
 )]
 struct Cli {

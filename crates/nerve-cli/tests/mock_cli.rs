@@ -20,6 +20,19 @@ fn mock_cli_prints_reviewed_diff_without_applying() {
 }
 
 #[test]
+fn mock_cli_prints_version() {
+    let fixture = MockCliFixture::new();
+    let output = fixture
+        .command()
+        .arg("--version")
+        .output()
+        .expect("failed to run nv --version");
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("nv "));
+}
+
+#[test]
 fn mock_cli_emits_machine_readable_json_report() {
     let fixture = MockCliFixture::new();
     let output = fixture
