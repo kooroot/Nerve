@@ -61,7 +61,7 @@ Nerve has the Phase 1 MVP plus the planned Phase 2/3 CLI execution features impl
 | Strategy dispatch | Implemented for `consensus`, `pipeline`, and `tournament` |
 | Real-time cross-firing | Implemented for `.nerve/scratch` watcher feedback |
 | Prompt templates | Implemented with `nv template` |
-| Terminal TUI / daemon | Implemented with `--tui`, `daemon`, and `daemon --rpc` |
+| Terminal product UX | Implemented with `nv`, `nv interactive`, `--tui`, `daemon`, and `daemon --rpc` |
 
 Important: the mock adapter path produces structured `NvPatch` values directly. The real subprocess path now extracts unified diffs from raw text or JSONL string fields and converts create/modify/delete/rename diffs into safe `NvPatch` values.
 
@@ -167,7 +167,8 @@ Nerve exposes one CLI today:
 | `nv --adapter real "<task>"` | Spawn real `claude` and `codex` subprocesses |
 | `nv --json "<task>"` | Emit a structured session report for downstream tooling |
 | `nv --tui "<task>"` | Render a three-pane terminal summary |
-| `nv` | Start a lightweight interactive prompt when run from a terminal |
+| `nv` | Start the terminal workspace when run from a terminal |
+| `nv interactive` | Force the terminal workspace, useful for scripts and tests |
 | `nv setup` | Initialize `.nerve/` and check config plus adapter prerequisites |
 | `nv login [all\|claude\|codex]` | Start provider login using Claude Code and/or Codex CLI subscriptions |
 | `nv history` | List stored session summaries from `.nerve/sessions/` |
@@ -193,6 +194,35 @@ codex exec --skip-git-repo-check --json "{prompt}"
 ```
 
 Use `nv login` or interactive `/login` to start the provider subscription login flows from Nerve.
+
+### Terminal Workspace
+
+Run `nv` with no prompt to open the Nerve terminal workspace. It keeps the last reviewed patch in memory so the next command can inspect or apply it without copying ids:
+
+```text
+nerve:real:dry-run> fix the auth callback bug
+nerve:real:dry-run patch=abc12345> /diff
+nerve:real:dry-run patch=abc12345> /apply
+```
+
+Available workspace commands:
+
+```text
+/login
+/doctor
+/status
+/history
+/resume <session-id>
+/list
+/templates
+/template <template-id> [args...]
+/diff
+/apply [patch-id]
+/rollback [patch-id]
+/quit
+```
+
+Task errors do not close the workspace; use `/login` for provider auth, `/doctor` for setup checks, and `NERVE_ADAPTER=mock nv` for a local smoke test.
 
 Verified real output shapes:
 

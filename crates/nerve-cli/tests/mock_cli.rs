@@ -170,6 +170,68 @@ fn mock_cli_setup_initializes_store_and_checks_mock_adapter() {
 }
 
 #[test]
+fn mock_cli_interactive_shows_terminal_workspace_help() {
+    let fixture = MockCliFixture::new();
+    let mut child = fixture
+        .command()
+        .arg("interactive")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn nv interactive");
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"/help\n/quit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Nerve Terminal"));
+    assert!(stdout.contains("nerve:mock:dry-run>"));
+    assert!(stdout.contains("/diff"));
+    assert!(stdout.contains("/apply [patch-id]"));
+}
+
+#[test]
+fn mock_cli_interactive_remembers_last_patch_for_apply() {
+    let fixture = MockCliFixture::new();
+    let mut child = fixture
+        .command()
+        .arg("interactive")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn nv interactive");
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"add a health endpoint\n/apply\n/quit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("reviewed patch ready"));
+    assert!(stdout.contains("Applied patch"));
+    assert!(
+        fs::read_to_string(fixture.mock_output())
+            .unwrap()
+            .contains("Status: refined")
+    );
+}
+
+#[test]
 fn mock_cli_names_and_reruns_sessions() {
     let fixture = MockCliFixture::new();
     let output = fixture

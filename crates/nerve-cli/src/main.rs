@@ -105,6 +105,8 @@ enum Command {
         #[arg(value_enum, default_value = "all")]
         provider: LoginProvider,
     },
+    #[command(about = "Start the Nerve terminal workspace")]
+    Interactive,
     #[command(about = "Name a stored Nerve session")]
     Name {
         #[arg(help = "Stored task/session id")]
@@ -266,6 +268,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Setup) => run_setup(matches!(cli.adapter, AdapterMode::Mock)),
         Some(Command::Login { provider }) => run_login(provider),
+        Some(Command::Interactive) => {
+            run_interactive(cli.apply, matches!(cli.adapter, AdapterMode::Mock)).await
+        }
         Some(Command::Name { task_id, name }) => {
             let cwd = env::current_dir().context("failed to read current directory")?;
             NerveStore::new(cwd).name_session(&task_id, name)?;
@@ -440,12 +445,14 @@ fn run_provider_login(provider: LoginProvider) -> Result<()> {
 }
 
 async fn run_interactive(apply: bool, mock: bool) -> Result<()> {
-    print_interactive_banner(apply, mock);
+    let mut state = InteractiveState::new(apply, mock);
+    state.refresh_counts();
+    print_interactive_banner(&state);
     let stdin = io::BufReader::new(io::stdin());
     let mut lines = stdin.lines();
 
     loop {
-        print!("nerve> ");
+        print!("{}", interactive_prompt(&state));
         std::io::stdout().flush()?;
         let Some(line) = lines.next_line().await? else {
             break;
@@ -455,14 +462,14 @@ async fn run_interactive(apply: bool, mock: bool) -> Result<()> {
             continue;
         }
         if let Some(command) = input.strip_prefix('/') {
-            match handle_interactive_command(command, apply, mock).await {
+            match handle_interactive_command(command, &mut state).await {
                 Ok(true) => break,
                 Ok(false) => {}
                 Err(error) => print_interactive_error(&error),
             }
             continue;
         }
-        if let Err(error) = run_prompt(input.to_string(), apply, false, false, mock).await {
+        if let Err(error) = run_interactive_task(input.to_string(), &mut state).await {
             print_interactive_error(&error);
         }
     }
@@ -470,22 +477,83 @@ async fn run_interactive(apply: bool, mock: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_interactive_banner(apply: bool, mock: bool) {
-    println!("Nerve");
+#[derive(Debug, Clone)]
+struct InteractiveState {
+    apply: bool,
+    mock: bool,
+    last_report: Option<RunReport>,
+    session_count: usize,
+    patch_count: usize,
+}
+
+impl InteractiveState {
+    fn new(apply: bool, mock: bool) -> Self {
+        Self {
+            apply,
+            mock,
+            last_report: None,
+            session_count: 0,
+            patch_count: 0,
+        }
+    }
+
+    fn adapter_label(&self) -> &'static str {
+        if self.mock { "mock" } else { "real" }
+    }
+
+    fn apply_label(&self) -> &'static str {
+        if self.apply { "apply" } else { "dry-run" }
+    }
+
+    fn refresh_counts(&mut self) {
+        let Ok(cwd) = env::current_dir() else {
+            return;
+        };
+        let store = NerveStore::new(cwd);
+        self.session_count = store.list_sessions().map(|items| items.len()).unwrap_or(0);
+        self.patch_count = store.list_patches().map(|items| items.len()).unwrap_or(0);
+    }
+
+    fn last_patch_id(&self) -> Option<&str> {
+        self.last_report
+            .as_ref()
+            .and_then(|report| report.final_patch.as_ref())
+            .map(|patch| patch.id.as_str())
+    }
+}
+
+fn print_interactive_banner(state: &InteractiveState) {
+    println!("┌─ Nerve Terminal ─────────────────────────────────────────────┐");
+    println!("│ Lead/reviewer coding loop with reviewed, auditable patches.  │");
+    println!("│ Type a task, then use /diff, /apply, /rollback, or /history. │");
+    println!("└──────────────────────────────────────────────────────────────┘");
+    print_interactive_status(state);
+}
+
+fn print_interactive_status(state: &InteractiveState) {
     println!(
-        "Lead/reviewer coding loop. Dry-run by default; reviewed patches apply only with --apply."
-    );
-    println!(
-        "adapter={} apply={} cwd={}",
-        if mock { "mock" } else { "real" },
-        apply,
+        "adapter={} mode={} sessions={} patches={} cwd={}",
+        state.adapter_label(),
+        state.apply_label(),
+        state.session_count,
+        state.patch_count,
         env::current_dir()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| "?".to_string())
     );
-    println!(
-        "Type a task to run it. Commands: /login /doctor /history /list /templates /help /quit"
-    );
+}
+
+fn interactive_prompt(state: &InteractiveState) -> String {
+    let patch_hint = state
+        .last_patch_id()
+        .map(|id| format!(" patch={}", short_id(id)))
+        .unwrap_or_default();
+    format!(
+        "nerve:{}:{}{}> ",
+        state.adapter_label(),
+        state.apply_label(),
+        patch_hint
+    )
 }
 
 fn print_interactive_error(error: &anyhow::Error) {
@@ -495,21 +563,71 @@ fn print_interactive_error(error: &anyhow::Error) {
     );
 }
 
-async fn handle_interactive_command(command: &str, apply: bool, mock: bool) -> Result<bool> {
+async fn run_interactive_task(prompt: String, state: &mut InteractiveState) -> Result<()> {
+    println!("▶ task: {prompt}");
+    println!("  lead/reviewer loop running...");
+    let report = run_report(prompt, state.apply, state.mock).await?;
+    print_interactive_result(&report, state.apply);
+    state.last_report = Some(report);
+    state.refresh_counts();
+    Ok(())
+}
+
+fn print_interactive_result(report: &RunReport, apply_requested: bool) {
+    println!(
+        "✓ session {} | verdict={:?} | rounds={} | applied={} | blocked={}",
+        short_id(&report.task.id),
+        report.final_feedback.verdict,
+        report.rounds.len(),
+        report.applied,
+        report.blocked
+    );
+    if let Some(patch) = &report.final_patch {
+        println!("  patch {} | files={}", patch.id, patch.files.len());
+        if report.applied {
+            println!("  applied. Use /rollback to undo the last patch.");
+        } else if !apply_requested && !report.blocked {
+            println!("  reviewed patch ready. Use /diff to inspect or /apply to apply it.");
+        }
+    } else {
+        println!(
+            "  no structured patch produced. Use /resume {} for raw output.",
+            report.task.id
+        );
+    }
+}
+
+async fn handle_interactive_command(command: &str, state: &mut InteractiveState) -> Result<bool> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let mut parts = command.split_whitespace();
     let name = parts.next().unwrap_or("");
     match name {
         "help" => {
             println!(
-                "Commands: /login /doctor /history /resume <id> /list /templates /apply <patch-id> /rollback <patch-id> /quit"
+                "Commands: /login /doctor /status /history /resume <id> /list /templates /template <id> [args] /diff /apply [patch-id] /rollback [patch-id] /quit"
             );
             println!("Tasks: type any coding request without a leading slash.");
         }
         "login" => run_login(LoginProvider::All)?,
-        "doctor" => run_doctor(mock)?,
+        "doctor" => run_doctor(state.mock)?,
+        "status" => {
+            state.refresh_counts();
+            print_interactive_status(state);
+            if let Some(report) = &state.last_report {
+                println!(
+                    "last session={} verdict={:?} patch={}",
+                    report.task.id,
+                    report.final_feedback.verdict,
+                    report
+                        .final_patch
+                        .as_ref()
+                        .map(|patch| patch.id.as_str())
+                        .unwrap_or("-")
+                );
+            }
+        }
         "history" => {
-            for session in NerveStore::new(cwd).list_sessions()? {
+            for session in NerveStore::new(cwd).list_sessions()?.into_iter().take(10) {
                 println!(
                     "{} | {:?} | applied={} | name={} | {}",
                     session.id,
@@ -535,9 +653,23 @@ async fn handle_interactive_command(command: &str, apply: bool, mock: bool) -> R
         }
         "templates" | "template" => {
             let config = Config::load()?;
-            if config.templates.is_empty() {
-                println!("No prompt templates configured.");
+            if name == "template"
+                && let Some(template_id) = parts.next()
+            {
+                let Some(template) = config
+                    .templates
+                    .iter()
+                    .find(|template| template.id == template_id)
+                else {
+                    anyhow::bail!("template `{template_id}` is not configured");
+                };
+                let args = parts.collect::<Vec<_>>().join(" ");
+                let prompt = template.prompt.replace("{{args}}", &args);
+                run_interactive_task(prompt, state).await?;
             } else {
+                if config.templates.is_empty() {
+                    println!("No prompt templates configured.");
+                }
                 for template in config.templates {
                     println!(
                         "{} | {}",
@@ -547,20 +679,38 @@ async fn handle_interactive_command(command: &str, apply: bool, mock: bool) -> R
                 }
             }
         }
+        "diff" => {
+            let Some(report) = &state.last_report else {
+                anyhow::bail!("no last session; run a task first");
+            };
+            let Some(patch) = &report.final_patch else {
+                anyhow::bail!("last session has no structured patch");
+            };
+            println!("{}", patch.to_unified_diff());
+        }
         "apply" => {
-            let id = parts.next().context("usage: /apply <patch-id>")?;
-            let report = NerveStore::new(cwd).apply_patch(id)?;
+            let id = parts
+                .next()
+                .map(str::to_string)
+                .or_else(|| state.last_patch_id().map(str::to_string))
+                .context("usage: /apply [patch-id]")?;
+            let report = NerveStore::new(cwd).apply_patch(&id)?;
             println!("Applied patch {}.", report.patch_id);
+            state.refresh_counts();
         }
         "rollback" => {
-            let id = parts.next().context("usage: /rollback <patch-id>")?;
-            let report = NerveStore::new(cwd).rollback_patch(id)?;
+            let id = parts
+                .next()
+                .map(str::to_string)
+                .or_else(|| state.last_patch_id().map(str::to_string))
+                .context("usage: /rollback [patch-id]")?;
+            let report = NerveStore::new(cwd).rollback_patch(&id)?;
             println!("Rolled back patch {}.", report.patch_id);
+            state.refresh_counts();
         }
         "quit" | "exit" => return Ok(true),
         other => println!("Unknown command /{other}. Type /help for commands."),
     }
-    let _ = apply;
     Ok(false)
 }
 
@@ -1002,6 +1152,10 @@ fn truncate_at_char_boundary(value: &str, limit: usize) -> &str {
         boundary -= 1;
     }
     &value[..boundary]
+}
+
+fn short_id(value: &str) -> &str {
+    truncate_at_char_boundary(value, 8.min(value.len()))
 }
 
 fn print_changed_files(paths: &[std::path::PathBuf]) {

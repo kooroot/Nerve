@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-adapter"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-config"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "globset",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-patch"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "sha2",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-types"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "nerve-patch",

@@ -2,6 +2,16 @@
 
 All notable changes to Nerve are documented here.
 
+## v0.1.5 - 2026-05-13
+
+### Added
+
+- `nv interactive` for a forced terminal workspace entrypoint.
+
+### Changed
+
+- The terminal workspace now remembers the last reviewed patch and supports `/diff`, `/apply [patch-id]`, `/rollback [patch-id]`, `/status`, and `/template <id> [args...]`.
+
 ## v0.1.4 - 2026-05-13
 
 ### Added
