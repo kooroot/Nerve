@@ -2,6 +2,13 @@
 
 All notable changes to Nerve are documented here.
 
+## v0.1.2 - 2026-05-12
+
+### Added
+
+- One-command installers for macOS/Linux (`install.sh`) and Windows (`install.ps1`).
+- Versionless latest release asset names so install commands do not need to know the current Nerve version.
+
 ## v0.1.1 - 2026-05-11
 
 Follow-up distribution release for the Nerve CLI.

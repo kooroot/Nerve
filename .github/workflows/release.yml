@@ -59,10 +59,12 @@ jobs:
           set -euo pipefail
           version="${RELEASE_TAG}"
           asset="nerve-${version}-${{ matrix.target }}"
+          latest_asset="nerve-${{ matrix.target }}"
           mkdir -p "dist/${asset}"
           cp "target/${{ matrix.target }}/release/nv" "dist/${asset}/nv"
-          cp README.md CHANGELOG.md "dist/${asset}/"
+          cp README.md CHANGELOG.md scripts/install.sh "dist/${asset}/"
           tar -C dist -czf "dist/${asset}.tar.gz" "${asset}"
+          cp "dist/${asset}.tar.gz" "dist/${latest_asset}.tar.gz"
 
       - name: Package Windows
         if: matrix.archive == 'zip'
@@ -70,15 +72,38 @@ jobs:
         run: |
           $version = $env:RELEASE_TAG
           $asset = "nerve-$version-${{ matrix.target }}"
+          $latestAsset = "nerve-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$asset" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/nv.exe" "dist/$asset/nv.exe"
-          Copy-Item README.md,CHANGELOG.md "dist/$asset/"
+          Copy-Item README.md,CHANGELOG.md,scripts/install.ps1 "dist/$asset/"
           Compress-Archive -Path "dist/$asset/*" -DestinationPath "dist/$asset.zip"
+          Copy-Item "dist/$asset.zip" "dist/$latestAsset.zip"
 
-      - name: Upload Release Assets
+      - name: Package Installers
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp scripts/install.sh dist/install.sh
+          cp scripts/install.ps1 dist/install.ps1
+
+      - name: Upload Binary Assets
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/nerve-${{ env.RELEASE_TAG }}-${{ matrix.target }}.${{ matrix.archive }}
+          files: |
+            dist/nerve-${{ env.RELEASE_TAG }}-${{ matrix.target }}.${{ matrix.archive }}
+            dist/nerve-${{ matrix.target }}.${{ matrix.archive }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          overwrite_files: true
+
+      - name: Upload Installer Assets
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/install.sh
+            dist/install.ps1
           tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           overwrite_files: true

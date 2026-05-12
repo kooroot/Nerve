@@ -103,21 +103,34 @@ NERVE_ADAPTER=mock cargo run -p nerve-cli -- --apply "add a health endpoint"
 
 ### Install the CLI
 
-Download a prebuilt binary from the latest GitHub release:
+Install the latest prebuilt binary with one command:
 
 ```bash
-curl -L https://github.com/kooroot/Nerve/releases/latest/download/nerve-v0.1.1-aarch64-apple-darwin.tar.gz | tar -xz
-sudo mv nv /usr/local/bin/
+curl -fsSL https://github.com/kooroot/Nerve/releases/latest/download/install.sh | sh
 ```
 
-Choose the archive that matches your platform:
+The installer detects macOS/Linux and CPU architecture, downloads the matching release asset, and installs `nv` into the first writable directory already on `PATH`. If none is found, it falls back to `~/.local/bin`. To choose another directory:
+
+```bash
+curl -fsSL https://github.com/kooroot/Nerve/releases/latest/download/install.sh | NERVE_INSTALL_DIR=/usr/local/bin sh
+```
+
+On Windows PowerShell:
+
+```powershell
+irm https://github.com/kooroot/Nerve/releases/latest/download/install.ps1 | iex
+```
+
+Windows installs to `%LOCALAPPDATA%\Programs\Nerve` and adds that directory to the user `PATH`.
+
+Manual downloads are also available from the latest GitHub release:
 
 | Platform | Release asset |
 |----------|---------------|
-| macOS Apple Silicon | `nerve-v0.1.1-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `nerve-v0.1.1-x86_64-apple-darwin.tar.gz` |
-| Linux x64 | `nerve-v0.1.1-x86_64-unknown-linux-gnu.tar.gz` |
-| Windows x64 | `nerve-v0.1.1-x86_64-pc-windows-msvc.zip` |
+| macOS Apple Silicon | `nerve-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `nerve-x86_64-apple-darwin.tar.gz` |
+| Linux x64 | `nerve-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows x64 | `nerve-x86_64-pc-windows-msvc.zip` |
 
 Or install from source with Cargo:
 
@@ -132,6 +145,12 @@ From GitHub:
 ```bash
 cargo install --git https://github.com/kooroot/Nerve.git nerve-cli
 nv config validate
+```
+
+After installation, check local prerequisites:
+
+```bash
+nv doctor
 ```
 
 ## Agent Loop
