@@ -2,6 +2,18 @@
 
 All notable changes to Nerve are documented here.
 
+## v0.1.4 - 2026-05-13
+
+### Added
+
+- `nv login` and interactive `/login` to start Claude Code and Codex subscription login flows.
+
+### Changed
+
+- Interactive mode now uses a Nerve-specific banner/prompt, includes `/login` and `/templates`, and keeps the session open after task errors.
+- The macOS/Linux installer now chooses standard CLI bin directories instead of the first writable directory on `PATH`.
+- Codex subprocess execution now passes `--skip-git-repo-check` for non-interactive runs.
+
 ## v0.1.3 - 2026-05-13
 
 ### Added

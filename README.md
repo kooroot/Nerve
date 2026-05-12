@@ -111,7 +111,7 @@ Install the latest prebuilt binary with one command:
 curl -fsSL https://github.com/kooroot/Nerve/releases/latest/download/install.sh | sh
 ```
 
-The installer detects macOS/Linux and CPU architecture, downloads the matching release asset, and installs `nv` into the first writable directory already on `PATH`. If none is found, it falls back to `~/.local/bin`. To choose another directory:
+The installer detects macOS/Linux and CPU architecture, downloads the matching release asset, and installs `nv` into a standard user-writable CLI directory such as `/opt/homebrew/bin`, `/usr/local/bin`, or `~/.local/bin`. To choose another directory:
 
 ```bash
 curl -fsSL https://github.com/kooroot/Nerve/releases/latest/download/install.sh | NERVE_INSTALL_DIR=/usr/local/bin sh
@@ -169,6 +169,7 @@ Nerve exposes one CLI today:
 | `nv --tui "<task>"` | Render a three-pane terminal summary |
 | `nv` | Start a lightweight interactive prompt when run from a terminal |
 | `nv setup` | Initialize `.nerve/` and check config plus adapter prerequisites |
+| `nv login [all\|claude\|codex]` | Start provider login using Claude Code and/or Codex CLI subscriptions |
 | `nv history` | List stored session summaries from `.nerve/sessions/` |
 | `nv history --applied --blocked --named` | Filter stored session summaries |
 | `nv resume <session-id>` | Print a stored session report |
@@ -188,8 +189,10 @@ Real adapter mode expects these CLIs on `PATH` and already authenticated:
 
 ```bash
 claude -p "{prompt}" --output-format stream-json --verbose
-codex exec --json "{prompt}"
+codex exec --skip-git-repo-check --json "{prompt}"
 ```
+
+Use `nv login` or interactive `/login` to start the provider subscription login flows from Nerve.
 
 Verified real output shapes:
 

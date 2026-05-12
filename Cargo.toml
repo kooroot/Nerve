@@ -13,7 +13,7 @@ resolver = "2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/kooroot/Nerve"
-version = "0.1.3"
+version = "0.1.4"
 
 [workspace.dependencies]
 anyhow = "1.0"

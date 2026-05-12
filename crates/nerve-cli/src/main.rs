@@ -43,6 +43,13 @@ enum AdapterMode {
     Mock,
 }
 
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum LoginProvider {
+    All,
+    Claude,
+    Codex,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     Config {
@@ -93,6 +100,11 @@ enum Command {
     },
     #[command(about = "First-run setup and local prerequisite checks")]
     Setup,
+    #[command(about = "Sign in to Claude Code and/or Codex subscriptions")]
+    Login {
+        #[arg(value_enum, default_value = "all")]
+        provider: LoginProvider,
+    },
     #[command(about = "Name a stored Nerve session")]
     Name {
         #[arg(help = "Stored task/session id")]
@@ -253,6 +265,7 @@ async fn main() -> Result<()> {
             }
         }
         Some(Command::Setup) => run_setup(matches!(cli.adapter, AdapterMode::Mock)),
+        Some(Command::Login { provider }) => run_login(provider),
         Some(Command::Name { task_id, name }) => {
             let cwd = env::current_dir().context("failed to read current directory")?;
             NerveStore::new(cwd).name_session(&task_id, name)?;
@@ -376,6 +389,8 @@ fn run_doctor(mock: bool) -> Result<()> {
     let codex = find_on_path("codex");
     print_doctor_check("claude", &claude);
     print_doctor_check("codex", &codex);
+    print_auth_status("claude", &claude, &["auth", "status"]);
+    print_auth_status("codex", &codex, &["login", "status"]);
     if claude.is_some() && codex.is_some() {
         Ok(())
     } else {
@@ -391,13 +406,46 @@ fn run_setup(mock: bool) -> Result<()> {
     run_doctor(mock)
 }
 
+fn run_login(provider: LoginProvider) -> Result<()> {
+    match provider {
+        LoginProvider::All => {
+            run_provider_login(LoginProvider::Claude)?;
+            run_provider_login(LoginProvider::Codex)
+        }
+        LoginProvider::Claude | LoginProvider::Codex => run_provider_login(provider),
+    }
+}
+
+fn run_provider_login(provider: LoginProvider) -> Result<()> {
+    let (name, binary, args): (&str, &str, &[&str]) = match provider {
+        LoginProvider::Claude => ("claude", "claude", &["auth", "login"]),
+        LoginProvider::Codex => ("codex", "codex", &["login"]),
+        LoginProvider::All => unreachable!("all is expanded before provider login"),
+    };
+
+    let Some(path) = find_on_path(binary) else {
+        anyhow::bail!("{name}: missing from PATH");
+    };
+    println!("{name}: starting login via {}", path.display());
+    let status = StdCommand::new(path)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to start {name} login"))?;
+    if status.success() {
+        println!("{name}: login completed");
+        Ok(())
+    } else {
+        anyhow::bail!("{name}: login exited with status {status}");
+    }
+}
+
 async fn run_interactive(apply: bool, mock: bool) -> Result<()> {
-    println!("Nerve interactive. Type /help for commands, /quit to exit.");
+    print_interactive_banner(apply, mock);
     let stdin = io::BufReader::new(io::stdin());
     let mut lines = stdin.lines();
 
     loop {
-        print!("nv> ");
+        print!("nerve> ");
         std::io::stdout().flush()?;
         let Some(line) = lines.next_line().await? else {
             break;
@@ -407,15 +455,44 @@ async fn run_interactive(apply: bool, mock: bool) -> Result<()> {
             continue;
         }
         if let Some(command) = input.strip_prefix('/') {
-            if handle_interactive_command(command, apply, mock).await? {
-                break;
+            match handle_interactive_command(command, apply, mock).await {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => print_interactive_error(&error),
             }
             continue;
         }
-        run_prompt(input.to_string(), apply, false, false, mock).await?;
+        if let Err(error) = run_prompt(input.to_string(), apply, false, false, mock).await {
+            print_interactive_error(&error);
+        }
     }
 
     Ok(())
+}
+
+fn print_interactive_banner(apply: bool, mock: bool) {
+    println!("Nerve");
+    println!(
+        "Lead/reviewer coding loop. Dry-run by default; reviewed patches apply only with --apply."
+    );
+    println!(
+        "adapter={} apply={} cwd={}",
+        if mock { "mock" } else { "real" },
+        apply,
+        env::current_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "?".to_string())
+    );
+    println!(
+        "Type a task to run it. Commands: /login /doctor /history /list /templates /help /quit"
+    );
+}
+
+fn print_interactive_error(error: &anyhow::Error) {
+    eprintln!("Error: {error:#}");
+    eprintln!(
+        "Hint: run /login to authenticate providers, /doctor to inspect setup, or start with NERVE_ADAPTER=mock nv for a local smoke test."
+    );
 }
 
 async fn handle_interactive_command(command: &str, apply: bool, mock: bool) -> Result<bool> {
@@ -425,9 +502,11 @@ async fn handle_interactive_command(command: &str, apply: bool, mock: bool) -> R
     match name {
         "help" => {
             println!(
-                "/doctor /history /resume <id> /list /apply <patch-id> /rollback <patch-id> /quit"
+                "Commands: /login /doctor /history /resume <id> /list /templates /apply <patch-id> /rollback <patch-id> /quit"
             );
+            println!("Tasks: type any coding request without a leading slash.");
         }
+        "login" => run_login(LoginProvider::All)?,
         "doctor" => run_doctor(mock)?,
         "history" => {
             for session in NerveStore::new(cwd).list_sessions()? {
@@ -452,6 +531,20 @@ async fn handle_interactive_command(command: &str, apply: bool, mock: bool) -> R
                     "{} | {:?} | files={} | applied={} | {}",
                     patch.id, patch.verdict, patch.file_count, patch.applied, patch.prompt
                 );
+            }
+        }
+        "templates" | "template" => {
+            let config = Config::load()?;
+            if config.templates.is_empty() {
+                println!("No prompt templates configured.");
+            } else {
+                for template in config.templates {
+                    println!(
+                        "{} | {}",
+                        template.id,
+                        template.description.as_deref().unwrap_or("-")
+                    );
+                }
             }
         }
         "apply" => {
@@ -944,6 +1037,46 @@ fn print_doctor_check(binary: &str, path: &Option<PathBuf>) {
     }
 }
 
+fn print_auth_status(name: &str, path: &Option<PathBuf>, args: &[&str]) {
+    let Some(path) = path else {
+        return;
+    };
+    let Ok(output) = StdCommand::new(path).args(args).output() else {
+        println!("{name} auth: unknown");
+        return;
+    };
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        println!("{name} auth: {}", summarize_auth_output(name, &text, true));
+    } else {
+        let text = String::from_utf8_lossy(&output.stdout);
+        println!("{name} auth: {}", summarize_auth_output(name, &text, false));
+    }
+}
+
+fn summarize_auth_output(name: &str, text: &str, success: bool) -> String {
+    if name == "claude"
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+        && let Some(logged_in) = value.get("loggedIn").and_then(serde_json::Value::as_bool)
+    {
+        let method = value
+            .get("authMethod")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        return if logged_in {
+            format!("logged in via {method}")
+        } else {
+            "not logged in; run nv login claude".to_string()
+        };
+    }
+
+    let fallback = if success { "ok" } else { "not logged in" };
+    text.lines()
+        .find(|line| !line.trim().is_empty() && !line.starts_with("WARNING:"))
+        .map(|line| line.trim().to_string())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 fn collect_context_paths(prompt: &str, cwd: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for token in prompt.split_whitespace() {
@@ -1035,5 +1168,16 @@ mod tests {
         std::fs::set_permissions(&path, permissions).unwrap();
 
         assert!(!is_executable_file(&path));
+    }
+
+    #[test]
+    fn claude_auth_status_summary_parses_json() {
+        let summary = summarize_auth_output(
+            "claude",
+            r#"{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}"#,
+            false,
+        );
+
+        assert_eq!(summary, "not logged in; run nv login claude");
     }
 }

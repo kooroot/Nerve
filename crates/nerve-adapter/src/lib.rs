@@ -183,6 +183,7 @@ impl SubprocessAdapter {
             "codex",
             vec![
                 "exec".to_string(),
+                "--skip-git-repo-check".to_string(),
                 "--json".to_string(),
                 "{prompt}".to_string(),
             ],
@@ -591,5 +592,13 @@ Lead notes before the patch.
         assert!(adapter.args.contains(&"--output-format".to_string()));
         assert!(adapter.args.contains(&"stream-json".to_string()));
         assert!(adapter.args.contains(&"--verbose".to_string()));
+    }
+
+    #[test]
+    fn codex_adapter_skips_repo_trust_check_for_non_interactive_exec() {
+        let adapter = SubprocessAdapter::codex();
+
+        assert!(adapter.args.contains(&"--skip-git-repo-check".to_string()));
+        assert!(adapter.args.contains(&"--json".to_string()));
     }
 }

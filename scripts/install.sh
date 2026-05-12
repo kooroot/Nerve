@@ -22,23 +22,6 @@ need_cmd uname
 need_cmd curl
 need_cmd tar
 
-if [ -z "$install_dir" ]; then
-  old_ifs="$IFS"
-  IFS=:
-  for path_dir in ${PATH:-}; do
-    IFS="$old_ifs"
-    if [ -n "$path_dir" ] && [ -d "$path_dir" ] && [ -w "$path_dir" ]; then
-      install_dir="$path_dir"
-      break
-    fi
-  done
-  IFS="$old_ifs"
-fi
-
-if [ -z "$install_dir" ]; then
-  install_dir="$HOME/.local/bin"
-fi
-
 os="$(uname -s)"
 arch="$(uname -m)"
 
@@ -63,6 +46,23 @@ case "$os" in
     exit 1
     ;;
 esac
+
+if [ -z "$install_dir" ]; then
+  for candidate in "/opt/homebrew/bin" "/usr/local/bin" "$HOME/.local/bin"; do
+    case "$os:$candidate" in
+      Darwin:*|Linux:/usr/local/bin|Linux:"$HOME/.local/bin")
+        if [ -d "$candidate" ] && [ -w "$candidate" ]; then
+          install_dir="$candidate"
+          break
+        fi
+        ;;
+    esac
+  done
+fi
+
+if [ -z "$install_dir" ]; then
+  install_dir="$HOME/.local/bin"
+fi
 
 asset="nerve-${target}.${archive}"
 url="https://github.com/${repo}/releases/latest/download/${asset}"
@@ -94,4 +94,4 @@ case ":${PATH:-}:" in
 esac
 
 "$install_dir/$bin_name" --help >/dev/null
-echo "Run: ${bin_name} doctor"
+echo "Run: ${bin_name} setup"
