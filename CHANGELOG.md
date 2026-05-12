@@ -2,7 +2,7 @@
 
 All notable changes to Nerve are documented here.
 
-## Unreleased
+## v0.1.3 - 2026-05-13
 
 ### Added
 
