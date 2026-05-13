@@ -2,6 +2,13 @@
 
 All notable changes to Nerve are documented here.
 
+## v0.1.7 - 2026-05-13
+
+### Added
+
+- Claude/Codex-style terminal workspace controls for changing mode, switching adapters, changing directories, clearing the screen, running shell commands, and submitting multiline tasks without restarting `nv`.
+- Git branch and dirty-state context in the interactive prompt.
+
 ## v0.1.6 - 2026-05-13
 
 ### Added

@@ -451,15 +451,56 @@ async fn run_interactive(apply: bool, mock: bool) -> Result<()> {
     print_interactive_banner(&state);
     let stdin = io::BufReader::new(io::stdin());
     let mut lines = stdin.lines();
+    let mut paste_lines: Option<Vec<String>> = None;
 
     loop {
-        print!("{}", interactive_prompt(&state));
+        if paste_lines.is_some() {
+            print!("paste> ");
+        } else {
+            print!("{}", interactive_prompt(&state));
+        }
         std::io::stdout().flush()?;
         let Some(line) = lines.next_line().await? else {
             break;
         };
-        let input = line.trim();
+        let raw_input = line.trim_end();
+        if let Some(lines) = paste_lines.as_mut() {
+            match raw_input {
+                "/end" => {
+                    let prompt = lines.join("\n").trim().to_string();
+                    paste_lines = None;
+                    if prompt.is_empty() {
+                        println!("Paste cancelled: empty task.");
+                    } else if let Err(error) = run_interactive_task(prompt, &mut state).await {
+                        print_interactive_error(&error);
+                    }
+                }
+                "/cancel" => {
+                    paste_lines = None;
+                    println!("Paste cancelled.");
+                }
+                _ => lines.push(raw_input.to_string()),
+            }
+            continue;
+        }
+
+        let input = raw_input.trim();
         if input.is_empty() {
+            continue;
+        }
+        if input == "?" {
+            print_interactive_help();
+            continue;
+        }
+        if let Some(shell_command) = input.strip_prefix('!') {
+            if let Err(error) = run_interactive_shell(shell_command.trim()) {
+                print_interactive_error(&error);
+            }
+            continue;
+        }
+        if input == "/paste" {
+            println!("Paste a multiline task. Finish with /end or cancel with /cancel.");
+            paste_lines = Some(Vec::new());
             continue;
         }
         if let Some(command) = input.strip_prefix('/') {
@@ -526,16 +567,19 @@ impl InteractiveState {
 fn print_interactive_banner(state: &InteractiveState) {
     println!("┌─ Nerve Terminal ─────────────────────────────────────────────┐");
     println!("│ Lead/reviewer coding loop with reviewed, auditable patches.  │");
-    println!("│ Type a task, then use /diff, /apply, /rollback, or /history. │");
+    println!("│ Type a task, /paste multiline input, or !cmd for shell.      │");
+    println!("│ Then inspect with /diff, /apply, /rollback, or /history.     │");
     println!("└──────────────────────────────────────────────────────────────┘");
     print_interactive_status(state);
 }
 
 fn print_interactive_status(state: &InteractiveState) {
+    let branch = git_branch_label(env::current_dir().ok().as_deref()).unwrap_or_else(|| "-".into());
     println!(
-        "adapter={} mode={} sessions={} patches={} cwd={}",
+        "adapter={} mode={} branch={} sessions={} patches={} cwd={}",
         state.adapter_label(),
         state.apply_label(),
+        branch,
         state.session_count,
         state.patch_count,
         env::current_dir()
@@ -549,10 +593,14 @@ fn interactive_prompt(state: &InteractiveState) -> String {
         .last_patch_id()
         .map(|id| format!(" patch={}", short_id(id)))
         .unwrap_or_default();
+    let branch_hint = git_branch_label(env::current_dir().ok().as_deref())
+        .map(|branch| format!(":{branch}"))
+        .unwrap_or_default();
     format!(
-        "nerve:{}:{}{}> ",
+        "nerve:{}:{}{}{}> ",
         state.adapter_label(),
         state.apply_label(),
+        branch_hint,
         patch_hint
     )
 }
@@ -603,12 +651,7 @@ async fn handle_interactive_command(command: &str, state: &mut InteractiveState)
     let mut parts = command.split_whitespace();
     let name = parts.next().unwrap_or("");
     match name {
-        "help" => {
-            println!(
-                "Commands: /login /doctor /status /history /resume <id> /list /templates /template <id> [args] /diff /apply [patch-id] /rollback [patch-id] /quit"
-            );
-            println!("Tasks: type any coding request without a leading slash.");
-        }
+        "help" => print_interactive_help(),
         "login" => run_login(LoginProvider::All)?,
         "doctor" => run_doctor(state.mock)?,
         "status" => {
@@ -626,6 +669,41 @@ async fn handle_interactive_command(command: &str, state: &mut InteractiveState)
                         .unwrap_or("-")
                 );
             }
+        }
+        "mode" => {
+            let mode = parts.next().context("usage: /mode <dry-run|apply>")?;
+            match mode {
+                "dry-run" | "dryrun" | "dry" => state.apply = false,
+                "apply" => state.apply = true,
+                _ => anyhow::bail!("usage: /mode <dry-run|apply>"),
+            }
+            println!("mode: {}", state.apply_label());
+        }
+        "adapter" => {
+            let adapter = parts.next().context("usage: /adapter <real|mock>")?;
+            match adapter {
+                "real" => state.mock = false,
+                "mock" => state.mock = true,
+                _ => anyhow::bail!("usage: /adapter <real|mock>"),
+            }
+            println!("adapter: {}", state.adapter_label());
+        }
+        "pwd" => println!("{}", cwd.display()),
+        "cd" => {
+            let target = parts.collect::<Vec<_>>().join(" ");
+            if target.is_empty() {
+                anyhow::bail!("usage: /cd <path>");
+            }
+            let next = resolve_workspace_path(&target, &cwd);
+            env::set_current_dir(&next)
+                .with_context(|| format!("failed to change directory to {}", next.display()))?;
+            state.refresh_counts();
+            print_interactive_status(state);
+        }
+        "clear" => {
+            print!("\x1b[2J\x1b[H");
+            std::io::stdout().flush()?;
+            print_interactive_banner(state);
         }
         "history" => {
             for session in NerveStore::new(cwd).list_sessions()?.into_iter().take(10) {
@@ -709,10 +787,110 @@ async fn handle_interactive_command(command: &str, state: &mut InteractiveState)
             println!("Rolled back patch {}.", report.patch_id);
             state.refresh_counts();
         }
-        "quit" | "exit" => return Ok(true),
+        "quit" | "exit" | "q" => return Ok(true),
         other => println!("Unknown command /{other}. Type /help for commands."),
     }
     Ok(false)
+}
+
+fn print_interactive_help() {
+    println!("Tasks:");
+    println!("  type a coding request to run the lead/reviewer loop");
+    println!("  /paste                 enter a multiline task; finish with /end");
+    println!("  !<command>             run a shell command in the current workspace");
+    println!("Workflow:");
+    println!("  /diff                  show the last reviewed patch");
+    println!("  /apply [patch-id]      apply the last or selected patch");
+    println!("  /rollback [patch-id]   roll back the last or selected patch");
+    println!("  /history               show recent sessions");
+    println!("  /resume <id>           print a stored session report");
+    println!("  /list                  list stored patches");
+    println!("Workspace:");
+    println!("  /status                show adapter, mode, branch, counts, cwd");
+    println!("  /mode <dry-run|apply>  switch apply behavior without restarting");
+    println!("  /adapter <real|mock>   switch providers without restarting");
+    println!("  /cd <path>             change workspace directory");
+    println!("  /pwd                   print workspace directory");
+    println!("  /clear                 redraw the terminal workspace");
+    println!("Setup:");
+    println!("  /login                 start provider login flows");
+    println!("  /doctor                inspect config, adapters, and auth");
+    println!("  /templates             list configured prompt templates");
+    println!("  /template <id> [args]  run a prompt template");
+    println!("  /quit                  exit");
+}
+
+fn resolve_workspace_path(target: &str, cwd: &Path) -> PathBuf {
+    if target == "~"
+        && let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE"))
+    {
+        return PathBuf::from(home);
+    }
+    if let Some(rest) = target.strip_prefix("~/")
+        && let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE"))
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    let path = PathBuf::from(target);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn git_branch_label(cwd: Option<&Path>) -> Option<String> {
+    let cwd = cwd?;
+    let output = StdCommand::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() {
+        return None;
+    }
+    let dirty = StdCommand::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| !output.stdout.is_empty())
+        .unwrap_or(false);
+    Some(if dirty { format!("{branch}*") } else { branch })
+}
+
+fn run_interactive_shell(command: &str) -> Result<()> {
+    if command.is_empty() {
+        anyhow::bail!("usage: !<command>");
+    }
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    #[cfg(windows)]
+    let mut child = {
+        let mut child = StdCommand::new("cmd");
+        child.args(["/C", command]);
+        child
+    };
+    #[cfg(not(windows))]
+    let mut child = {
+        let shell = env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+        let mut child = StdCommand::new(shell);
+        child.args(["-lc", command]);
+        child
+    };
+    let status = child
+        .current_dir(cwd)
+        .status()
+        .with_context(|| format!("failed to run shell command `{command}`"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("shell command exited with status {status}");
+    }
 }
 
 async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {

@@ -204,17 +204,24 @@ Use `nv login` or interactive `/login` to start the provider subscription login 
 Run `nv` with no prompt to open the Nerve terminal workspace. It keeps the last reviewed patch in memory so the next command can inspect or apply it without copying ids:
 
 ```text
-nerve:real:dry-run> fix the auth callback bug
-nerve:real:dry-run patch=abc12345> /diff
-nerve:real:dry-run patch=abc12345> /apply
+nerve:real:dry-run:main> fix the auth callback bug
+nerve:real:dry-run:main patch=abc12345> /diff
+nerve:real:dry-run:main patch=abc12345> /apply
 ```
 
 Available workspace commands:
 
 ```text
+/paste
+!<command>
 /login
 /doctor
 /status
+/mode <dry-run|apply>
+/adapter <real|mock>
+/cd <path>
+/pwd
+/clear
 /history
 /resume <session-id>
 /list

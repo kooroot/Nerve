@@ -205,8 +205,13 @@ fn mock_cli_interactive_shows_terminal_workspace_help() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Nerve Terminal"));
     assert!(stdout.contains("nerve:mock:dry-run>"));
+    assert!(stdout.contains("/paste"));
+    assert!(stdout.contains("!<command>"));
     assert!(stdout.contains("/diff"));
     assert!(stdout.contains("/apply [patch-id]"));
+    assert!(stdout.contains("/mode <dry-run|apply>"));
+    assert!(stdout.contains("/adapter <real|mock>"));
+    assert!(stdout.contains("/cd <path>"));
 }
 
 #[test]
@@ -242,6 +247,72 @@ fn mock_cli_interactive_remembers_last_patch_for_apply() {
             .unwrap()
             .contains("Status: refined")
     );
+}
+
+#[test]
+fn mock_cli_interactive_switches_workspace_controls() {
+    let fixture = MockCliFixture::new();
+    let mut child = fixture
+        .command()
+        .arg("interactive")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn nv interactive");
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            b"/mode apply\n/adapter real\n/adapter mock\n!echo nerve-shell\n/status\n/quit\n",
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("mode: apply"));
+    assert!(stdout.contains("adapter: real"));
+    assert!(stdout.contains("adapter: mock"));
+    assert!(stdout.contains("nerve-shell"));
+    assert!(stdout.contains("adapter=mock mode=apply"));
+}
+
+#[test]
+fn mock_cli_interactive_accepts_multiline_paste_task() {
+    let fixture = MockCliFixture::new();
+    let mut child = fixture
+        .command()
+        .arg("interactive")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn nv interactive");
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"/paste\nadd a health endpoint\ninclude a status line\n/end\n/quit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Paste a multiline task."));
+    assert!(stdout.contains("paste>"));
+    assert!(stdout.contains("reviewed patch ready"));
 }
 
 #[test]
