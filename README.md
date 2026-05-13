@@ -233,6 +233,12 @@ Available workspace commands:
 /quit
 ```
 
+When `nv` is attached to a real terminal, it uses an interactive line editor:
+
+- Type `/` to open the command palette.
+- Use Up/Down to move through command suggestions, or to navigate prompt history when the palette is closed.
+- Press Tab or Right to complete the selected slash command.
+
 Task errors do not close the workspace; use `/login` for provider auth, `/doctor` for setup checks, and `NERVE_ADAPTER=mock nv` for a local smoke test.
 
 Verified real output shapes:

@@ -6,7 +6,7 @@ use nerve_core::store::NerveStore;
 use nerve_core::{RunOptions, RunReport, run_synaptic_loop};
 use nerve_types::{AgentEvent, Task, Verdict};
 use std::env;
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use tokio::io::{self, AsyncBufReadExt};
@@ -449,6 +449,14 @@ async fn run_interactive(apply: bool, mock: bool) -> Result<()> {
     let mut state = InteractiveState::new(apply, mock);
     state.refresh_counts();
     print_interactive_banner(&state);
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        run_interactive_terminal(&mut state).await
+    } else {
+        run_interactive_lines(&mut state).await
+    }
+}
+
+async fn run_interactive_lines(state: &mut InteractiveState) -> Result<()> {
     let stdin = io::BufReader::new(io::stdin());
     let mut lines = stdin.lines();
     let mut paste_lines: Option<Vec<String>> = None;
@@ -457,66 +465,426 @@ async fn run_interactive(apply: bool, mock: bool) -> Result<()> {
         if paste_lines.is_some() {
             print!("paste> ");
         } else {
-            print!("{}", interactive_prompt(&state));
+            print!("{}", interactive_prompt(state));
         }
         std::io::stdout().flush()?;
         let Some(line) = lines.next_line().await? else {
             break;
         };
-        let raw_input = line.trim_end();
-        if let Some(lines) = paste_lines.as_mut() {
-            match raw_input {
-                "/end" => {
-                    let prompt = lines.join("\n").trim().to_string();
-                    paste_lines = None;
-                    if prompt.is_empty() {
-                        println!("Paste cancelled: empty task.");
-                    } else if let Err(error) = run_interactive_task(prompt, &mut state).await {
-                        print_interactive_error(&error);
-                    }
-                }
-                "/cancel" => {
-                    paste_lines = None;
-                    println!("Paste cancelled.");
-                }
-                _ => lines.push(raw_input.to_string()),
-            }
-            continue;
-        }
-
-        let input = raw_input.trim();
-        if input.is_empty() {
-            continue;
-        }
-        if input == "?" {
-            print_interactive_help();
-            continue;
-        }
-        if let Some(shell_command) = input.strip_prefix('!') {
-            if let Err(error) = run_interactive_shell(shell_command.trim()) {
-                print_interactive_error(&error);
-            }
-            continue;
-        }
-        if input == "/paste" {
-            println!("Paste a multiline task. Finish with /end or cancel with /cancel.");
-            paste_lines = Some(Vec::new());
-            continue;
-        }
-        if let Some(command) = input.strip_prefix('/') {
-            match handle_interactive_command(command, &mut state).await {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(error) => print_interactive_error(&error),
-            }
-            continue;
-        }
-        if let Err(error) = run_interactive_task(input.to_string(), &mut state).await {
-            print_interactive_error(&error);
+        if process_interactive_input(line.trim_end(), state, &mut paste_lines).await? {
+            break;
         }
     }
 
     Ok(())
+}
+
+async fn run_interactive_terminal(state: &mut InteractiveState) -> Result<()> {
+    let mut raw_guard = enable_stdin_raw_if_terminal()?;
+    let mut editor = InteractiveLineEditor::new();
+    let mut paste_lines: Option<Vec<String>> = None;
+
+    loop {
+        let prompt = if paste_lines.is_some() {
+            "paste> ".to_string()
+        } else {
+            interactive_prompt(state)
+        };
+        match editor.read_line(&prompt)? {
+            EditorRead::Line(line) => {
+                raw_guard.suspend()?;
+                let should_exit = process_interactive_input(&line, state, &mut paste_lines).await;
+                raw_guard.resume()?;
+                if should_exit? {
+                    break;
+                }
+            }
+            EditorRead::Interrupted => {
+                raw_guard.suspend()?;
+                println!("Interrupted. Type /quit to exit.");
+                raw_guard.resume()?;
+            }
+            EditorRead::Eof => break,
+        }
+    }
+
+    Ok(())
+}
+
+async fn process_interactive_input(
+    raw_input: &str,
+    state: &mut InteractiveState,
+    paste_lines: &mut Option<Vec<String>>,
+) -> Result<bool> {
+    if let Some(lines) = paste_lines.as_mut() {
+        match raw_input {
+            "/end" => {
+                let prompt = lines.join("\n").trim().to_string();
+                *paste_lines = None;
+                if prompt.is_empty() {
+                    println!("Paste cancelled: empty task.");
+                } else if let Err(error) = run_interactive_task(prompt, state).await {
+                    print_interactive_error(&error);
+                }
+            }
+            "/cancel" => {
+                *paste_lines = None;
+                println!("Paste cancelled.");
+            }
+            _ => lines.push(raw_input.to_string()),
+        }
+        return Ok(false);
+    }
+
+    let input = raw_input.trim();
+    if input.is_empty() {
+        return Ok(false);
+    }
+    if input == "?" {
+        print_interactive_help();
+        return Ok(false);
+    }
+    if let Some(shell_command) = input.strip_prefix('!') {
+        if let Err(error) = run_interactive_shell(shell_command.trim()) {
+            print_interactive_error(&error);
+        }
+        return Ok(false);
+    }
+    if input == "/paste" {
+        println!("Paste a multiline task. Finish with /end or cancel with /cancel.");
+        *paste_lines = Some(Vec::new());
+        return Ok(false);
+    }
+    if let Some(command) = input.strip_prefix('/') {
+        return match handle_interactive_command(command, state).await {
+            Ok(should_exit) => Ok(should_exit),
+            Err(error) => {
+                print_interactive_error(&error);
+                Ok(false)
+            }
+        };
+    }
+    if let Err(error) = run_interactive_task(input.to_string(), state).await {
+        print_interactive_error(&error);
+    }
+    Ok(false)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InteractiveCommandSpec {
+    command: &'static str,
+    args: &'static str,
+    description: &'static str,
+}
+
+const INTERACTIVE_COMMANDS: &[InteractiveCommandSpec] = &[
+    InteractiveCommandSpec {
+        command: "/login",
+        args: "",
+        description: "authenticate Claude and Codex",
+    },
+    InteractiveCommandSpec {
+        command: "/doctor",
+        args: "",
+        description: "inspect config, adapters, and auth",
+    },
+    InteractiveCommandSpec {
+        command: "/status",
+        args: "",
+        description: "show current workspace state",
+    },
+    InteractiveCommandSpec {
+        command: "/mode",
+        args: "<dry-run|apply>",
+        description: "switch apply behavior",
+    },
+    InteractiveCommandSpec {
+        command: "/adapter",
+        args: "<real|mock>",
+        description: "switch provider adapter",
+    },
+    InteractiveCommandSpec {
+        command: "/cd",
+        args: "<path>",
+        description: "change workspace directory",
+    },
+    InteractiveCommandSpec {
+        command: "/pwd",
+        args: "",
+        description: "print workspace directory",
+    },
+    InteractiveCommandSpec {
+        command: "/clear",
+        args: "",
+        description: "redraw terminal workspace",
+    },
+    InteractiveCommandSpec {
+        command: "/paste",
+        args: "",
+        description: "enter a multiline task",
+    },
+    InteractiveCommandSpec {
+        command: "/diff",
+        args: "",
+        description: "show last reviewed patch",
+    },
+    InteractiveCommandSpec {
+        command: "/apply",
+        args: "[patch-id]",
+        description: "apply last or selected patch",
+    },
+    InteractiveCommandSpec {
+        command: "/rollback",
+        args: "[patch-id]",
+        description: "roll back last or selected patch",
+    },
+    InteractiveCommandSpec {
+        command: "/history",
+        args: "",
+        description: "show recent sessions",
+    },
+    InteractiveCommandSpec {
+        command: "/resume",
+        args: "<session-id>",
+        description: "print stored session report",
+    },
+    InteractiveCommandSpec {
+        command: "/list",
+        args: "",
+        description: "list stored patches",
+    },
+    InteractiveCommandSpec {
+        command: "/templates",
+        args: "",
+        description: "list prompt templates",
+    },
+    InteractiveCommandSpec {
+        command: "/template",
+        args: "<id> [args]",
+        description: "run prompt template",
+    },
+    InteractiveCommandSpec {
+        command: "/help",
+        args: "",
+        description: "show command help",
+    },
+    InteractiveCommandSpec {
+        command: "/quit",
+        args: "",
+        description: "exit Nerve",
+    },
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EditorRead {
+    Line(String),
+    Interrupted,
+    Eof,
+}
+
+struct InteractiveLineEditor {
+    buffer: String,
+    history: Vec<String>,
+    history_index: Option<usize>,
+    draft: String,
+    selected_suggestion: usize,
+}
+
+impl InteractiveLineEditor {
+    fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            history: Vec::new(),
+            history_index: None,
+            draft: String::new(),
+            selected_suggestion: 0,
+        }
+    }
+
+    fn read_line(&mut self, prompt: &str) -> Result<EditorRead> {
+        self.buffer.clear();
+        self.history_index = None;
+        self.draft.clear();
+        self.selected_suggestion = 0;
+        self.render(prompt)?;
+
+        let stdin = std::io::stdin();
+        let mut stdin = stdin.lock();
+        loop {
+            let mut byte = [0_u8; 1];
+            if let Err(error) = stdin.read_exact(&mut byte) {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    self.finish_render(prompt)?;
+                    return Ok(EditorRead::Eof);
+                }
+                return Err(error).context("failed to read terminal input");
+            }
+
+            match byte[0] {
+                b'\r' | b'\n' => {
+                    self.finish_render(prompt)?;
+                    let line = self.buffer.trim_end().to_string();
+                    if !line.is_empty() {
+                        self.history.push(line.clone());
+                    }
+                    return Ok(EditorRead::Line(line));
+                }
+                3 => {
+                    self.finish_render(prompt)?;
+                    return Ok(EditorRead::Interrupted);
+                }
+                4 if self.buffer.is_empty() => {
+                    self.finish_render(prompt)?;
+                    return Ok(EditorRead::Eof);
+                }
+                9 => {
+                    self.complete_selected_suggestion();
+                    self.render(prompt)?;
+                }
+                8 | 127 => {
+                    self.buffer.pop();
+                    self.selected_suggestion = 0;
+                    self.history_index = None;
+                    self.render(prompt)?;
+                }
+                27 => {
+                    self.handle_escape_sequence(&mut stdin);
+                    self.render(prompt)?;
+                }
+                value if value.is_ascii_graphic() || value == b' ' => {
+                    self.buffer.push(value as char);
+                    self.selected_suggestion = 0;
+                    self.history_index = None;
+                    self.render(prompt)?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn handle_escape_sequence(&mut self, stdin: &mut std::io::StdinLock<'_>) {
+        let mut sequence = [0_u8; 2];
+        if stdin.read_exact(&mut sequence).is_err() || sequence[0] != b'[' {
+            return;
+        }
+        match sequence[1] {
+            b'A' => {
+                if self.has_command_suggestions() {
+                    self.move_suggestion(-1);
+                } else {
+                    self.move_history(-1);
+                }
+            }
+            b'B' => {
+                if self.has_command_suggestions() {
+                    self.move_suggestion(1);
+                } else {
+                    self.move_history(1);
+                }
+            }
+            b'C' => self.complete_selected_suggestion(),
+            _ => {}
+        }
+    }
+
+    fn render(&self, prompt: &str) -> Result<()> {
+        print!("\r\x1b[J{prompt}{}", self.buffer);
+        let suggestions = self.command_suggestions();
+        for (index, suggestion) in suggestions.iter().enumerate() {
+            let marker = if index == self.selected_suggestion {
+                ">"
+            } else {
+                " "
+            };
+            println!(
+                "\n  {marker} {:<12} {:<16} {}",
+                suggestion.command, suggestion.args, suggestion.description
+            );
+        }
+        if !suggestions.is_empty() {
+            print!("\x1b[{}A\r{prompt}{}", suggestions.len(), self.buffer);
+        }
+        std::io::stdout().flush()?;
+        Ok(())
+    }
+
+    fn finish_render(&self, prompt: &str) -> Result<()> {
+        print!("\r\x1b[J{prompt}{}\n", self.buffer);
+        std::io::stdout().flush()?;
+        Ok(())
+    }
+
+    fn command_suggestions(&self) -> Vec<&'static InteractiveCommandSpec> {
+        command_suggestions(&self.buffer)
+    }
+
+    fn has_command_suggestions(&self) -> bool {
+        !self.command_suggestions().is_empty()
+    }
+
+    fn complete_selected_suggestion(&mut self) {
+        let Some(suggestion) = self
+            .command_suggestions()
+            .get(self.selected_suggestion)
+            .copied()
+        else {
+            return;
+        };
+        self.buffer = if suggestion.args.is_empty() {
+            suggestion.command.to_string()
+        } else {
+            format!("{} ", suggestion.command)
+        };
+        self.selected_suggestion = 0;
+    }
+
+    fn move_suggestion(&mut self, delta: isize) {
+        let count = self.command_suggestions().len();
+        if count == 0 {
+            return;
+        }
+        self.selected_suggestion =
+            (self.selected_suggestion as isize + delta).rem_euclid(count as isize) as usize;
+    }
+
+    fn move_history(&mut self, delta: isize) {
+        if self.history.is_empty() {
+            return;
+        }
+        if self.history_index.is_none() {
+            self.draft = self.buffer.clone();
+        }
+
+        let next = match (self.history_index, delta) {
+            (None, -1) => Some(self.history.len() - 1),
+            (None, 1) => None,
+            (Some(0), -1) => Some(0),
+            (Some(index), -1) => Some(index - 1),
+            (Some(index), 1) if index + 1 >= self.history.len() => None,
+            (Some(index), 1) => Some(index + 1),
+            (current, _) => current,
+        };
+
+        self.history_index = next;
+        self.buffer = match self.history_index {
+            Some(index) => self.history[index].clone(),
+            None => self.draft.clone(),
+        };
+        self.selected_suggestion = 0;
+    }
+}
+
+fn command_suggestions(input: &str) -> Vec<&'static InteractiveCommandSpec> {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with('/') || trimmed.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    let query = trimmed.to_ascii_lowercase();
+    INTERACTIVE_COMMANDS
+        .iter()
+        .filter(|spec| spec.command.starts_with(&query))
+        .take(8)
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -651,6 +1019,7 @@ async fn handle_interactive_command(command: &str, state: &mut InteractiveState)
     let mut parts = command.split_whitespace();
     let name = parts.next().unwrap_or("");
     match name {
+        "" => print_interactive_help(),
         "help" => print_interactive_help(),
         "login" => run_login(LoginProvider::All)?,
         "doctor" => run_doctor(state.mock)?,
@@ -818,6 +1187,10 @@ fn print_interactive_help() {
     println!("  /templates             list configured prompt templates");
     println!("  /template <id> [args]  run a prompt template");
     println!("  /quit                  exit");
+    println!("Tips:");
+    println!("  type / to open the command palette");
+    println!("  use Up/Down for history or command selection");
+    println!("  use Tab or Right to complete a selected command");
 }
 
 fn resolve_workspace_path(target: &str, cwd: &Path) -> PathBuf {
@@ -1051,6 +1424,106 @@ async fn handle_rpc_command(value: serde_json::Value, apply: bool, mock: bool) -
         other => anyhow::bail!("unknown RPC command `{other}`"),
     }
     Ok(())
+}
+
+#[cfg(unix)]
+struct RawTerminalGuard {
+    fd: std::os::fd::RawFd,
+    original: libc::termios,
+    raw: libc::termios,
+    active: bool,
+}
+
+#[cfg(unix)]
+impl RawTerminalGuard {
+    fn suspend(&mut self) -> Result<()> {
+        if self.active {
+            unsafe {
+                if libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("failed to restore terminal settings");
+                }
+            }
+            self.active = false;
+        }
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        if !self.active {
+            unsafe {
+                if libc::tcsetattr(self.fd, libc::TCSANOW, &self.raw) != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("failed to enable raw terminal input");
+                }
+            }
+            self.active = true;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawTerminalGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn enable_stdin_raw_if_terminal() -> Result<RawTerminalGuard> {
+    use std::os::fd::AsRawFd;
+
+    let stdin = std::io::stdin();
+    let fd = stdin.as_raw_fd();
+    let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+    unsafe {
+        if libc::tcgetattr(fd, original.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to read terminal settings");
+        }
+
+        let original = original.assume_init();
+        let mut raw = original;
+        raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
+        raw.c_iflag &= !(libc::IXON | libc::ICRNL);
+        raw.c_oflag &= !libc::OPOST;
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+
+        if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to enable raw terminal input");
+        }
+
+        Ok(RawTerminalGuard {
+            fd,
+            original,
+            raw,
+            active: true,
+        })
+    }
+}
+
+#[cfg(not(unix))]
+struct RawTerminalGuard;
+
+#[cfg(not(unix))]
+impl RawTerminalGuard {
+    fn suspend(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn enable_stdin_raw_if_terminal() -> Result<RawTerminalGuard> {
+    Ok(RawTerminalGuard)
 }
 
 #[cfg(unix)]
@@ -1512,5 +1985,19 @@ mod tests {
         );
 
         assert_eq!(summary, "not logged in; run nv login claude");
+    }
+
+    #[test]
+    fn slash_command_suggestions_filter_by_prefix() {
+        let suggestions = command_suggestions("/do");
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].command, "/doctor");
+    }
+
+    #[test]
+    fn slash_command_suggestions_ignore_task_text_and_arguments() {
+        assert!(command_suggestions("fix /doctor output").is_empty());
+        assert!(command_suggestions("/mode dry-run").is_empty());
     }
 }

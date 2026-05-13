@@ -2,6 +2,13 @@
 
 All notable changes to Nerve are documented here.
 
+## v0.1.8 - 2026-05-13
+
+### Added
+
+- Interactive slash-command palette in real terminals: type `/` to see commands, use arrow keys to move through command suggestions, and press Tab or Right to complete.
+- Arrow-key prompt history for the terminal workspace.
+
 ## v0.1.7 - 2026-05-13
 
 ### Added
