@@ -52,8 +52,8 @@ Nerve has the Phase 1 MVP plus the planned Phase 2/3 CLI execution features impl
 | Config loading and profile matching | Implemented |
 | Mock lead/reviewer loop | Implemented and tested |
 | Hash-checked patch apply/rollback | Implemented and tested |
-| Claude/Codex subprocess boundary | Scaffolded |
-| Real CLI JSON parsing | Generic JSONL string extraction |
+| Claude/Codex subprocess boundary | Implemented with JSONL text, usage, and suggested-patch extraction |
+| Real CLI JSON parsing | Generic JSONL string extraction plus adapter completion events |
 | Real unified-diff to `NvPatch` conversion | Implemented for create/modify/delete/rename diffs |
 | Machine-readable session reports | Implemented with `--json` |
 | Persistent history / patch index | Implemented under `.nerve/` |
@@ -62,8 +62,9 @@ Nerve has the Phase 1 MVP plus the planned Phase 2/3 CLI execution features impl
 | Real-time cross-firing | Implemented for `.nerve/scratch` watcher feedback |
 | Prompt templates | Implemented with `nv template` |
 | Terminal product UX | Implemented with `nv`, `nv interactive`, `--tui`, `daemon`, and `daemon --rpc` |
+| Pi workflow benchmark | Implemented with `nv benchmark pi` |
 
-Important: the mock adapter path produces structured `NvPatch` values directly. The real subprocess path now extracts unified diffs from raw text or JSONL string fields and converts create/modify/delete/rename diffs into safe `NvPatch` values.
+Important: the mock adapter path produces structured `NvPatch` values directly. The real subprocess path extracts unified diffs from raw text or JSONL string fields, converts create/modify/delete/rename diffs into safe `NvPatch` values, and attaches reported usage when provider JSONL includes token or cost fields.
 
 ## Quick Start
 
@@ -188,6 +189,7 @@ Nerve exposes one CLI today:
 | `nv template run <template-id> [args...]` | Run a configured prompt template |
 | `nv daemon` | Run a line-oriented daemon for editor and shell integrations |
 | `nv daemon --rpc` | Run a JSONL RPC daemon with lifecycle events |
+| `nv benchmark pi` | Run the deterministic Pi-inspired workflow benchmark |
 | `nv config validate` | Validate `nerve.config.json` |
 
 Real adapter mode expects these CLIs on `PATH` and already authenticated:
@@ -227,6 +229,7 @@ Available workspace commands:
 /list
 /templates
 /template <template-id> [args...]
+/benchmark pi [iterations]
 /diff
 /apply [patch-id]
 /rollback [patch-id]
@@ -302,6 +305,10 @@ printf '%s\n' '{"command":"prompt","prompt":"add a health endpoint"}' | nv daemo
 ```
 
 Supported RPC commands are `prompt`, `get_state`, `history`, `resume`, `list_patches`, `apply_patch`, and `rollback_patch`. Prompt runs emit `session_start`, `lead_start`, `lead_event`, `review_start`, `review_event`, `patch_ready`, `apply_result`, and `session_end` events.
+
+### Pi Benchmark
+
+Use `nv benchmark pi` to run a deterministic local benchmark of the Pi-inspired workflow. It uses the mock adapter by default and checks config loading, store initialization, the lead/reviewer loop, structured patch creation, apply, rollback, history, and patch indexing. Add `--json` for machine-readable output or `--live` to exercise authenticated Claude/Codex subprocesses in a temporary workspace.
 
 ### Terminal TUI
 
@@ -510,6 +517,7 @@ Current test coverage verifies:
 - Pure rename and rename-with-content-change apply/rollback
 - Unsafe path rejection for traversal and symlink escapes
 - Real adapter raw text / JSONL diff extraction
+- Real adapter JSONL usage and reviewer suggested-patch extraction
 - Fenced Claude JSONL diff extraction
 - Fixture-based real adapter CLI dry-run and apply paths
 - CLI smoke test with dry-run diff output
@@ -523,6 +531,7 @@ Current test coverage verifies:
 - Scratch-file crossfire watcher feedback during lead execution
 - Line-oriented `nv daemon` mode for editor and shell integrations
 - Three-pane terminal TUI summary
+- Pi workflow benchmark command
 
 ## How It Works
 

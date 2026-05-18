@@ -59,6 +59,55 @@ fn real_adapter_fixture_applies_structured_diff_when_requested() {
     );
 }
 
+#[test]
+fn real_adapter_fixture_uses_reviewer_suggested_patch_when_prioritized() {
+    let fixture = RealAdapterFixture::with_scripts(
+        Some(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 0,
+                "conflict_policy": "reviewer_priority"
+              },
+              "roles": {
+                "architect": "claude-code",
+                "reviewer": "codex"
+              },
+              "profiles": []
+            }"#,
+        ),
+        r#"#!/bin/sh
+cat <<'JSON'
+{"type":"assistant","message":{"content":[{"type":"text","text":"--- a/target.txt\n+++ b/target.txt\n@@ -1 +1 @@\n-before\n+lead\n"}]}}
+JSON
+"#,
+        r#"#!/bin/sh
+cat <<'JSON'
+{"type":"assistant","message":{"content":[{"type":"text","text":"REQUEST_CHANGES: prefer reviewer patch\n\n--- a/target.txt\n+++ b/target.txt\n@@ -1 +1 @@\n-before\n+reviewed\n"}]}}
+JSON
+"#,
+    );
+
+    let output = fixture
+        .command()
+        .args(["--adapter", "real", "--apply", "update target file"])
+        .output()
+        .expect("failed to run nv binary");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Verdict: RequestChanges"));
+    assert_eq!(
+        fs::read_to_string(fixture.target_file()).unwrap(),
+        "reviewed\n"
+    );
+}
+
 struct RealAdapterFixture {
     _tempdir: tempfile::TempDir,
     cwd: PathBuf,
@@ -67,27 +116,32 @@ struct RealAdapterFixture {
 
 impl RealAdapterFixture {
     fn new() -> Self {
+        Self::with_scripts(
+            None,
+            r#"#!/bin/sh
+cat <<'JSON'
+{"type":"assistant","message":{"content":[{"type":"text","text":"--- a/target.txt\n+++ b/target.txt\n@@ -1 +1 @@\n-before\n+after\n"}]}}
+JSON
+"#,
+            r#"#!/bin/sh
+printf '%s\n' 'LGTM: fixture reviewer accepts the patch'
+"#,
+        )
+    }
+
+    fn with_scripts(config: Option<&str>, claude_script: &str, codex_script: &str) -> Self {
         let tempdir = tempfile::tempdir().unwrap();
         let cwd = tempdir.path().join("workspace");
         let bin = tempdir.path().join("bin");
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(&bin).unwrap();
         fs::write(cwd.join("target.txt"), "before\n").unwrap();
+        if let Some(config) = config {
+            fs::write(cwd.join("nerve.config.json"), config).unwrap();
+        }
 
-        write_executable(
-            &bin.join("claude"),
-            r#"#!/bin/sh
-cat <<'JSON'
-{"type":"assistant","message":{"content":[{"type":"text","text":"--- a/target.txt\n+++ b/target.txt\n@@ -1 +1 @@\n-before\n+after\n"}]}}
-JSON
-"#,
-        );
-        write_executable(
-            &bin.join("codex"),
-            r#"#!/bin/sh
-printf '%s\n' 'LGTM: fixture reviewer accepts the patch'
-"#,
-        );
+        write_executable(&bin.join("claude"), claude_script);
+        write_executable(&bin.join("codex"), codex_script);
 
         let mut paths = vec![bin];
         if let Some(existing) = env::var_os("PATH") {

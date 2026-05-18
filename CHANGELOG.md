@@ -2,6 +2,18 @@
 
 All notable changes to Nerve are documented here.
 
+## v0.1.9 - 2026-05-14
+
+### Added
+
+- `nv benchmark pi` for a deterministic Pi-inspired workflow benchmark covering config load, store initialization, lead/reviewer loop, structured patch creation, apply, rollback, history, and patch index checks.
+- Interactive `/benchmark pi [iterations]` command for running the same benchmark from the terminal workspace.
+
+### Changed
+
+- Real Claude/Codex subprocess integration now emits adapter completion events and extracts token/cost usage from JSONL output when providers report it.
+- Reviewer subprocess output can now contribute a structured suggested patch, enabling `reviewer_priority` and `merge_attempt` policies to use real reviewer diffs.
+
 ## v0.1.8 - 2026-05-13
 
 ### Added

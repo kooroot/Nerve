@@ -5,10 +5,12 @@ use nerve_config::{Config, DaemonProtocol};
 use nerve_core::store::NerveStore;
 use nerve_core::{RunOptions, RunReport, run_synaptic_loop};
 use nerve_types::{AgentEvent, Task, Verdict};
+use serde::Serialize;
 use std::env;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
+use std::time::Instant;
 use tokio::io::{self, AsyncBufReadExt};
 
 #[derive(Debug, Parser)]
@@ -53,6 +55,11 @@ enum LoginProvider {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(alias = "bench", about = "Run Nerve benchmark workflows")]
+    Benchmark {
+        #[command(subcommand)]
+        command: BenchmarkCommand,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -135,6 +142,22 @@ enum ConfigCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum BenchmarkCommand {
+    #[command(about = "Run the Pi-inspired terminal workflow benchmark")]
+    Pi {
+        #[arg(long, default_value_t = 3, help = "Benchmark iterations, from 1 to 20")]
+        iterations: u16,
+        #[arg(long, help = "Emit a machine-readable benchmark report")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Use the configured real provider adapter instead of the deterministic mock adapter"
+        )]
+        live: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum TemplateCommand {
     #[command(about = "List configured prompt templates")]
     List {
@@ -162,6 +185,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Command::Benchmark { command }) => {
+            run_benchmark(command, cli.json, matches!(cli.adapter, AdapterMode::Mock)).await
+        }
         Some(Command::Config {
             command: ConfigCommand::Validate,
         }) => {
@@ -323,6 +349,194 @@ async fn main() -> Result<()> {
             .await
         }
     }
+}
+
+async fn run_benchmark(command: BenchmarkCommand, json: bool, mock: bool) -> Result<()> {
+    match command {
+        BenchmarkCommand::Pi {
+            iterations,
+            json: command_json,
+            live,
+        } => {
+            let report = run_pi_benchmark(iterations, live, mock).await?;
+            print_pi_benchmark_report(&report, json || command_json)?;
+            if report.success {
+                Ok(())
+            } else {
+                anyhow::bail!("Pi benchmark failed")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PiBenchmarkReport {
+    name: &'static str,
+    adapter: &'static str,
+    iterations: u16,
+    success: bool,
+    elapsed_ms: u128,
+    checks: Vec<PiBenchmarkCheck>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PiBenchmarkCheck {
+    name: String,
+    ok: bool,
+    elapsed_ms: u128,
+    detail: String,
+}
+
+impl PiBenchmarkCheck {
+    fn new(name: impl Into<String>, ok: bool, elapsed_ms: u128, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ok,
+            elapsed_ms,
+            detail: detail.into(),
+        }
+    }
+}
+
+async fn run_pi_benchmark(iterations: u16, live: bool, mock: bool) -> Result<PiBenchmarkReport> {
+    if iterations == 0 || iterations > 20 {
+        anyhow::bail!("--iterations must be between 1 and 20");
+    }
+    if live && mock {
+        anyhow::bail!("--live requires --adapter real");
+    }
+
+    let adapter_mock = !live;
+    let adapter = if adapter_mock { "mock" } else { "real" };
+    let started = Instant::now();
+    let workspace = tempfile::tempdir().context("failed to create benchmark workspace")?;
+    let cwd = workspace.path();
+    let config = Config::load_from(cwd)?;
+    let store = NerveStore::new(cwd);
+    let mut checks = Vec::new();
+
+    let check_started = Instant::now();
+    store.init()?;
+    let has_templates = config
+        .templates
+        .iter()
+        .any(|template| template.id == "security-audit")
+        && config
+            .templates
+            .iter()
+            .any(|template| template.id == "rapid-fix");
+    checks.push(PiBenchmarkCheck::new(
+        "config-store-templates",
+        has_templates,
+        check_started.elapsed().as_millis(),
+        format!(
+            "strategy={:?} templates={} store=.nerve",
+            config.orchestration.default_strategy,
+            config.templates.len()
+        ),
+    ));
+
+    let adapters = default_adapters(adapter_mock);
+    for iteration in 1..=iterations {
+        let task = Task::new(
+            format!("Pi benchmark iteration {iteration}: produce a reviewed patch artifact"),
+            cwd,
+        );
+        let run_started = Instant::now();
+        let report =
+            run_synaptic_loop(task, &config, &adapters, RunOptions { apply: false }).await?;
+        store.save_report(&report)?;
+        let patch_id = report.final_patch.as_ref().map(|patch| patch.id.clone());
+        let loop_ok = report.final_feedback.verdict == Verdict::Lgtm
+            && !report.blocked
+            && !report.rounds.is_empty()
+            && patch_id.is_some();
+        checks.push(PiBenchmarkCheck::new(
+            format!("loop-{iteration}"),
+            loop_ok,
+            run_started.elapsed().as_millis(),
+            format!(
+                "session={} verdict={:?} rounds={} patch={}",
+                report.task.id,
+                report.final_feedback.verdict,
+                report.rounds.len(),
+                patch_id.as_deref().unwrap_or("-")
+            ),
+        ));
+
+        let Some(patch) = &report.final_patch else {
+            continue;
+        };
+
+        let apply_started = Instant::now();
+        let apply_report = store.apply_patch(&patch.id)?;
+        let applied_report = store.load_report(&report.task.id)?;
+        checks.push(PiBenchmarkCheck::new(
+            format!("apply-{iteration}"),
+            applied_report.applied
+                && apply_report.patch_id == patch.id
+                && !apply_report.changed_files.is_empty(),
+            apply_started.elapsed().as_millis(),
+            format!("changed_files={}", apply_report.changed_files.len()),
+        ));
+
+        let rollback_started = Instant::now();
+        let rollback_report = store.rollback_patch(&patch.id)?;
+        let rolled_back_report = store.load_report(&report.task.id)?;
+        checks.push(PiBenchmarkCheck::new(
+            format!("rollback-{iteration}"),
+            !rolled_back_report.applied
+                && rollback_report.patch_id == patch.id
+                && !rollback_report.changed_files.is_empty(),
+            rollback_started.elapsed().as_millis(),
+            format!("changed_files={}", rollback_report.changed_files.len()),
+        ));
+    }
+
+    let index_started = Instant::now();
+    let sessions = store.list_sessions()?;
+    let patches = store.list_patches()?;
+    checks.push(PiBenchmarkCheck::new(
+        "history-patch-index",
+        sessions.len() == usize::from(iterations) && patches.len() == usize::from(iterations),
+        index_started.elapsed().as_millis(),
+        format!("sessions={} patches={}", sessions.len(), patches.len()),
+    ));
+
+    let success = checks.iter().all(|check| check.ok);
+    Ok(PiBenchmarkReport {
+        name: "pi",
+        adapter,
+        iterations,
+        success,
+        elapsed_ms: started.elapsed().as_millis(),
+        checks,
+    })
+}
+
+fn print_pi_benchmark_report(report: &PiBenchmarkReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    println!(
+        "Pi benchmark: {} | adapter={} iterations={} elapsed={}ms",
+        if report.success { "ok" } else { "failed" },
+        report.adapter,
+        report.iterations,
+        report.elapsed_ms
+    );
+    for check in &report.checks {
+        println!(
+            "[{}] {} ({}ms) {}",
+            if check.ok { "ok" } else { "fail" },
+            check.name,
+            check.elapsed_ms,
+            check.detail
+        );
+    }
+    Ok(())
 }
 
 async fn run_prompt(prompt: String, apply: bool, json: bool, tui: bool, mock: bool) -> Result<()> {
@@ -662,6 +876,11 @@ const INTERACTIVE_COMMANDS: &[InteractiveCommandSpec] = &[
         command: "/template",
         args: "<id> [args]",
         description: "run prompt template",
+    },
+    InteractiveCommandSpec {
+        command: "/benchmark",
+        args: "pi [iterations]",
+        description: "run the Pi workflow benchmark",
     },
     InteractiveCommandSpec {
         command: "/help",
@@ -1127,6 +1346,20 @@ async fn handle_interactive_command(command: &str, state: &mut InteractiveState)
                 }
             }
         }
+        "benchmark" => {
+            let target = parts.next().context("usage: /benchmark pi [iterations]")?;
+            if target != "pi" {
+                anyhow::bail!("usage: /benchmark pi [iterations]");
+            }
+            let iterations = parts
+                .next()
+                .map(str::parse::<u16>)
+                .transpose()
+                .context("iterations must be a number")?
+                .unwrap_or(3);
+            let report = run_pi_benchmark(iterations, false, state.mock).await?;
+            print_pi_benchmark_report(&report, false)?;
+        }
         "diff" => {
             let Some(report) = &state.last_report else {
                 anyhow::bail!("no last session; run a task first");
@@ -1186,6 +1419,7 @@ fn print_interactive_help() {
     println!("  /doctor                inspect config, adapters, and auth");
     println!("  /templates             list configured prompt templates");
     println!("  /template <id> [args]  run a prompt template");
+    println!("  /benchmark pi [n]      run the Pi workflow benchmark");
     println!("  /quit                  exit");
     println!("Tips:");
     println!("  type / to open the command palette");

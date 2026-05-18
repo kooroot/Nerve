@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use nerve_patch::{FilePatch, NvPatch};
-use nerve_types::{AgentEvent, AgentOutput, Issue, IssueSeverity, ReviewerFeedback, Task, Verdict};
+use nerve_types::{
+    AgentEvent, AgentOutput, Issue, IssueSeverity, ReviewerFeedback, Task, UsageStats, Verdict,
+};
+use serde_json::{Map, Value};
 use std::path::Path;
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -228,6 +231,12 @@ impl SubprocessAdapter {
             );
         }
 
+        let _ = tx
+            .send(AgentEvent::Done {
+                agent_id: self.id.clone(),
+            })
+            .await;
+
         Ok(stdout)
     }
 }
@@ -265,7 +274,7 @@ impl ModelAdapter for SubprocessAdapter {
             task.prompt, lead_output.raw_text
         );
         let raw = self.run_prompt(prompt, cwd, &tx).await?;
-        Ok(feedback_from_text(self.id(), raw))
+        feedback_from_raw_text(self.id(), cwd, raw)
     }
 
     async fn refine(
@@ -320,9 +329,24 @@ fn feedback_from_text(reviewer_id: &str, raw_text: String) -> ReviewerFeedback {
         verdict,
         issues,
         suggested_patch: None,
-        cost: None,
+        cost: usage_from_raw_text(&raw_text),
         raw_text,
     }
+}
+
+fn feedback_from_raw_text(
+    reviewer_id: &str,
+    cwd: &Path,
+    raw_text: String,
+) -> Result<ReviewerFeedback> {
+    let mut feedback = feedback_from_text(reviewer_id, raw_text);
+    let patch_input = extract_patch_candidate_text(&feedback.raw_text);
+    if let Some(patch) = NvPatch::from_unified_diff(cwd, &patch_input)?
+        && !patch.is_empty()
+    {
+        feedback.suggested_patch = Some(patch);
+    }
+    Ok(feedback)
 }
 
 fn parse_verdict(raw_text: &str) -> Verdict {
@@ -392,11 +416,14 @@ fn strip_verdict_prefix(line: &str) -> Option<&str> {
 }
 
 fn output_from_raw_text(agent_id: &str, cwd: &Path, raw_text: String) -> Result<AgentOutput> {
+    let usage = usage_from_raw_text(&raw_text);
     let patch_input = extract_patch_candidate_text(&raw_text);
-    match NvPatch::from_unified_diff(cwd, &patch_input)? {
-        Some(patch) if !patch.is_empty() => Ok(AgentOutput::with_patch(agent_id, raw_text, patch)),
-        _ => Ok(AgentOutput::text(agent_id, raw_text)),
-    }
+    let mut output = match NvPatch::from_unified_diff(cwd, &patch_input)? {
+        Some(patch) if !patch.is_empty() => AgentOutput::with_patch(agent_id, raw_text, patch),
+        _ => AgentOutput::text(agent_id, raw_text),
+    };
+    output.cost = usage;
+    Ok(output)
 }
 
 fn extract_patch_candidate_text(raw_text: &str) -> String {
@@ -419,9 +446,30 @@ fn extract_patch_candidate_text(raw_text: &str) -> String {
 fn collect_adapter_message_text(value: &serde_json::Value, out: &mut String) {
     if value.get("type").and_then(serde_json::Value::as_str) == Some("assistant") {
         collect_content_text(&value["message"]["content"], out);
+        return;
     }
 
     if value.get("type").and_then(serde_json::Value::as_str) == Some("item.completed") {
+        if let Some(text) = value["item"]["text"].as_str() {
+            push_candidate_text(out, text);
+        }
+        collect_content_text(&value["item"]["content"], out);
+        return;
+    }
+
+    if value.get("role").and_then(serde_json::Value::as_str) == Some("assistant") {
+        if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+            push_candidate_text(out, text);
+        }
+        collect_content_text(&value["content"], out);
+    }
+
+    if value
+        .get("item")
+        .and_then(|item| item.get("role"))
+        .and_then(serde_json::Value::as_str)
+        == Some("assistant")
+    {
         if let Some(text) = value["item"]["text"].as_str() {
             push_candidate_text(out, text);
         }
@@ -457,6 +505,99 @@ fn push_candidate_text(out: &mut String, text: &str) {
         out.push('\n');
     }
     out.push_str(text);
+}
+
+fn usage_from_raw_text(raw_text: &str) -> Option<UsageStats> {
+    let mut latest = None;
+    for line in raw_text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        collect_latest_usage(&value, &mut latest);
+    }
+    latest.filter(|usage: &UsageStats| {
+        usage.total_tokens() > 0 || usage.estimated_cost_microusd.is_some()
+    })
+}
+
+fn collect_latest_usage(value: &Value, latest: &mut Option<UsageStats>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(usage) = parse_usage_object(map) {
+                *latest = Some(usage);
+            }
+            for child in map.values() {
+                collect_latest_usage(child, latest);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_latest_usage(item, latest);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn parse_usage_object(map: &Map<String, Value>) -> Option<UsageStats> {
+    let input_tokens = first_u64(
+        map,
+        &[
+            "input_tokens",
+            "prompt_tokens",
+            "total_input_tokens",
+            "cached_input_tokens",
+        ],
+    )
+    .unwrap_or_default();
+    let output_tokens = first_u64(
+        map,
+        &[
+            "output_tokens",
+            "completion_tokens",
+            "total_output_tokens",
+            "response_tokens",
+        ],
+    )
+    .unwrap_or_default();
+    let total_tokens = first_u64(map, &["total_tokens"]);
+    let estimated_cost_microusd = first_u64(
+        map,
+        &["estimated_cost_microusd", "cost_microusd", "microusd"],
+    );
+
+    if input_tokens == 0
+        && output_tokens == 0
+        && total_tokens.is_none()
+        && estimated_cost_microusd.is_none()
+    {
+        return None;
+    }
+
+    let (input_tokens, output_tokens) = if input_tokens == 0 && output_tokens == 0 {
+        (total_tokens.unwrap_or_default(), 0)
+    } else {
+        (input_tokens, output_tokens)
+    };
+
+    Some(UsageStats {
+        input_tokens,
+        output_tokens,
+        estimated_cost_microusd,
+    })
+}
+
+fn first_u64(map: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        map.get(*key).and_then(|value| {
+            value.as_u64().or_else(|| {
+                value
+                    .as_f64()
+                    .filter(|number| *number >= 0.0)
+                    .map(|number| number as u64)
+            })
+        })
+    })
 }
 
 async fn send_stdout(tx: &mpsc::Sender<AgentEvent>, agent_id: &str, line: &str) {
@@ -557,6 +698,34 @@ Lead notes before the patch.
     }
 
     #[test]
+    fn codex_item_completed_with_role_is_not_collected_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "before\n").unwrap();
+        let raw = r#"{"type":"item.completed","item":{"role":"assistant","text":"--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-before\n+after\n"}}"#
+            .to_string();
+
+        let output = output_from_raw_text("codex", dir.path(), raw).unwrap();
+
+        let patch = output.proposed_patch.unwrap();
+        assert_eq!(patch.files.len(), 1);
+        assert_eq!(patch.files[0].modified, "after\n");
+    }
+
+    #[test]
+    fn extracts_suggested_patch_from_reviewer_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "before\n").unwrap();
+        let raw = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"REQUEST_CHANGES: use this exact patch\n\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-before\n+reviewed\n"}]}}"#
+            .to_string();
+
+        let feedback = feedback_from_raw_text("codex", dir.path(), raw).unwrap();
+
+        assert_eq!(feedback.verdict, Verdict::RequestChanges);
+        let patch = feedback.suggested_patch.unwrap();
+        assert_eq!(patch.files[0].modified, "reviewed\n");
+    }
+
+    #[test]
     fn ignores_tool_result_diffs_when_extracting_jsonl_patch() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("file.txt"), "before\n").unwrap();
@@ -600,5 +769,17 @@ Lead notes before the patch.
 
         assert!(adapter.args.contains(&"--skip-git-repo-check".to_string()));
         assert!(adapter.args.contains(&"--json".to_string()));
+    }
+
+    #[test]
+    fn extracts_latest_usage_from_jsonl() {
+        let raw = r#"{"type":"usage","usage":{"input_tokens":10,"output_tokens":5}}
+{"type":"result","usage":{"input_tokens":14,"output_tokens":9,"estimated_cost_microusd":120}}"#;
+
+        let usage = usage_from_raw_text(raw).unwrap();
+
+        assert_eq!(usage.input_tokens, 14);
+        assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.estimated_cost_microusd, Some(120));
     }
 }

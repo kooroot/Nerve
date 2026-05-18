@@ -16,9 +16,8 @@ nerve-adapter = { path = "../nerve-adapter" }
 nerve-config = { path = "../nerve-config" }
 nerve-core = { path = "../nerve-core" }
 nerve-types = { path = "../nerve-types" }
+serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

@@ -87,6 +87,7 @@ nv --apply "rename foo to bar in src/lib.rs"
 | `nv rollback <patch-id>` | 저장된 patch 되돌리기 |
 | `nv doctor` | config + 어댑터 사전 점검 |
 | `nv daemon [--once]` | stdin 한 줄 = 한 task, stdout 한 줄 = JSON report (에디터 통합용) |
+| `nv benchmark pi [--json]` | Pi 스타일 워크플로우 벤치마크 |
 | `nv config validate` | 현재 작업 디렉터리의 `nerve.config.json` 검증 |
 
 **환경변수**:
@@ -187,6 +188,7 @@ crates/nerve-cli/tests/            e2e 테스트 (mock + 실제 어댑터 fixtur
 |------|-------------|
 | adapter verdict parsing | reviewer 응답 첫 verdict token만 파싱해 `LGTM: no blockers` 오분류 방지 |
 | adapter JSONL diff extraction | assistant-authored text만 diff parser에 넣고 tool result/input 문자열은 제외 |
+| adapter usage/suggested patch extraction | provider JSONL의 token/cost usage와 reviewer diff를 구조화 |
 | adapter issue summary | `Issue.message`에서 leading verdict line을 제거하고 실제 지적을 구조화 |
 | UTF-8 truncation | crossfire/TUI truncation이 char boundary를 보존 |
 | `merge_attempt` | `git merge-file` conflict exit code를 fatal로 보지 않고 conflict marker 출력 보존 |

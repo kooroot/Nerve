@@ -183,6 +183,29 @@ fn mock_cli_setup_initializes_store_and_checks_mock_adapter() {
 }
 
 #[test]
+fn mock_cli_runs_pi_benchmark_as_json() {
+    let fixture = MockCliFixture::new();
+    let output = fixture
+        .command()
+        .args(["benchmark", "pi", "--iterations", "2", "--json"])
+        .output()
+        .expect("failed to run pi benchmark");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["name"], "pi");
+    assert_eq!(report["adapter"], "mock");
+    assert_eq!(report["iterations"], 2);
+    assert_eq!(report["success"], true);
+    assert!(report["checks"].as_array().unwrap().len() >= 8);
+}
+
+#[test]
 fn mock_cli_interactive_shows_terminal_workspace_help() {
     let fixture = MockCliFixture::new();
     let mut child = fixture
@@ -212,6 +235,7 @@ fn mock_cli_interactive_shows_terminal_workspace_help() {
     assert!(stdout.contains("/mode <dry-run|apply>"));
     assert!(stdout.contains("/adapter <real|mock>"));
     assert!(stdout.contains("/cd <path>"));
+    assert!(stdout.contains("/benchmark pi [n]"));
 }
 
 #[test]
