@@ -104,7 +104,7 @@ pub fn apply_ulimit(_spec: &CheckUlimit) -> Result<(), UlimitError> {
 
 #[cfg(unix)]
 fn set_resource(
-    resource: impl Into<libc::c_int>,
+    resource: RlimitResource,
     label: &'static str,
     value: u64,
     macos_best_effort: bool,
@@ -115,7 +115,7 @@ fn set_resource(
     };
     // SAFETY: libc::setrlimit needs a valid pointer for the duration of the
     // call; `&limit` is. The struct fields are POD.
-    let rc = unsafe { libc::setrlimit(resource.into() as _, &limit) };
+    let rc = unsafe { libc::setrlimit(resource, &limit) };
     if rc == 0 {
         return Ok(());
     }
@@ -129,6 +129,19 @@ fn set_resource(
         errno: errno(),
     })
 }
+
+#[cfg(all(
+    unix,
+    target_os = "linux",
+    any(target_env = "gnu", target_env = "uclibc")
+))]
+type RlimitResource = libc::__rlimit_resource_t;
+
+#[cfg(all(
+    unix,
+    not(all(target_os = "linux", any(target_env = "gnu", target_env = "uclibc")))
+))]
+type RlimitResource = libc::c_int;
 
 #[cfg(unix)]
 fn clamp_to_rlim(value: u64) -> libc::rlim_t {

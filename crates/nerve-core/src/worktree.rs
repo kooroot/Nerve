@@ -10,16 +10,16 @@
 //! 3. advisory file lock serialising concurrent rounds
 //! 4. doctor pre-check (`git --version`)
 //! 5. symlink escape detection before merge
-//! 6. statvfs disk gate before each round
+//! 6. disk-space gate before each round
 //! 7. reset --hard → reset --merge fallback + orphaned manifest
 
 use chrono::Utc;
 use fs2::FileExt;
 use nerve_patch::NvPatch;
 use serde::{Deserialize, Serialize};
-use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -579,6 +579,7 @@ fn append_manifest(path: &Path, entry: &OrphanManifestEntry) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn chmod_recursive(root: &Path, mode: u32) -> io::Result<()> {
     if !root.exists() {
         return Ok(());
@@ -599,7 +600,12 @@ fn chmod_recursive(root: &Path, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// Doctor-facing accessor for the statvfs-based MiB probe used by
+#[cfg(not(unix))]
+fn chmod_recursive(_root: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
+/// Doctor-facing accessor for the MiB disk-space probe used by
 /// `prepare_round`/`merge_round` (Tier 2d guard #6). Wraps the private helper
 /// so `doctor_checks` doesn't need to construct an isolator just to read
 /// available disk space.
@@ -608,22 +614,8 @@ pub fn available_mib_for_doctor(probe: &Path) -> Result<u64, WorktreeError> {
 }
 
 fn available_mib(probe: &Path) -> Result<u64, WorktreeError> {
-    let raw = probe.to_str().ok_or_else(|| invalid_path(probe))?;
-    let c = CString::new(raw).map_err(|err| {
-        WorktreeError::Io(io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))
-    })?;
-    // SAFETY: zeroed statvfs is the documented init pattern, and we hand a valid
-    // C string to libc.
-    unsafe {
-        let mut buf: libc::statvfs = std::mem::zeroed();
-        let rc = libc::statvfs(c.as_ptr(), &mut buf);
-        if rc != 0 {
-            return Err(WorktreeError::Io(io::Error::last_os_error()));
-        }
-        let block = buf.f_frsize as u128;
-        let available = buf.f_bavail as u128 * block;
-        Ok((available / (1024 * 1024)) as u64)
-    }
+    let available = fs2::available_space(probe).map_err(WorktreeError::Io)?;
+    Ok(available / (1024 * 1024))
 }
 
 struct WorktreeLock {
@@ -652,7 +644,7 @@ impl Drop for WorktreeLock {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use nerve_patch::{FilePatch, NvPatch};

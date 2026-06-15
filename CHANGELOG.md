@@ -31,6 +31,7 @@ All notable changes to Nerve are documented here.
 - Natural-language goal conversion rejects model-controlled `cwd` changes and freezes the caller workspace.
 - Worktree merge/discard refuses to reset when main HEAD moved after round preparation.
 - Worktree chmod handling skips symlink targets.
+- Release builds now compile on Linux and Windows by using the platform-native `setrlimit` resource type, a cross-platform disk-space probe, and Unix-only chmod/test guards.
 - Legacy stored sessions keep their round history when bootstrapped into the fork index.
 - Mayor/Patrol queue IDs are validated as safe file components and duplicate task IDs are rejected before enqueue.
 - Patrol claim writes a heartbeat before moving a pending task so status/orphan recovery does not immediately reclaim fresh work.
@@ -40,6 +41,9 @@ All notable changes to Nerve are documented here.
 - `cargo fmt --check`
 - `cargo test --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo check --locked -p nerve-cli --target x86_64-unknown-linux-gnu`
+- `cargo check --locked -p nerve-cli --target x86_64-pc-windows-msvc`
+- `cargo build --release --locked -p nerve-cli`
 - `cargo run -p nerve-cli -- config validate`
 - `cargo run -p nerve-cli -- --adapter mock benchmark pi --iterations 1 --json`
 - `cargo run -p nerve-cli -- --adapter mock doctor`

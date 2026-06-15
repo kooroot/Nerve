@@ -1,4 +1,6 @@
-use crate::ulimit::{CheckUlimit, UlimitError, apply_ulimit};
+#[cfg(unix)]
+use crate::ulimit::apply_ulimit;
+use crate::ulimit::{CheckUlimit, UlimitError};
 use nerve_config::GoalSpec;
 use nerve_types::CheckResult;
 use std::collections::BTreeSet;
@@ -108,6 +110,11 @@ impl GoalEvaluator {
         }
         for (key, value) in &self.goal.env {
             command.env(key, value);
+        }
+
+        #[cfg(not(unix))]
+        if self.ulimit.is_some() {
+            return Err(GoalError::Ulimit(UlimitError::Unsupported));
         }
 
         #[cfg(unix)]
