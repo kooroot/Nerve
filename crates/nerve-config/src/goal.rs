@@ -42,6 +42,22 @@ pub enum ConfigError {
     // Tier 2e (v0.5.0): rpc.* knobs must be non-zero when set.
     #[error("daemon.rpc.{0} must be greater than 0")]
     InvalidRpcValue(&'static str),
+    // Tier 3i (v1.0): mcp.servers[].command must be a non-empty argv.
+    #[error("mcp.servers[].name must not be empty")]
+    EmptyMcpName,
+    #[error("mcp.servers[`{0}`] is defined more than once")]
+    DuplicateMcpServer(String),
+    #[error("mcp.servers[`{0}`].command must be a non-empty argv vector")]
+    EmptyMcpCommand(String),
+    // Tier 3j (v1.0): mayor_patrol.* knobs must satisfy the documented ranges.
+    #[error("orchestration.mayor_patrol.{0} must be greater than 0 when set")]
+    InvalidMayorPatrolValue(&'static str),
+    #[error("orchestration.mayor_patrol.max_patrols must be in 1..=64 (got {0})")]
+    InvalidMayorPatrolMaxPatrols(u32),
+    #[error(
+        "orchestration.mayor_patrol.claim_ttl_secs ({ttl}) must be at least 2x heartbeat_secs ({hb})"
+    )]
+    InvalidMayorPatrolClaimTtl { ttl: u32, hb: u32 },
 }
 
 impl GoalSpec {

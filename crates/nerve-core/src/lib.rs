@@ -22,8 +22,10 @@ use tokio::time::{Duration, sleep};
 pub mod budget_audit;
 pub mod goal;
 pub mod goal_intent;
+pub mod mayor_patrol;
 pub mod plan;
 pub mod rpc;
+pub mod session_fork;
 pub mod store;
 pub mod ulimit;
 pub mod worktree;
@@ -34,11 +36,17 @@ pub use budget_audit::{
 };
 pub use goal::{GoalError, GoalEvaluator};
 pub use goal_intent::{GOAL_INTENT_SYSTEM_PROMPT, GoalIntentConverter, GoalIntentError};
+pub use mayor_patrol::{
+    DispatchFuture, Mayor, MayorError, MayorStatus, Patrol, PatrolResult, PatrolTask, PatrolVerdict,
+};
 pub use plan::{
     PLAN_ONLY_SYSTEM_PROMPT, PLAN_REVIEW_SYSTEM_PROMPT, PlanError, PlanRunOptions, PlanSections,
     run_plan_mode, validate_plan_markdown,
 };
 pub use rpc::{EmitError, EmitOutcome, RpcBus, RpcError};
+pub use session_fork::{
+    ForkConfig, ForkError, ForkOptions, SessionForker, SessionIndexEntry, SessionTree,
+};
 pub use ulimit::{UlimitError, apply_ulimit};
 pub use worktree::{IsolatedRound, OrphanManifestEntry, WorktreeError, WorktreeIsolator};
 

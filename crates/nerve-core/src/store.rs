@@ -354,6 +354,25 @@ fn write_json<T>(path: &Path, value: &T) -> Result<()>
 where
     T: Serialize,
 {
+    write_json_atomic(path, value)
+}
+
+/// Atomically serialize `value` to JSON at `path`.
+///
+/// Implementation guarantees:
+/// 1. The parent directory is created if missing.
+/// 2. Bytes are first written to a `NamedTempFile` inside the *same*
+///    directory so that the subsequent `persist` is a `rename(2)` on the
+///    same filesystem — never a cross-mount copy.
+/// 3. On success the destination is replaced atomically; on any failure
+///    the temp file is cleaned up and the destination is untouched.
+///
+/// This is the canonical path for persisting `.nerve/` state — fork
+/// session payloads, queue tasks, results, audit chain entries, etc.
+pub fn write_json_atomic<T>(path: &Path, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create `{}`", parent.display()))?;
