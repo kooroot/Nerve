@@ -1,14 +1,16 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerve_adapter::{ModelAdapter, SubprocessAdapter, default_adapters_with_limits};
-use nerve_config::{Config, DaemonProtocol, GoalIntent, GoalSpec};
+use nerve_config::{Config, DaemonProtocol, GoalIntent, GoalSpec, PlanStrategy, RpcConfig};
 use nerve_core::store::NerveStore;
 use nerve_core::{
     AuditChainState, BudgetAuditEntry, BudgetSnapshot, ChainStatus, DoctorCheck, DoctorStatus,
-    GoalIntentConverter, RunOptions, RunReport, append_budget_audit_entry, doctor_checks,
-    format_chain_broken, run_synaptic_loop,
+    GoalIntentConverter, PlanError, PlanRunOptions, RpcBus, RunOptions, RunReport,
+    append_budget_audit_entry, doctor_checks, format_chain_broken, run_plan_mode,
+    run_synaptic_loop,
 };
-use nerve_types::{AgentEvent, Task, Verdict};
+use nerve_tui::{TuiApp, TuiAppOptions, TuiState};
+use nerve_types::{AgentEvent, PlanReport, RPC_SCHEMA_VERSION, RpcEnvelope, Task, Verdict};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::env;
@@ -19,6 +21,7 @@ use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{self, AsyncBufReadExt};
+use tokio::sync::{broadcast, watch};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -136,7 +139,19 @@ enum Command {
         once: bool,
         #[arg(long, help = "Use JSONL RPC input and lifecycle events")]
         rpc: bool,
+        #[arg(
+            long,
+            help = "Print the RPC bearer token on stdout after the daemon starts"
+        )]
+        print_token: bool,
     },
+    #[command(about = "Inspect or maintain the v0.5.0 RPC event-streaming surface")]
+    Rpc {
+        #[command(subcommand)]
+        command: RpcCommand,
+    },
+    #[command(about = "Run /plan (Tier 2f read-only analysis); never produces a patch")]
+    Plan(PlanArgs),
     #[command(about = "First-run setup and local prerequisite checks")]
     Setup,
     #[command(about = "Sign in to Claude Code and/or Codex subscriptions")]
@@ -170,6 +185,32 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
     Validate,
+}
+
+/// `nv plan` arguments. Plan mode runs the lead (and optionally reviewer)
+/// adapter under a strict plan-only system prompt that forbids patches.
+#[derive(Debug, clap::Args)]
+struct PlanArgs {
+    #[arg(help = "Natural-language task description for plan-mode")]
+    task: String,
+    #[arg(
+        long,
+        help = "Run the reviewer adapter as a second pass over the plan markdown"
+    )]
+    dual_review: bool,
+    #[arg(
+        long,
+        help = "Override the workspace directory for plan-mode (defaults to cwd)"
+    )]
+    cwd: Option<PathBuf>,
+}
+
+/// `nv rpc` family. Currently exposes the v0.5.0 bearer-token rotation
+/// helper; future maintenance subcommands hang off this enum.
+#[derive(Debug, Subcommand)]
+enum RpcCommand {
+    #[command(about = "Rotate the bearer token persisted under .nerve/session-meta/")]
+    RotateToken,
 }
 
 #[derive(Debug, Subcommand)]
@@ -318,15 +359,32 @@ async fn main() -> Result<()> {
             &mut std::io::stdout(),
             &mut std::io::stderr(),
         ),
-        Some(Command::Daemon { once, rpc }) => {
+        Some(Command::Daemon {
+            once,
+            rpc,
+            print_token,
+        }) => {
             let config_prefers_rpc = Config::load()
                 .map(|config| matches!(config.daemon.protocol, DaemonProtocol::Rpc))
                 .unwrap_or(false);
             if rpc || config_prefers_rpc {
-                run_rpc_daemon(cli.apply, matches!(cli.adapter, AdapterMode::Mock), once).await
+                run_rpc_daemon(
+                    cli.apply,
+                    matches!(cli.adapter, AdapterMode::Mock),
+                    once,
+                    print_token,
+                )
+                .await
             } else {
+                if print_token {
+                    anyhow::bail!("--print-token requires --rpc (or daemon.protocol=rpc)");
+                }
                 run_daemon(cli.apply, matches!(cli.adapter, AdapterMode::Mock), once).await
             }
+        }
+        Some(Command::Rpc { command }) => run_rpc_subcommand(command),
+        Some(Command::Plan(args)) => {
+            run_plan_subcommand(args, matches!(cli.adapter, AdapterMode::Mock), cli.json).await
         }
         Some(Command::Setup) => run_setup(matches!(cli.adapter, AdapterMode::Mock)),
         Some(Command::Login { provider }) => run_login(provider),
@@ -335,6 +393,7 @@ async fn main() -> Result<()> {
                 cli.apply,
                 matches!(cli.adapter, AdapterMode::Mock),
                 cli_worktree_override(cli.worktree, cli.no_worktree),
+                cli.tui,
             )
             .await
         }
@@ -384,6 +443,7 @@ async fn main() -> Result<()> {
                         cli.apply,
                         matches!(cli.adapter, AdapterMode::Mock),
                         cli_worktree_override(cli.worktree, cli.no_worktree),
+                        cli.tui,
                     )
                     .await;
                 }
@@ -670,6 +730,17 @@ fn run_doctor(mock: bool, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Res
         }
     }
 
+    // v0.5.0 Tier 2e: rpc-token file permission (0600) and envelope schema
+    // version compatibility checks. We surface these even when the daemon
+    // protocol is `line` because operators may switch protocols at runtime.
+    let rpc_config = config.daemon.rpc.clone().unwrap_or_default();
+    for check in rpc_doctor_checks(&cwd, &rpc_config) {
+        render_doctor_check(&check, stdout, stderr);
+        if matches!(check.status, DoctorStatus::Fail(_)) {
+            any_fail = true;
+        }
+    }
+
     if mock {
         writeln!(stdout, "adapter: mock ok").ok();
         if any_fail {
@@ -692,6 +763,102 @@ fn run_doctor(mock: bool, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Res
     } else {
         anyhow::bail!("real adapter prerequisites are missing")
     }
+}
+
+/// Tier 2e doctor checks. We verify two invariants:
+///
+///   1. The bearer-token file (when it exists) is `0600`. A wider mode
+///      could let other users on the host read or replace the token, so we
+///      treat anything else as a `Fail`.
+///   2. The configured `envelope_version` is compatible with the runtime
+///      [`RPC_SCHEMA_VERSION`]. We only check the major version (semver) so
+///      additive payload extensions don't trip the gate.
+fn rpc_doctor_checks(cwd: &Path, rpc_config: &RpcConfig) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+
+    let token_path = if rpc_config.token_path.is_absolute() {
+        rpc_config.token_path.clone()
+    } else {
+        cwd.join(".nerve")
+            .join("session-meta")
+            .join(rpc_config.token_path.file_name().unwrap_or_default())
+    };
+
+    let status = rpc_token_permission_status(&token_path);
+    checks.push(DoctorCheck {
+        name: "rpc_token_perm".to_string(),
+        status,
+    });
+
+    let status = envelope_version_status(&rpc_config.envelope_version);
+    checks.push(DoctorCheck {
+        name: "rpc_envelope_version".to_string(),
+        status,
+    });
+
+    checks
+}
+
+#[cfg(unix)]
+fn rpc_token_permission_status(token_path: &Path) -> DoctorStatus {
+    use std::os::unix::fs::PermissionsExt;
+    if !token_path.exists() {
+        return DoctorStatus::Ok;
+    }
+    match fs::metadata(token_path) {
+        Ok(metadata) => {
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode == 0o600 {
+                DoctorStatus::Ok
+            } else {
+                DoctorStatus::Fail(format!(
+                    "{} has mode {mode:o}, expected 0600",
+                    token_path.display()
+                ))
+            }
+        }
+        Err(err) => DoctorStatus::Warn(format!("could not stat `{}`: {err}", token_path.display())),
+    }
+}
+
+#[cfg(not(unix))]
+fn rpc_token_permission_status(_token_path: &Path) -> DoctorStatus {
+    // Non-unix targets don't expose octal modes; assume ok.
+    DoctorStatus::Ok
+}
+
+/// Compare `configured` against the runtime [`RPC_SCHEMA_VERSION`] on the
+/// major-version axis. Anything that fails to parse as `MAJOR.MINOR.PATCH`
+/// is a `Fail`.
+fn envelope_version_status(configured: &str) -> DoctorStatus {
+    let runtime_major = match major_version(RPC_SCHEMA_VERSION) {
+        Some(v) => v,
+        None => {
+            return DoctorStatus::Warn(format!(
+                "runtime RPC_SCHEMA_VERSION `{RPC_SCHEMA_VERSION}` is not semver-shaped",
+            ));
+        }
+    };
+    let configured_major = match major_version(configured) {
+        Some(v) => v,
+        None => {
+            return DoctorStatus::Fail(format!(
+                "daemon.rpc.envelope_version `{configured}` is not semver-shaped",
+            ));
+        }
+    };
+    if runtime_major == configured_major {
+        DoctorStatus::Ok
+    } else {
+        DoctorStatus::Fail(format!(
+            "daemon.rpc.envelope_version `{configured}` major mismatches runtime `{RPC_SCHEMA_VERSION}`",
+        ))
+    }
+}
+
+/// Strip the major version prefix (`1`) from a `MAJOR.MINOR.PATCH` string.
+fn major_version(version: &str) -> Option<u32> {
+    version.split('.').next().and_then(|s| s.parse().ok())
 }
 
 fn render_doctor_check(check: &DoctorCheck, stdout: &mut dyn Write, stderr: &mut dyn Write) {
@@ -750,10 +917,28 @@ fn run_provider_login(provider: LoginProvider) -> Result<()> {
     }
 }
 
-async fn run_interactive(apply: bool, mock: bool, worktree_override: Option<bool>) -> Result<()> {
+async fn run_interactive(
+    apply: bool,
+    mock: bool,
+    worktree_override: Option<bool>,
+    force_tui: bool,
+) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let tui_decision = match Config::load_from(&cwd) {
+        Ok(config) => decide_tui(force_tui, &config),
+        Err(_) => TuiDecision {
+            use_tui: false,
+            refresh_ms: 100,
+            log_height_pct: 60,
+            suppressed_reason: Some(TuiSuppression::Disabled),
+        },
+    };
+    if tui_decision.use_tui {
+        return run_interactive_tui(apply, mock, worktree_override, tui_decision).await;
+    }
+
     let mut state = InteractiveState::new(apply, mock, worktree_override);
     state.refresh_counts();
-    let cwd = env::current_dir().context("failed to read current directory")?;
     refresh_active_goal(&mut state, &cwd);
     warn_if_audit_chain_broken(&cwd);
     print_interactive_banner(&state);
@@ -762,6 +947,251 @@ async fn run_interactive(apply: bool, mock: bool, worktree_override: Option<bool
     } else {
         run_interactive_lines(&mut state).await
     }
+}
+
+/// Outcome of [`decide_tui`] — whether to enable the v0.5.0 ratatui front-end
+/// and the resolved TUI knobs to feed [`TuiAppOptions`].
+#[derive(Debug, Clone, Copy)]
+struct TuiDecision {
+    use_tui: bool,
+    refresh_ms: u64,
+    log_height_pct: u8,
+    /// Why TUI was suppressed (for diagnostics). `None` when `use_tui` is true.
+    /// Read by `tui_skips_when_non_tty` and by future telemetry hooks.
+    #[allow(dead_code)]
+    suppressed_reason: Option<TuiSuppression>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiSuppression {
+    /// Neither `--tui` nor auto-enable conditions matched.
+    NotRequested,
+    /// stdin or stdout is not a TTY; we refuse to clobber piped output.
+    NotATty,
+    /// `--tui` was requested but explicit `tui.enabled = false` overrides it.
+    Disabled,
+}
+
+/// Resolve whether the interactive shell should hand off to the ratatui TUI.
+///
+/// Precedence (matches the task spec): explicit `--tui` flag wins when the
+/// TTY check passes; otherwise we honour `tui.auto_in_cmux` + `CMUX_SESSION`.
+/// Any non-TTY stream forces the legacy plain shell so piped consumers still
+/// receive line-oriented output.
+fn decide_tui(force_tui: bool, config: &Config) -> TuiDecision {
+    let refresh_ms = config.tui.refresh_ms.max(16);
+    let log_height_pct = config.tui.log_height_pct.clamp(10, 90);
+
+    if !config.tui.enabled && !force_tui {
+        return TuiDecision {
+            use_tui: false,
+            refresh_ms,
+            log_height_pct,
+            suppressed_reason: Some(TuiSuppression::Disabled),
+        };
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return TuiDecision {
+            use_tui: false,
+            refresh_ms,
+            log_height_pct,
+            suppressed_reason: Some(TuiSuppression::NotATty),
+        };
+    }
+
+    let auto = config.tui.enabled && config.tui.auto_in_cmux && env::var("CMUX_SESSION").is_ok();
+    if !force_tui && !auto {
+        return TuiDecision {
+            use_tui: false,
+            refresh_ms,
+            log_height_pct,
+            suppressed_reason: Some(TuiSuppression::NotRequested),
+        };
+    }
+
+    TuiDecision {
+        use_tui: true,
+        refresh_ms,
+        log_height_pct,
+        suppressed_reason: None,
+    }
+}
+
+/// Drive the v0.5.0 Tier 3g 3-pane ratatui shell. We spin three broadcast
+/// channels (status / lead / reviewer) plus a watch-based shutdown flag,
+/// hand them to `TuiApp::run`, and forward a single placeholder status
+/// snapshot so the UI is responsive even before the first synaptic round.
+///
+/// The full lifecycle wiring (per-iter `TuiState` emit, per-token lead and
+/// reviewer chunk fan-out) lands when `nerve-core` exposes a session-bound
+/// `RpcBus`. Until then we expose the UI so cmux sessions can verify the
+/// pane layout against the design doc without diverging from the daemon
+/// transport contract.
+async fn run_interactive_tui(
+    _apply: bool,
+    _mock: bool,
+    _worktree_override: Option<bool>,
+    decision: TuiDecision,
+) -> Result<()> {
+    let (state_tx, state_rx) = broadcast::channel::<TuiState>(256);
+    let (lead_tx, lead_rx) = broadcast::channel::<String>(256);
+    let (reviewer_tx, reviewer_rx) = broadcast::channel::<String>(256);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Emit an initial status so the bottom-right pane shows real content on
+    // first paint instead of an empty widget. Failures (no subscribers yet)
+    // are ignored — the TuiApp draws once before subscribing to `recv`.
+    let _ = state_tx.send(TuiState {
+        note: Some("tui ready (interactive)".to_string()),
+        ..TuiState::default()
+    });
+
+    let app = TuiApp::new(TuiAppOptions {
+        refresh_ms: decision.refresh_ms,
+        log_height_pct: decision.log_height_pct,
+    });
+
+    // Run the TUI on the current task so Ctrl-C / Esc / `q` propagates
+    // through the shutdown watch to the supervisor's join point below.
+    let tui_handle =
+        tokio::spawn(async move { app.run(state_rx, lead_rx, reviewer_rx, shutdown_rx).await });
+
+    // Hold the publisher ends alive until the TUI exits. Dropping them
+    // before the TUI returns would close the broadcast channels and force
+    // `RecvError::Closed`.
+    let _retain = (state_tx, lead_tx, reviewer_tx);
+
+    let result = tui_handle.await.context("TUI task panicked")?;
+    // Flip shutdown so any other observers can react; ignore send errors
+    // because the watch may already be dropped.
+    let _ = shutdown_tx.send(true);
+    result.context("TUI driver failed")
+}
+
+/// Print the resolved system prompt + section validation summary for the
+/// CLI `nv plan` command, then emit the lead's plan markdown. Reviewer
+/// feedback (`--dual-review`) is appended below the plan body.
+async fn run_plan_subcommand(args: PlanArgs, mock: bool, json: bool) -> Result<()> {
+    let task_cwd = match args.cwd {
+        Some(path) => path,
+        None => env::current_dir().context("failed to read current directory")?,
+    };
+    let config = Config::load_from(&task_cwd)?;
+    let strategy = if args.dual_review {
+        PlanStrategy::DualReview
+    } else {
+        config.roles.plan_strategy.clone()
+    };
+
+    let task = Task::new(args.task, &task_cwd);
+    let adapters = adapters_for_config(mock, &config);
+    let report = run_plan_mode(
+        task,
+        Arc::new(config),
+        adapters,
+        PlanRunOptions::new(strategy),
+    )
+    .await
+    .map_err(plan_error_to_anyhow)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    print_plan_report(&report);
+    Ok(())
+}
+
+fn plan_error_to_anyhow(err: PlanError) -> anyhow::Error {
+    anyhow::anyhow!("{err}")
+}
+
+/// Render a [`PlanReport`] for human consumption: header + plan markdown
+/// + optional reviewer commentary + cost / LOC summary.
+fn print_plan_report(report: &PlanReport) {
+    println!("Nerve plan {}", report.task_id);
+    println!("{}", "=".repeat(72));
+    println!("{}", report.plan_markdown.trim_end());
+    if !report.reviewer_feedback.is_empty() {
+        println!("{}", "-".repeat(72));
+        println!("Reviewer feedback:");
+        println!("{}", report.reviewer_feedback.trim_end());
+    }
+    println!("{}", "-".repeat(72));
+    let cost_label = report
+        .cost
+        .as_ref()
+        .and_then(|c| c.estimated_cost_microusd.map(format_cost_microusd))
+        .unwrap_or_else(|| "-".to_string());
+    let loc_label = report
+        .estimated_loc
+        .map(|loc| loc.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    println!(
+        "summary: cost={} estimated_loc={} estimated_files={}",
+        cost_label,
+        loc_label,
+        report.estimated_files.len()
+    );
+}
+
+fn run_rpc_subcommand(command: RpcCommand) -> Result<()> {
+    match command {
+        RpcCommand::RotateToken => rpc_rotate_token(),
+    }
+}
+
+/// Tier 2e RPC token rotation. Reconstructs `RpcBus` against the workspace
+/// `.nerve/session-meta` directory (creating the parent dir if needed) and
+/// writes a fresh 32-byte bearer token in `0600` mode.
+fn rpc_rotate_token() -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let session_meta = cwd.join(".nerve").join("session-meta");
+    fs::create_dir_all(&session_meta).with_context(|| {
+        format!(
+            "failed to create RPC session-meta dir `{}`",
+            session_meta.display()
+        )
+    })?;
+    let config = Config::load_from(&cwd)?;
+    let rpc_config = config.daemon.rpc.clone().unwrap_or_default();
+    let bus = RpcBus::new(rpc_config, &session_meta)
+        .with_context(|| "failed to open RPC bus for token rotation")?;
+    let new_token = bus
+        .rotate_token(&session_meta)
+        .with_context(|| "failed to rotate RPC bearer token")?;
+    println!(
+        "rotated rpc bearer token (32 bytes / {} hex chars)",
+        new_token.len()
+    );
+    println!(
+        "token written to {}",
+        session_meta.join("rpc-token").display()
+    );
+    Ok(())
+}
+
+/// Interactive `/plan` slash handler. Routes a natural-language task through
+/// `run_plan_mode` and writes the plan markdown + reviewer commentary back to
+/// the terminal. Per the design doc, plan mode must never apply a patch — we
+/// therefore don't touch `state.last_report` so subsequent `/apply` calls
+/// see the previous coding session's patch, not the plan output.
+async fn run_interactive_plan(prompt: String, state: &InteractiveState) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let config = Config::load_from(&cwd)?;
+    let task = Task::new(prompt, &cwd);
+    let adapters = adapters_for_config(state.mock, &config);
+    let strategy = config.roles.plan_strategy.clone();
+    let report = run_plan_mode(
+        task,
+        Arc::new(config),
+        adapters,
+        PlanRunOptions::new(strategy),
+    )
+    .await
+    .map_err(plan_error_to_anyhow)?;
+    print_plan_report(&report);
+    Ok(())
 }
 
 /// sec-gap-12: surface a RED warning on stderr when the on-disk audit chain
@@ -1003,6 +1433,11 @@ const INTERACTIVE_COMMANDS: &[InteractiveCommandSpec] = &[
         command: "/goal",
         args: "<argv | :nl <prose> | clear | show>",
         description: "register a deterministic stop condition (argv or LLM-converted prose)",
+    },
+    InteractiveCommandSpec {
+        command: "/plan",
+        args: "<task>",
+        description: "run /plan (read-only analysis; never produces a patch)",
     },
     InteractiveCommandSpec {
         command: "/budget",
@@ -1621,6 +2056,19 @@ async fn handle_interactive_command(command: &str, state: &mut InteractiveState)
                 .unwrap_or_default();
             handle_goal_command(parts.collect::<Vec<_>>(), raw, state, &cwd).await?;
         }
+        "plan" => {
+            // Tier 2f (v0.5.0): forward the remainder as a natural-language plan
+            // task. Preserve the raw text so quoted strings or `:nl`-style
+            // wrappers survive into the prompt verbatim.
+            let raw = command
+                .strip_prefix("plan")
+                .map(str::trim_start)
+                .unwrap_or_default();
+            if raw.is_empty() {
+                anyhow::bail!("usage: /plan <task description>");
+            }
+            run_interactive_plan(raw.to_string(), state).await?;
+        }
         "budget" => {
             handle_budget_command(parts.collect::<Vec<_>>(), state, &cwd).await?;
         }
@@ -1699,6 +2147,7 @@ fn print_interactive_help() {
     println!("  /template <id> [args]  run a prompt template");
     println!("  /benchmark pi [n]      run the Pi workflow benchmark");
     println!("Loop controls:");
+    println!("  /plan <task>           run read-only plan analysis (never patches)");
     println!("  /goal <argv...>        register a deterministic stop check_cmd");
     println!("  /goal :nl <prose>      LLM-convert natural language into a check_cmd");
     println!("  /goal \"<prose>\"        quoted form of :nl (must be the entire argument)");
@@ -2520,8 +2969,40 @@ async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_rpc_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
+async fn run_rpc_daemon(apply: bool, mock: bool, once: bool, print_token: bool) -> Result<()> {
     let _echo_guard = disable_stdin_echo_if_terminal()?;
+
+    // Tier 2e (sec-4 #4): bring up the per-session RPC bus before processing
+    // any RPC commands. We deliberately keep the bus alive for the whole
+    // daemon lifetime so subscribers continue to receive lifecycle envelopes
+    // even when a single `prompt` command is in flight.
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let session_meta = cwd.join(".nerve").join("session-meta");
+    fs::create_dir_all(&session_meta).with_context(|| {
+        format!(
+            "failed to create RPC session-meta dir `{}`",
+            session_meta.display()
+        )
+    })?;
+    let config_for_rpc = Config::load_from(&cwd)?;
+    let rpc_config = config_for_rpc.daemon.rpc.clone().unwrap_or_default();
+    let print_token = print_token || rpc_config.print_token;
+    let bus = Arc::new(
+        RpcBus::new(rpc_config, &session_meta)
+            .with_context(|| "failed to open RPC bus for daemon startup")?,
+    );
+
+    if print_token {
+        // Token surfaces as a typed envelope on stdout (not the bearer text
+        // alone) so editors / shell wrappers can pull it out of the same JSONL
+        // stream that carries lifecycle events.
+        let envelope = RpcEnvelope::new(
+            "rpc.token",
+            serde_json::json!({ "bearer": bus.bearer_token() }),
+        );
+        emit_envelope_line(&envelope);
+    }
+
     let stdin = io::BufReader::new(io::stdin());
     let mut lines = stdin.lines();
 
@@ -2548,7 +3029,7 @@ async fn run_rpc_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
             }
         };
 
-        if let Err(error) = handle_rpc_command(value, apply, mock).await {
+        if let Err(error) = handle_rpc_command(value, apply, mock, bus.clone()).await {
             println!(
                 "{}",
                 serde_json::json!({
@@ -2563,10 +3044,65 @@ async fn run_rpc_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
         }
     }
 
+    // sec-4 #5: tear down the bearer-token file on graceful shutdown so a
+    // crashed daemon never leaves a stale token behind. `Arc::try_unwrap`
+    // ensures we only delete when no other handle (e.g. an in-flight handler
+    // hanging on a `tokio` task) is still using the bus.
+    if let Ok(bus) = Arc::try_unwrap(bus) {
+        bus.shutdown().context("rpc bus shutdown failed")?;
+    }
+
     Ok(())
 }
 
-async fn handle_rpc_command(value: serde_json::Value, apply: bool, mock: bool) -> Result<()> {
+fn emit_envelope_line(envelope: &RpcEnvelope) {
+    match serde_json::to_string(envelope) {
+        Ok(line) => println!("{line}"),
+        Err(error) => {
+            eprintln!("warning: failed to serialise RPC envelope: {error}");
+        }
+    }
+}
+
+/// Convert an [`AgentEvent`] into the Tier 2e envelope kinds expected by
+/// subscribers (lead / reviewer stdout chunks). Returns `None` when the
+/// event has no envelope representation (e.g. terminal `Done`).
+fn agent_event_to_envelopes(event: &AgentEvent, lead_id: &str) -> Vec<RpcEnvelope> {
+    use nerve_types::rpc_kinds;
+
+    let (agent_id, line, is_lead) = match event {
+        AgentEvent::Stdout { agent_id, line } => {
+            (agent_id.clone(), line.clone(), agent_id == lead_id)
+        }
+        AgentEvent::Stderr { agent_id, line } => {
+            (agent_id.clone(), line.clone(), agent_id == lead_id)
+        }
+        AgentEvent::Tool { agent_id, call } => (
+            agent_id.clone(),
+            format!("tool:{} {}", call.name, call.arguments),
+            agent_id == lead_id,
+        ),
+        AgentEvent::Done { .. } => return Vec::new(),
+    };
+    let kind = if is_lead {
+        rpc_kinds::LEAD_STDOUT
+    } else {
+        rpc_kinds::REVIEWER_STDOUT
+    };
+    vec![RpcEnvelope::new(
+        kind,
+        serde_json::json!({ "agent_id": agent_id, "chunk": line }),
+    )]
+}
+
+async fn handle_rpc_command(
+    value: serde_json::Value,
+    apply: bool,
+    mock: bool,
+    bus: Arc<RpcBus>,
+) -> Result<()> {
+    use nerve_types::rpc_kinds;
+
     let command = value
         .get("command")
         .and_then(serde_json::Value::as_str)
@@ -2579,6 +3115,104 @@ async fn handle_rpc_command(value: serde_json::Value, apply: bool, mock: bool) -
                 .context("missing string field `prompt`")?;
             let report = run_report(prompt.to_string(), apply, mock, None).await?;
             emit_report_events(&report)?;
+            // Tier 2e (v0.5.0) lifecycle envelopes: emit through the bus and
+            // also stream them as newline-delimited JSON on stdout so consumers
+            // that don't subscribe to the broadcast channel still observe them.
+            let session_started = RpcEnvelope::new(
+                rpc_kinds::SESSION_STARTED,
+                serde_json::json!({
+                    "session_id": report.task.id,
+                    "prompt": report.task.prompt,
+                    "lead": report.selection.lead,
+                    "reviewer": report.selection.reviewer,
+                }),
+            );
+            emit_envelope_line(&session_started);
+            let _ = bus.emit(rpc_kinds::SESSION_STARTED, session_started.payload.clone());
+
+            for event in &report.events {
+                for envelope in agent_event_to_envelopes(event, &report.selection.lead) {
+                    emit_envelope_line(&envelope);
+                    let _ = bus.emit(&envelope.kind, envelope.payload.clone());
+                }
+            }
+
+            // Round.started/ended pair per recorded round. We do not have
+            // per-iter timings from `RunReport` (one-shot RPC) so the envelope
+            // carries the round index only.
+            for round in &report.rounds {
+                let round_started = RpcEnvelope::new(
+                    rpc_kinds::ROUND_STARTED,
+                    serde_json::json!({
+                        "session_id": report.task.id,
+                        "round": round.round,
+                    }),
+                );
+                emit_envelope_line(&round_started);
+                let _ = bus.emit(rpc_kinds::ROUND_STARTED, round_started.payload.clone());
+
+                let round_ended = RpcEnvelope::new(
+                    rpc_kinds::ROUND_ENDED,
+                    serde_json::json!({
+                        "session_id": report.task.id,
+                        "round": round.round,
+                        "verdict": round.reviewer.verdict,
+                        "check": round.check_result,
+                    }),
+                );
+                emit_envelope_line(&round_ended);
+                let _ = bus.emit(rpc_kinds::ROUND_ENDED, round_ended.payload.clone());
+            }
+
+            // Budget envelope: cumulative usage at the end of the session.
+            let budget_envelope = RpcEnvelope::new(
+                rpc_kinds::BUDGET_CHANGED,
+                serde_json::json!({
+                    "session_id": report.task.id,
+                    "input_tokens": report.usage.input_tokens,
+                    "output_tokens": report.usage.output_tokens,
+                    "estimated_cost_microusd": report.usage.estimated_cost_microusd,
+                    "budget_exceeded": report.budget_exceeded,
+                }),
+            );
+            emit_envelope_line(&budget_envelope);
+            let _ = bus.emit(rpc_kinds::BUDGET_CHANGED, budget_envelope.payload.clone());
+
+            // Patch envelope: applied vs discarded.
+            if let Some(patch) = &report.final_patch {
+                let kind = if report.applied {
+                    rpc_kinds::PATCH_APPLIED
+                } else {
+                    rpc_kinds::PATCH_DISCARDED
+                };
+                let patch_envelope = RpcEnvelope::new(
+                    kind,
+                    serde_json::json!({
+                        "session_id": report.task.id,
+                        "patch_id": patch.id,
+                        "files": patch.files.len(),
+                        "blocked": report.blocked,
+                    }),
+                );
+                emit_envelope_line(&patch_envelope);
+                let _ = bus.emit(kind, patch_envelope.payload.clone());
+            }
+
+            let session_ended = RpcEnvelope::new(
+                rpc_kinds::SESSION_ENDED,
+                serde_json::json!({
+                    "session_id": report.task.id,
+                    "verdict": report.final_feedback.verdict,
+                    "applied": report.applied,
+                    "blocked": report.blocked,
+                    "patch_id": report.final_patch.as_ref().map(|patch| patch.id.clone())
+                }),
+            );
+            emit_envelope_line(&session_ended);
+            let _ = bus.emit(rpc_kinds::SESSION_ENDED, session_ended.payload.clone());
+
+            // Legacy `session_end` JSON kept for v0.3.0 consumers; v0.5.0
+            // consumers read the typed envelope above.
             println!(
                 "{}",
                 serde_json::json!({
@@ -2590,6 +3224,47 @@ async fn handle_rpc_command(value: serde_json::Value, apply: bool, mock: bool) -
                     "patch_id": report.final_patch.as_ref().map(|patch| patch.id.clone())
                 })
             );
+        }
+        "plan" => {
+            // RPC entry point for `/plan`. Mirrors the CLI subcommand but
+            // emits a single `plan.proposed` envelope on success.
+            let prompt = value
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .context("missing string field `prompt`")?;
+            let dual_review = value
+                .get("dual_review")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            let config = Config::load_from(&cwd)?;
+            let strategy = if dual_review {
+                PlanStrategy::DualReview
+            } else {
+                config.roles.plan_strategy.clone()
+            };
+            let task = Task::new(prompt.to_string(), &cwd);
+            let adapters = adapters_for_config(mock, &config);
+            let report = run_plan_mode(
+                task,
+                Arc::new(config),
+                adapters,
+                PlanRunOptions::new(strategy),
+            )
+            .await
+            .map_err(plan_error_to_anyhow)?;
+            let envelope = RpcEnvelope::new(
+                rpc_kinds::PLAN_PROPOSED,
+                serde_json::json!({
+                    "task_id": report.task_id,
+                    "plan_markdown": report.plan_markdown,
+                    "reviewer_feedback": report.reviewer_feedback,
+                    "estimated_loc": report.estimated_loc,
+                    "estimated_files": report.estimated_files,
+                }),
+            );
+            emit_envelope_line(&envelope);
+            let _ = bus.emit(rpc_kinds::PLAN_PROPOSED, envelope.payload.clone());
         }
         "get_state" | "history" => {
             let cwd = env::current_dir().context("failed to read current directory")?;
@@ -3537,5 +4212,146 @@ mod tests {
         assert!(matches_template_query(&template, "CVE"));
         assert!(matches_template_query(&template, ""));
         assert!(!matches_template_query(&template, "performance"));
+    }
+
+    /// `nv plan --dual-review "<task>"` must parse into the typed
+    /// `PlanArgs` (clap derive) with `dual_review = true` and the task
+    /// preserved verbatim.
+    #[test]
+    fn parse_plan_subcommand_dual_review() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "nv",
+            "plan",
+            "--dual-review",
+            "audit crates/nerve-cli for /plan",
+        ])
+        .expect("clap must accept `nv plan --dual-review <task>`");
+        match cli.command {
+            Some(Command::Plan(args)) => {
+                assert!(args.dual_review, "--dual-review must set dual_review=true");
+                assert_eq!(args.task, "audit crates/nerve-cli for /plan");
+                assert!(args.cwd.is_none());
+            }
+            other => panic!("expected Plan subcommand, got {other:?}"),
+        }
+
+        // Sanity: omitting --dual-review leaves the field false.
+        let cli = Cli::try_parse_from(["nv", "plan", "single mode task"]).expect("plan w/o flag");
+        match cli.command {
+            Some(Command::Plan(args)) => {
+                assert!(!args.dual_review);
+                assert_eq!(args.task, "single mode task");
+            }
+            other => panic!("expected Plan, got {other:?}"),
+        }
+    }
+
+    /// When stdin or stdout is not a TTY, `decide_tui` must refuse to
+    /// engage the ratatui surface even if `--tui` was requested. The cargo
+    /// test harness always runs without a TTY, so this is enforced by the
+    /// runtime check inside `decide_tui` itself.
+    #[test]
+    fn tui_skips_when_non_tty() {
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": {
+                "architect": "claude-code",
+                "reviewer": "codex"
+              },
+              "tui": {
+                "enabled": true,
+                "auto_in_cmux": true,
+                "refresh_ms": 100,
+                "log_height_pct": 60
+              }
+            }"#,
+        )
+        .expect("tui config must parse");
+
+        // Force-on path: --tui requested but no TTY → suppressed with NotATty.
+        let decision = decide_tui(true, &config);
+        assert!(
+            !decision.use_tui,
+            "non-tty must never engage the TUI (got {decision:?})"
+        );
+        assert_eq!(decision.suppressed_reason, Some(TuiSuppression::NotATty));
+
+        // Auto path: --tui false, no CMUX_SESSION → suppressed (NotATty
+        // still wins because the TTY check runs first).
+        // SAFETY: tests are serialized in this binary; no parallel
+        // `decide_tui` invocations observe the mutated env.
+        unsafe { std::env::remove_var("CMUX_SESSION") };
+        let decision = decide_tui(false, &config);
+        assert!(!decision.use_tui);
+        assert!(decision.suppressed_reason.is_some());
+
+        // Disabled path: tui.enabled = false and no --tui override.
+        let mut disabled = config.clone();
+        disabled.tui.enabled = false;
+        let decision = decide_tui(false, &disabled);
+        assert!(!decision.use_tui);
+        assert_eq!(decision.suppressed_reason, Some(TuiSuppression::Disabled));
+    }
+
+    /// `nv rpc rotate-token` rebuilds an `RpcBus` against the workspace
+    /// session-meta dir and persists a fresh token. We exercise the
+    /// underlying rotation helper directly so the test does not depend on
+    /// process-level current_dir mutation.
+    #[test]
+    fn rpc_rotate_token_persists() {
+        let dir = tempfile::tempdir().expect("tempdir for rpc rotate test");
+        let session_meta = dir.path().join(".nerve").join("session-meta");
+        std::fs::create_dir_all(&session_meta).expect("create session-meta dir");
+
+        // Pin the token under the tempdir so the test never touches the
+        // user's real workspace.
+        let rpc_config = RpcConfig {
+            token_path: session_meta.join("rpc-token"),
+            ..Default::default()
+        };
+
+        let bus = RpcBus::new(rpc_config, &session_meta).expect("rpc bus init");
+        let before = bus.bearer_token();
+        let after = bus.rotate_token(&session_meta).expect("rotate token");
+
+        assert_ne!(before, after, "rotated token must differ from previous");
+        let on_disk =
+            std::fs::read_to_string(session_meta.join("rpc-token")).expect("rotated token file");
+        assert_eq!(on_disk.trim(), after);
+        assert_eq!(after.len(), 64, "32-byte token encoded as 64 hex chars");
+
+        // Validate the 0600 doctor check sees the rotated file as ok.
+        #[cfg(unix)]
+        {
+            let status = rpc_token_permission_status(&session_meta.join("rpc-token"));
+            assert!(matches!(status, DoctorStatus::Ok));
+        }
+    }
+
+    #[test]
+    fn envelope_version_status_accepts_runtime_major() {
+        // Runtime matches itself.
+        assert!(matches!(
+            envelope_version_status(RPC_SCHEMA_VERSION),
+            DoctorStatus::Ok
+        ));
+        // Same major (1.x.y) is accepted.
+        assert!(matches!(envelope_version_status("1.2.3"), DoctorStatus::Ok));
+        // Different major is rejected.
+        assert!(matches!(
+            envelope_version_status("2.0.0"),
+            DoctorStatus::Fail(_)
+        ));
+        // Non-semver is rejected.
+        assert!(matches!(
+            envelope_version_status("not-a-version"),
+            DoctorStatus::Fail(_)
+        ));
     }
 }
