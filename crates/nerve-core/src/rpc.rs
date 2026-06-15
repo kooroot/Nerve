@@ -23,13 +23,11 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use chrono::Utc;
 use nerve_config::RpcConfig;
 use nerve_types::RpcEnvelope;
 use rand::RngCore;
 use thiserror::Error;
 use tokio::sync::broadcast;
-use ulid::Ulid;
 
 /// Errors surfaced by [`RpcBus::new`], [`RpcBus::rotate_token`], and
 /// [`RpcBus::shutdown`].
@@ -79,18 +77,18 @@ pub struct RpcBus {
 
 impl RpcBus {
     /// Construct a new bus, creating or reusing the bearer-token file under
-    /// `session_meta_dir`.
+    /// `workspace_dir` when `RpcConfig::token_path` is relative.
     ///
     /// `RpcConfig::token_path` is treated as relative when it is relative
-    /// (the common case for the default `.nerve/session-meta/rpc-token`),
-    /// and absolute paths are honoured verbatim — useful for tests that
-    /// pin the token under a tempdir.
-    pub fn new(config: RpcConfig, session_meta_dir: &Path) -> Result<Self, RpcError> {
+    /// (the common case for the default `.nerve/session-meta/rpc-token`), and
+    /// absolute paths are honoured verbatim — useful for tests that pin the
+    /// token under a tempdir.
+    pub fn new(config: RpcConfig, workspace_dir: &Path) -> Result<Self, RpcError> {
         config
             .validate()
             .map_err(|err| RpcError::InvalidConfig(err.to_string()))?;
 
-        let token_path = resolve_token_path(&config, session_meta_dir);
+        let token_path = resolve_token_path(&config, workspace_dir);
         ensure_parent_dir(&token_path)?;
         let bearer_token = read_or_create_token(&token_path, config.token_size_bytes)?;
 
@@ -138,9 +136,7 @@ impl RpcBus {
         let cap_bytes = self.config.payload_cap_kib.saturating_mul(1024);
         let final_payload = enforce_payload_cap(payload, cap_bytes)?;
 
-        let envelope = RpcEnvelope::new(kind, final_payload)
-            .with_envelope_id(Ulid::new().to_string())
-            .with_emitted_at(Utc::now());
+        let envelope = RpcEnvelope::new(kind, final_payload).with_fresh_metadata();
 
         // broadcast::Sender::send fails only when there are no
         // subscribers; that is not a real failure in our model. The lagging
@@ -165,8 +161,8 @@ impl RpcBus {
 
     /// Rotate the bearer token in place, persisting the new value atomically
     /// with mode `0600`.
-    pub fn rotate_token(&self, session_meta_dir: &Path) -> Result<String, RpcError> {
-        let token_path = resolve_token_path(&self.config, session_meta_dir);
+    pub fn rotate_token(&self, workspace_dir: &Path) -> Result<String, RpcError> {
+        let token_path = resolve_token_path(&self.config, workspace_dir);
         ensure_parent_dir(&token_path)?;
         let new_token = generate_token_hex(self.config.token_size_bytes)?;
         atomic_write_token(&token_path, &new_token)?;
@@ -188,11 +184,11 @@ impl RpcBus {
     }
 }
 
-fn resolve_token_path(config: &RpcConfig, session_meta_dir: &Path) -> PathBuf {
+fn resolve_token_path(config: &RpcConfig, workspace_dir: &Path) -> PathBuf {
     if config.token_path.is_absolute() {
         config.token_path.clone()
     } else {
-        session_meta_dir.join(&config.token_path)
+        workspace_dir.join(&config.token_path)
     }
 }
 
@@ -409,6 +405,19 @@ mod tests {
         let token = bus.bearer_token();
         assert_eq!(token.len(), 64);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn default_token_path_is_workspace_relative() {
+        let dir = tempdir().unwrap();
+        let _bus = RpcBus::new(RpcConfig::default(), dir.path()).unwrap();
+
+        assert!(dir.path().join(".nerve/session-meta/rpc-token").exists());
+        assert!(
+            !dir.path()
+                .join(".nerve/session-meta/.nerve/session-meta/rpc-token")
+                .exists()
+        );
     }
 
     #[test]

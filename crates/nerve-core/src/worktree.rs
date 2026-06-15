@@ -51,6 +51,8 @@ pub enum WorktreeError {
     MergeFailed { stderr: String },
     #[error("git reset failed even after --merge fallback: {stderr}")]
     ResetFailed { stderr: String },
+    #[error("main HEAD moved during isolated round: expected `{expected}`, found `{actual}`")]
+    MainMoved { expected: String, actual: String },
     #[error("failed to acquire worktree lock: {source}")]
     Lock {
         #[source]
@@ -203,6 +205,7 @@ impl WorktreeIsolator {
         let _lock = WorktreeLock::acquire(&self.scratch_root)?;
         self.check_disk_space()?;
         self.ensure_clean_main()?;
+        self.ensure_main_head_unchanged(&round)?;
 
         // Guard #5: collect every file touched in the round branch and reject
         // anything that resolves to a symlink or escapes main_cwd.
@@ -225,12 +228,11 @@ impl WorktreeIsolator {
         Ok(())
     }
 
-    /// Discard a prepared round without merging. Guarantees main rewinds to
-    /// `main_pre_ref`. Cleans up worktree storage.
+    /// Discard a prepared round without merging. Refuses to touch main if HEAD
+    /// moved after the round was prepared, then cleans up worktree storage.
     pub fn discard_round(&self, round: IsolatedRound) -> Result<(), WorktreeError> {
         let _lock = WorktreeLock::acquire(&self.scratch_root)?;
-        // Rewind unconditionally; main_pre_ref is the recorded oid.
-        self.rewind_main(&round)?;
+        self.ensure_main_head_unchanged(&round)?;
         self.cleanup_worktree(&round, "discarded");
         Ok(())
     }
@@ -274,6 +276,18 @@ impl WorktreeIsolator {
             });
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    fn ensure_main_head_unchanged(&self, round: &IsolatedRound) -> Result<(), WorktreeError> {
+        let current = self.head_oid()?;
+        if current != round.main_pre_ref {
+            self.cleanup_worktree(round, "main-head-moved");
+            return Err(WorktreeError::MainMoved {
+                expected: round.main_pre_ref.clone(),
+                actual: current,
+            });
+        }
+        Ok(())
     }
 
     fn write_bundle(&self, bundle_path: &Path, _head_ref: &str) -> Result<(), WorktreeError> {
@@ -570,12 +584,17 @@ fn chmod_recursive(root: &Path, mode: u32) -> io::Result<()> {
         return Ok(());
     }
     let meta = fs::symlink_metadata(root)?;
-    fs::set_permissions(root, fs::Permissions::from_mode(mode))?;
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
     if meta.file_type().is_dir() {
         for entry in fs::read_dir(root)? {
             let entry = entry?;
             chmod_recursive(&entry.path(), mode)?;
         }
+        fs::set_permissions(root, fs::Permissions::from_mode(mode | 0o100))?;
+    } else {
+        fs::set_permissions(root, fs::Permissions::from_mode(mode))?;
     }
     Ok(())
 }
@@ -722,6 +741,54 @@ mod tests {
         assert!(manifest.exists(), "orphan manifest should exist");
         let body = fs::read_to_string(&manifest).unwrap();
         assert!(body.contains("symlink") || body.contains("escape"));
+    }
+
+    #[test]
+    fn merge_refuses_if_main_head_moved() {
+        let dir = init_main_repo();
+        let isolator = WorktreeIsolator::with_threshold(dir.path().to_path_buf(), 0).unwrap();
+        let round = isolator.prepare_round(6).unwrap();
+        let original_head = round.main_pre_ref.clone();
+
+        fs::write(dir.path().join("main-change.txt"), "main moved\n").unwrap();
+        run(dir.path(), &["add", "main-change.txt"]);
+        run(dir.path(), &["commit", "-q", "-m", "main moved"]);
+        let moved_head = isolator.head_oid().unwrap();
+        assert_ne!(moved_head, original_head);
+
+        fs::write(round.worktree_path.join("seed.txt"), "seed from worktree\n").unwrap();
+        run(&round.worktree_path, &["add", "seed.txt"]);
+        run(
+            &round.worktree_path,
+            &["commit", "-q", "-m", "worktree edit"],
+        );
+
+        let err = isolator.merge_round(round).unwrap_err();
+        match err {
+            WorktreeError::MainMoved { expected, actual } => {
+                assert_eq!(expected, original_head);
+                assert_eq!(actual, moved_head);
+            }
+            other => panic!("expected MainMoved, got {other:?}"),
+        }
+        assert_eq!(isolator.head_oid().unwrap(), moved_head);
+        assert!(dir.path().join("main-change.txt").exists());
+    }
+
+    #[test]
+    fn chmod_recursive_skips_symlink_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let target = dir.path().join("outside.txt");
+        fs::create_dir(&root).unwrap();
+        fs::write(&target, "outside\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, root.join("link")).unwrap();
+
+        chmod_recursive(&root, 0o600).unwrap();
+
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
     }
 
     #[test]

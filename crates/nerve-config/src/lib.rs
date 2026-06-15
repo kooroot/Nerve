@@ -294,6 +294,10 @@ pub struct ProfileSelection {
     pub reviewer: String,
     pub review_strictness: ReviewStrictness,
     pub max_refinement_rounds: u8,
+    #[serde(default)]
+    pub plan_strategy: PlanStrategy,
+    #[serde(default)]
+    pub plan_system_prompt_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -491,6 +495,11 @@ impl Config {
                     max_refinement_rounds: profile
                         .max_refinement_rounds
                         .unwrap_or(self.orchestration.max_refinement_rounds),
+                    plan_strategy: profile.plan_strategy.clone(),
+                    plan_system_prompt_override: profile
+                        .plan_system_prompt_override
+                        .clone()
+                        .or_else(|| self.roles.plan_system_prompt_override.clone()),
                 });
             }
         }
@@ -501,6 +510,8 @@ impl Config {
             reviewer: self.roles.reviewer.clone(),
             review_strictness: ReviewStrictness::Normal,
             max_refinement_rounds: self.orchestration.max_refinement_rounds,
+            plan_strategy: self.roles.plan_strategy.clone(),
+            plan_system_prompt_override: self.roles.plan_system_prompt_override.clone(),
         })
     }
 }
@@ -901,6 +912,56 @@ mod tests {
         assert_eq!(json, "\"dual_review\"");
         let back: PlanStrategy = serde_json::from_str(&json).unwrap();
         assert_eq!(back, PlanStrategy::DualReview);
+    }
+
+    #[test]
+    fn select_profile_carries_plan_settings() {
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": {
+                "architect": "default-lead",
+                "reviewer": "default-reviewer",
+                "plan_strategy": "dual_review",
+                "plan_system_prompt_override": "role prompt"
+              },
+              "profiles": [
+                {
+                  "id": "docs",
+                  "match_rules": ["docs"],
+                  "lead": "profile-lead",
+                  "reviewer": "profile-reviewer",
+                  "plan_strategy": "single",
+                  "plan_system_prompt_override": "profile prompt"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let selected = config
+            .select_profile(&Task::new("update docs", "."))
+            .expect("profile selection");
+        assert_eq!(selected.id.as_deref(), Some("docs"));
+        assert_eq!(selected.plan_strategy, PlanStrategy::Single);
+        assert_eq!(
+            selected.plan_system_prompt_override.as_deref(),
+            Some("profile prompt")
+        );
+
+        let fallback = config
+            .select_profile(&Task::new("update unrelated code", "."))
+            .expect("default selection");
+        assert_eq!(fallback.id, None);
+        assert_eq!(fallback.plan_strategy, PlanStrategy::DualReview);
+        assert_eq!(
+            fallback.plan_system_prompt_override.as_deref(),
+            Some("role prompt")
+        );
     }
 
     #[test]
