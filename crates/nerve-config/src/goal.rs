@@ -31,6 +31,14 @@ pub enum ConfigError {
     ZeroTimeout,
     #[error("goal env key `{0}` contains forbidden characters (`=`, NUL, or control)")]
     InvalidEnvKey(String),
+    #[error("goal intent free_form must not be empty")]
+    EmptyGoalIntentFreeForm,
+    #[error("goal intent rationale must not be empty")]
+    EmptyGoalIntentRationale,
+    #[error("goal intent source_adapter must not be empty")]
+    EmptyGoalIntentSourceAdapter,
+    #[error("check_ulimit field `{0}` must be greater than 0 when set")]
+    InvalidUlimitValue(&'static str),
 }
 
 impl GoalSpec {

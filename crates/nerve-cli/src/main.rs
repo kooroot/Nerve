@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use nerve_adapter::{ModelAdapter, default_adapters_with_limits};
-use nerve_config::{Config, DaemonProtocol, GoalSpec};
+use nerve_adapter::{ModelAdapter, SubprocessAdapter, default_adapters_with_limits};
+use nerve_config::{Config, DaemonProtocol, GoalIntent, GoalSpec};
 use nerve_core::store::NerveStore;
 use nerve_core::{
-    BudgetAuditEntry, BudgetSnapshot, RunOptions, RunReport, append_budget_audit_entry,
-    run_synaptic_loop,
+    AuditChainState, BudgetAuditEntry, BudgetSnapshot, ChainStatus, DoctorCheck, DoctorStatus,
+    GoalIntentConverter, RunOptions, RunReport, append_budget_audit_entry, doctor_checks,
+    format_chain_broken, run_synaptic_loop,
 };
 use nerve_types::{AgentEvent, Task, Verdict};
 use serde::Serialize;
@@ -15,6 +16,7 @@ use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{self, AsyncBufReadExt};
 
@@ -41,8 +43,32 @@ struct Cli {
     #[arg(long, help = "Render a three-pane terminal summary")]
     tui: bool,
 
+    #[arg(
+        long,
+        help = "Force Tier 2d worktree-isolated /apply (overrides nerve.config.json)"
+    )]
+    worktree: bool,
+
+    #[arg(
+        long,
+        help = "Force the legacy in-place /apply path even if worktree_apply is enabled"
+    )]
+    no_worktree: bool,
+
     #[arg(long, env = "NERVE_ADAPTER", default_value = "real")]
     adapter: AdapterMode,
+}
+
+/// Resolve the optional Tier 2d worktree override from the global CLI flags.
+/// `--worktree` wins over `--no-worktree`; `None` defers to config.
+fn cli_worktree_override(worktree: bool, no_worktree: bool) -> Option<bool> {
+    if worktree {
+        Some(true)
+    } else if no_worktree {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -102,7 +128,7 @@ enum Command {
         #[arg(help = "Patch id from `nv list`")]
         patch_id: String,
     },
-    #[command(about = "Check config and adapter prerequisites")]
+    #[command(about = "Run config, environment, worktree, and audit-chain health checks")]
     Doctor,
     #[command(about = "Run a line-oriented daemon for editor and shell integrations")]
     Daemon {
@@ -287,21 +313,42 @@ async fn main() -> Result<()> {
             print_changed_files(&report.changed_files);
             Ok(())
         }
-        Some(Command::Doctor) => run_doctor(matches!(cli.adapter, AdapterMode::Mock)),
+        Some(Command::Doctor) => run_doctor(
+            matches!(cli.adapter, AdapterMode::Mock),
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        ),
         Some(Command::Daemon { once, rpc }) => {
             let config_prefers_rpc = Config::load()
                 .map(|config| matches!(config.daemon.protocol, DaemonProtocol::Rpc))
                 .unwrap_or(false);
             if rpc || config_prefers_rpc {
-                run_rpc_daemon(cli.apply, matches!(cli.adapter, AdapterMode::Mock), once).await
+                run_rpc_daemon(
+                    cli.apply,
+                    matches!(cli.adapter, AdapterMode::Mock),
+                    once,
+                    cli_worktree_override(cli.worktree, cli.no_worktree),
+                )
+                .await
             } else {
-                run_daemon(cli.apply, matches!(cli.adapter, AdapterMode::Mock), once).await
+                run_daemon(
+                    cli.apply,
+                    matches!(cli.adapter, AdapterMode::Mock),
+                    once,
+                    cli_worktree_override(cli.worktree, cli.no_worktree),
+                )
+                .await
             }
         }
         Some(Command::Setup) => run_setup(matches!(cli.adapter, AdapterMode::Mock)),
         Some(Command::Login { provider }) => run_login(provider),
         Some(Command::Interactive) => {
-            run_interactive(cli.apply, matches!(cli.adapter, AdapterMode::Mock)).await
+            run_interactive(
+                cli.apply,
+                matches!(cli.adapter, AdapterMode::Mock),
+                cli_worktree_override(cli.worktree, cli.no_worktree),
+            )
+            .await
         }
         Some(Command::Name { task_id, name }) => {
             let cwd = env::current_dir().context("failed to read current directory")?;
@@ -313,8 +360,13 @@ async fn main() -> Result<()> {
             let cwd = env::current_dir().context("failed to read current directory")?;
             let store = NerveStore::new(&cwd);
             store.load_report(&task_id)?;
-            let report =
-                run_report(prompt, cli.apply, matches!(cli.adapter, AdapterMode::Mock)).await?;
+            let report = run_report(
+                prompt,
+                cli.apply,
+                matches!(cli.adapter, AdapterMode::Mock),
+                cli_worktree_override(cli.worktree, cli.no_worktree),
+            )
+            .await?;
             store.link_child_session(&report.task.id, &task_id)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -333,14 +385,19 @@ async fn main() -> Result<()> {
                 cli.json,
                 cli.tui,
                 matches!(cli.adapter, AdapterMode::Mock),
+                cli_worktree_override(cli.worktree, cli.no_worktree),
             )
             .await
         }
         None => {
             let Some(prompt) = cli.prompt else {
                 if std::io::stdin().is_terminal() {
-                    return run_interactive(cli.apply, matches!(cli.adapter, AdapterMode::Mock))
-                        .await;
+                    return run_interactive(
+                        cli.apply,
+                        matches!(cli.adapter, AdapterMode::Mock),
+                        cli_worktree_override(cli.worktree, cli.no_worktree),
+                    )
+                    .await;
                 }
                 anyhow::bail!("missing prompt; usage: nv \"add a /health endpoint\"");
             };
@@ -350,6 +407,7 @@ async fn main() -> Result<()> {
                 cli.json,
                 cli.tui,
                 matches!(cli.adapter, AdapterMode::Mock),
+                cli_worktree_override(cli.worktree, cli.no_worktree),
             )
             .await
         }
@@ -543,8 +601,15 @@ fn print_pi_benchmark_report(report: &PiBenchmarkReport, json: bool) -> Result<(
     Ok(())
 }
 
-async fn run_prompt(prompt: String, apply: bool, json: bool, tui: bool, mock: bool) -> Result<()> {
-    let report = run_report(prompt, apply, mock).await?;
+async fn run_prompt(
+    prompt: String,
+    apply: bool,
+    json: bool,
+    tui: bool,
+    mock: bool,
+    worktree_override: Option<bool>,
+) -> Result<()> {
+    let report = run_report(prompt, apply, mock, worktree_override).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -565,6 +630,7 @@ async fn run_template(
     json: bool,
     tui: bool,
     mock: bool,
+    worktree_override: Option<bool>,
 ) -> Result<()> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let config = Config::load_from(&cwd)?;
@@ -594,31 +660,64 @@ async fn run_template(
                 anyhow::bail!("template `{template_id}` is not configured");
             };
             let prompt = template.prompt.replace("{{args}}", &args.join(" "));
-            run_prompt(prompt, apply, json, tui, mock).await
+            run_prompt(prompt, apply, json, tui, mock, worktree_override).await
         }
     }
 }
 
-fn run_doctor(mock: bool) -> Result<()> {
+/// Run the v0.3.0 doctor surface. Loads config, runs `nerve_core::doctor_checks`
+/// for the workspace, then layers the adapter-prerequisite checks. Returns
+/// `Err` if any check is `Fail` or (for real adapters) a CLI is missing.
+fn run_doctor(mock: bool, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<()> {
     let cwd = env::current_dir().context("failed to read current directory")?;
-    Config::load_from(&cwd)?;
-    println!("config: ok");
+    let config = Config::load_from(&cwd)?;
+    writeln!(stdout, "config: ok").ok();
+
+    let checks = doctor_checks(&config, &cwd);
+    let mut any_fail = false;
+    for check in &checks {
+        render_doctor_check(check, stdout, stderr);
+        if matches!(check.status, DoctorStatus::Fail(_)) {
+            any_fail = true;
+        }
+    }
 
     if mock {
-        println!("adapter: mock ok");
+        writeln!(stdout, "adapter: mock ok").ok();
+        if any_fail {
+            anyhow::bail!("nv doctor reported failing checks; review output above");
+        }
         return Ok(());
     }
 
     let claude = find_on_path("claude");
     let codex = find_on_path("codex");
-    print_doctor_check("claude", &claude);
-    print_doctor_check("codex", &codex);
-    print_auth_status("claude", &claude, &["auth", "status"]);
-    print_auth_status("codex", &codex, &["login", "status"]);
+    writeln_doctor_check(stdout, "claude", &claude);
+    writeln_doctor_check(stdout, "codex", &codex);
+    writeln_auth_status(stdout, "claude", &claude, &["auth", "status"]);
+    writeln_auth_status(stdout, "codex", &codex, &["login", "status"]);
+    if any_fail {
+        anyhow::bail!("nv doctor reported failing checks; review output above");
+    }
     if claude.is_some() && codex.is_some() {
         Ok(())
     } else {
         anyhow::bail!("real adapter prerequisites are missing")
+    }
+}
+
+fn render_doctor_check(check: &DoctorCheck, stdout: &mut dyn Write, stderr: &mut dyn Write) {
+    match &check.status {
+        DoctorStatus::Ok => {
+            writeln!(stdout, "{}: ok", check.name).ok();
+        }
+        DoctorStatus::Warn(msg) => {
+            writeln!(stdout, "{}: warn ({msg})", check.name).ok();
+        }
+        DoctorStatus::Fail(msg) => {
+            // sec-gap-12: emit chain breakage in RED to stderr so CI surfaces it.
+            writeln!(stderr, "{}: fail ({msg})", check.name).ok();
+        }
     }
 }
 
@@ -627,7 +726,7 @@ fn run_setup(mock: bool) -> Result<()> {
     let store = NerveStore::new(&cwd);
     store.init()?;
     println!("store: {}", cwd.join(".nerve").display());
-    run_doctor(mock)
+    run_doctor(mock, &mut std::io::stdout(), &mut std::io::stderr())
 }
 
 fn run_login(provider: LoginProvider) -> Result<()> {
@@ -663,18 +762,40 @@ fn run_provider_login(provider: LoginProvider) -> Result<()> {
     }
 }
 
-async fn run_interactive(apply: bool, mock: bool) -> Result<()> {
-    let mut state = InteractiveState::new(apply, mock);
+async fn run_interactive(apply: bool, mock: bool, worktree_override: Option<bool>) -> Result<()> {
+    let mut state = InteractiveState::new(apply, mock, worktree_override);
     state.refresh_counts();
-    refresh_active_goal(
-        &mut state,
-        &env::current_dir().context("failed to read current directory")?,
-    );
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    refresh_active_goal(&mut state, &cwd);
+    warn_if_audit_chain_broken(&cwd);
     print_interactive_banner(&state);
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         run_interactive_terminal(&mut state).await
     } else {
         run_interactive_lines(&mut state).await
+    }
+}
+
+/// sec-gap-12: surface a RED warning on stderr when the on-disk audit chain
+/// has a tampered or missing prev_hash link. Empty/Intact chains stay silent.
+fn warn_if_audit_chain_broken(cwd: &Path) {
+    let path = budget_audit_path(cwd);
+    if !path.exists() {
+        return;
+    }
+    match AuditChainState::verify(&path) {
+        Ok(status @ ChainStatus::Broken { .. }) => {
+            if let Some(msg) = format_chain_broken(&status) {
+                eprintln!("{msg}");
+                eprintln!(
+                    "Hint: run `nv doctor` to confirm and consult docs/audit-recovery before continuing.",
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("warning: budget audit chain could not be verified: {err}");
+        }
     }
 }
 
@@ -892,8 +1013,8 @@ const INTERACTIVE_COMMANDS: &[InteractiveCommandSpec] = &[
     },
     InteractiveCommandSpec {
         command: "/goal",
-        args: "<argv | clear | show>",
-        description: "register a deterministic stop condition",
+        args: "<argv | :nl <prose> | clear | show>",
+        description: "register a deterministic stop condition (argv or LLM-converted prose)",
     },
     InteractiveCommandSpec {
         command: "/budget",
@@ -1128,6 +1249,9 @@ fn command_suggestions(input: &str) -> Vec<&'static InteractiveCommandSpec> {
 struct InteractiveState {
     apply: bool,
     mock: bool,
+    /// Tier 2d (v0.3.0) per-session worktree override carried from CLI flags or
+    /// runtime `/mode worktree` toggles. `None` defers to nerve.config.json.
+    worktree_override: Option<bool>,
     last_report: Option<RunReport>,
     session_count: usize,
     patch_count: usize,
@@ -1143,10 +1267,11 @@ struct InteractiveState {
 }
 
 impl InteractiveState {
-    fn new(apply: bool, mock: bool) -> Self {
+    fn new(apply: bool, mock: bool, worktree_override: Option<bool>) -> Self {
         Self {
             apply,
             mock,
+            worktree_override,
             last_report: None,
             session_count: 0,
             patch_count: 0,
@@ -1328,6 +1453,7 @@ async fn run_interactive_task(prompt: String, state: &mut InteractiveState) -> R
         state.active_goal.clone(),
         state.budget_override_cost_microusd,
         state.budget_override_tokens,
+        state.worktree_override,
     )
     .await?;
     print_interactive_result(&report, state.apply);
@@ -1370,7 +1496,7 @@ async fn handle_interactive_command(command: &str, state: &mut InteractiveState)
         "" => print_interactive_help(),
         "help" => print_interactive_help(),
         "login" => run_login(LoginProvider::All)?,
-        "doctor" => run_doctor(state.mock)?,
+        "doctor" => run_doctor(state.mock, &mut std::io::stdout(), &mut std::io::stderr())?,
         "status" => {
             state.refresh_counts();
             print_interactive_status(state);
@@ -1499,7 +1625,13 @@ async fn handle_interactive_command(command: &str, state: &mut InteractiveState)
             }
         }
         "goal" => {
-            handle_goal_command(parts.collect::<Vec<_>>(), state, &cwd)?;
+            // Preserve the raw remainder so Phase 2 natural-language input can
+            // recover the original `:nl` body or "quoted" sentence verbatim.
+            let raw = command
+                .strip_prefix("goal")
+                .map(str::trim_start)
+                .unwrap_or_default();
+            handle_goal_command(parts.collect::<Vec<_>>(), raw, state, &cwd).await?;
         }
         "budget" => {
             handle_budget_command(parts.collect::<Vec<_>>(), state, &cwd).await?;
@@ -1580,6 +1712,8 @@ fn print_interactive_help() {
     println!("  /benchmark pi [n]      run the Pi workflow benchmark");
     println!("Loop controls:");
     println!("  /goal <argv...>        register a deterministic stop check_cmd");
+    println!("  /goal :nl <prose>      LLM-convert natural language into a check_cmd");
+    println!("  /goal \"<prose>\"        quoted form of :nl (must be the entire argument)");
     println!("  /goal show | clear     inspect or remove the active goal");
     println!("  /budget show           show current cap, cumulative, and remaining");
     println!("  /budget cost=$X        cap session cost (microusd-aware)");
@@ -1729,23 +1863,72 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 enum GoalAction {
     Show,
     Clear,
-    Register {
+    RegisterArgv {
         argv: Vec<String>,
         timeout_secs: Option<u64>,
+    },
+    /// Phase 2 (§3 Tier 1b): forward `free_form` to `GoalIntentConverter`.
+    RegisterNaturalLanguage {
+        free_form: String,
     },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 enum GoalParseError {
-    #[error("usage: /goal <argv> | /goal show | /goal clear | /goal --timeout N <argv>")]
+    #[error(
+        "usage: /goal <argv> | /goal :nl <prose> | /goal \"<prose>\" | /goal show | /goal clear | /goal --timeout N <argv>"
+    )]
     Empty,
     #[error("/goal --timeout requires a positive number")]
     BadTimeout,
-    #[error(
-        "Phase 2 natural-language goals are deferred to v0.3.0. \
-         Use argv form: /goal <program> [args...]"
-    )]
-    NaturalLanguage,
+    #[error("/goal natural-language input must be non-empty")]
+    EmptyNaturalLanguage,
+}
+
+/// Parse `/goal` arguments. `raw` is the original remainder after the
+/// `/goal ` prefix (whitespace preserved) so quoted Phase-2 sentences are
+/// detected verbatim. `tokens` is the whitespace-split form used for the
+/// historical argv path.
+fn parse_goal_argv_with_raw(tokens: &[&str], raw: &str) -> Result<GoalAction, GoalParseError> {
+    if let Some(action) = parse_goal_nl_form(raw) {
+        return action;
+    }
+    parse_goal_argv(tokens)
+}
+
+/// Detect the Phase 2 natural-language forms (`:nl <prose>` or `"<prose>"`)
+/// and short-circuit before the argv parser. Returns:
+/// - `Some(Ok(action))` when the raw is unambiguously natural-language.
+/// - `Some(Err(_))` when the form is detected but malformed (e.g. empty body).
+/// - `None` when the raw does not look like natural language.
+fn parse_goal_nl_form(raw: &str) -> Option<Result<GoalAction, GoalParseError>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(body) = trimmed.strip_prefix(":nl") {
+        let free_form = body.trim();
+        if free_form.is_empty() {
+            return Some(Err(GoalParseError::EmptyNaturalLanguage));
+        }
+        return Some(Ok(GoalAction::RegisterNaturalLanguage {
+            free_form: free_form.to_string(),
+        }));
+    }
+    // Quoted form: the entire remainder is a single "..." string. We require
+    // the closing quote to be the last non-whitespace character to avoid
+    // colliding with shell-literal argv strings that just happen to start
+    // with a quote.
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if inner.is_empty() {
+            return Some(Err(GoalParseError::EmptyNaturalLanguage));
+        }
+        return Some(Ok(GoalAction::RegisterNaturalLanguage {
+            free_form: inner.to_string(),
+        }));
+    }
+    None
 }
 
 fn parse_goal_argv(tokens: &[&str]) -> Result<GoalAction, GoalParseError> {
@@ -1781,17 +1964,7 @@ fn parse_goal_argv(tokens: &[&str]) -> Result<GoalAction, GoalParseError> {
         return Err(GoalParseError::Empty);
     }
 
-    // sec-1 #6 deferred: reject natural-language forms (heuristic — `&&`, `||`,
-    // `;`, `|` are shell-meta or English-conjunction signals — until v0.3.0
-    // Phase 2 lands the user-confirmation flow.
-    if argv
-        .iter()
-        .any(|tok| matches!(tok.as_str(), "&&" | "||" | ";" | "|"))
-    {
-        return Err(GoalParseError::NaturalLanguage);
-    }
-
-    Ok(GoalAction::Register { argv, timeout_secs })
+    Ok(GoalAction::RegisterArgv { argv, timeout_secs })
 }
 
 fn active_goal_path(cwd: &Path) -> PathBuf {
@@ -1827,8 +2000,13 @@ fn refresh_active_goal(state: &mut InteractiveState, cwd: &Path) {
     }
 }
 
-fn handle_goal_command(args: Vec<&str>, state: &mut InteractiveState, cwd: &Path) -> Result<()> {
-    let action = parse_goal_argv(&args).map_err(|err| anyhow::anyhow!("{err}"))?;
+async fn handle_goal_command(
+    args: Vec<&str>,
+    raw: &str,
+    state: &mut InteractiveState,
+    cwd: &Path,
+) -> Result<()> {
+    let action = parse_goal_argv_with_raw(&args, raw).map_err(|err| anyhow::anyhow!("{err}"))?;
     match action {
         GoalAction::Show => match state.active_goal.as_ref() {
             Some(spec) => {
@@ -1847,7 +2025,7 @@ fn handle_goal_command(args: Vec<&str>, state: &mut InteractiveState, cwd: &Path
             }
             println!("Cleared active goal.");
         }
-        GoalAction::Register { argv, timeout_secs } => {
+        GoalAction::RegisterArgv { argv, timeout_secs } => {
             let id = format!("goal-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
             let spec = GoalSpec {
                 id,
@@ -1871,7 +2049,158 @@ fn handle_goal_command(args: Vec<&str>, state: &mut InteractiveState, cwd: &Path
             );
             state.active_goal = Some(spec);
         }
+        GoalAction::RegisterNaturalLanguage { free_form } => {
+            register_goal_from_natural_language(free_form, state, cwd).await?;
+        }
     }
+    Ok(())
+}
+
+/// §3 Tier 1b Phase 2 user-confirmation flow.
+///
+/// 1. Spin up a fresh lead adapter (`SubprocessAdapter::claude_code` for real
+///    mode, `MockAdapter::lead` for mock) and wrap it in
+///    `GoalIntentConverter`.
+/// 2. Call `convert(free_form, cwd)` to get a vetted `GoalIntent`.
+/// 3. Render the proposal to stdout and gate registration on an
+///    interactive y/N confirmation. Non-interactive sessions are rejected so
+///    automation cannot register an LLM-proposed argv silently.
+/// 4. On accept, append the confirmed GoalIntent to
+///    `.nerve/session-meta/goal-history.jsonl` (sec-1 #6) and persist the
+///    proposed `GoalSpec` to `active-goal.json`.
+async fn register_goal_from_natural_language(
+    free_form: String,
+    state: &mut InteractiveState,
+    cwd: &Path,
+) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "/goal natural-language input requires an interactive terminal so the LLM proposal can be confirmed before it runs"
+        );
+    }
+
+    let config = Config::load_from(cwd)
+        .context("failed to load nerve.config.json for /goal natural-language conversion")?;
+    let adapter = goal_intent_lead_adapter(state.mock, &config);
+    let converter = GoalIntentConverter::new(adapter);
+
+    println!(
+        "Asking `{}` to convert `{}` into a deterministic check_cmd...",
+        converter.adapter_id(),
+        free_form
+    );
+    let intent = converter
+        .convert(&free_form, cwd)
+        .await
+        .with_context(|| "natural-language /goal conversion failed")?;
+
+    render_goal_intent_proposal(&intent);
+
+    if !confirm_goal_intent_interactive()? {
+        println!("Goal proposal rejected. No active goal registered.");
+        return Ok(());
+    }
+
+    // Persist the audited intent before mutating active-goal.json so a crash
+    // between the two writes leaves a recoverable trail (sec-1 #6).
+    append_goal_history_entry(cwd, &intent)
+        .with_context(|| "failed to append goal-history.jsonl audit entry")?;
+
+    let mut spec = intent.proposed_spec.clone();
+    if spec.cwd.is_none() {
+        spec.cwd = Some(cwd.to_path_buf());
+    }
+    spec.validate()
+        .with_context(|| "proposed goal failed validation")?;
+
+    let target = active_goal_path(cwd);
+    write_json_atomic(&target, &spec)?;
+    println!(
+        "Registered goal `{}`: {} ({}s timeout) [source={}]",
+        spec.id,
+        spec.check_cmd.join(" "),
+        spec.timeout_secs,
+        intent.source_adapter
+    );
+    state.active_goal = Some(spec);
+    Ok(())
+}
+
+/// Build the lead adapter used by `GoalIntentConverter`.
+///
+/// We deliberately don't reuse `adapters_for_config` because that returns
+/// `Vec<Box<dyn ModelAdapter>>`; the converter wants `Arc` for cheap clones.
+fn goal_intent_lead_adapter(mock: bool, config: &Config) -> Arc<dyn ModelAdapter> {
+    if mock {
+        Arc::new(nerve_adapter::MockAdapter::lead())
+    } else {
+        let mut adapter = SubprocessAdapter::claude_code();
+        if let Some(secs) = config.orchestration.adapter_timeout_secs {
+            adapter = adapter.with_timeout_secs(secs);
+        }
+        if let Some(bytes) = config.orchestration.adapter_max_output_bytes {
+            adapter = adapter.with_max_output_bytes(bytes);
+        }
+        Arc::new(adapter)
+    }
+}
+
+fn render_goal_intent_proposal(intent: &GoalIntent) {
+    println!("Proposed goal from \"{}\":", intent.free_form);
+    println!("  check_cmd:    {:?}", intent.proposed_spec.check_cmd);
+    println!("  timeout_secs: {}", intent.proposed_spec.timeout_secs);
+    if intent.proposed_spec.env.is_empty() {
+        println!("  env:          (inherit only configured allowlist)");
+    } else {
+        println!(
+            "  env override: {}",
+            intent
+                .proposed_spec
+                .env
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!("  rationale:    {}", intent.rationale);
+    println!("  source:       {}", intent.source_adapter);
+}
+
+fn confirm_goal_intent_interactive() -> Result<bool> {
+    print!("Accept? [y/N]: ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(matches!(answer.as_str(), "y" | "yes"))
+}
+
+fn goal_history_path(cwd: &Path) -> PathBuf {
+    cwd.join(".nerve")
+        .join("session-meta")
+        .join("goal-history.jsonl")
+}
+
+/// Append a confirmed `GoalIntent` to `.nerve/session-meta/goal-history.jsonl`
+/// as a one-line JSON record. The file is created atomically when missing and
+/// appended to under the parent dir's default permissions.
+fn append_goal_history_entry(cwd: &Path, intent: &GoalIntent) -> Result<()> {
+    let path = goal_history_path(cwd);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create `{}`", parent.display()))?;
+    }
+    let mut line = serde_json::to_string(intent)
+        .with_context(|| "failed to encode goal-history entry as JSON")?;
+    line.push('\n');
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open `{}`", path.display()))?;
+    file.write_all(line.as_bytes())
+        .with_context(|| format!("failed to append to `{}`", path.display()))?;
     Ok(())
 }
 
@@ -2102,6 +2431,9 @@ async fn handle_budget_command(
                 next: next.clone(),
                 source: "slash".to_string(),
                 user_confirmed,
+                // sec-gap-12 hash chain: append_budget_audit_entry fills this
+                // with the current chain head before persisting.
+                prev_hash: None,
             };
             append_budget_audit_entry(&budget_audit_path(cwd), entry)
                 .with_context(|| "failed to append budget audit entry")?;
@@ -2178,7 +2510,12 @@ fn confirm_raise_interactive(label: &str) -> Result<bool> {
     Ok(matches!(answer.as_str(), "y" | "yes"))
 }
 
-async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
+async fn run_daemon(
+    apply: bool,
+    mock: bool,
+    once: bool,
+    worktree_override: Option<bool>,
+) -> Result<()> {
     let _echo_guard = disable_stdin_echo_if_terminal()?;
     let stdin = io::BufReader::new(io::stdin());
     let mut lines = stdin.lines();
@@ -2189,7 +2526,7 @@ async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
             continue;
         }
 
-        let report = run_report(prompt.to_string(), apply, mock).await?;
+        let report = run_report(prompt.to_string(), apply, mock, worktree_override).await?;
         println!("{}", serde_json::to_string(&report)?);
 
         if once {
@@ -2200,7 +2537,12 @@ async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_rpc_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
+async fn run_rpc_daemon(
+    apply: bool,
+    mock: bool,
+    once: bool,
+    worktree_override: Option<bool>,
+) -> Result<()> {
     let _echo_guard = disable_stdin_echo_if_terminal()?;
     let stdin = io::BufReader::new(io::stdin());
     let mut lines = stdin.lines();
@@ -2228,7 +2570,7 @@ async fn run_rpc_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
             }
         };
 
-        if let Err(error) = handle_rpc_command(value, apply, mock).await {
+        if let Err(error) = handle_rpc_command(value, apply, mock, worktree_override).await {
             println!(
                 "{}",
                 serde_json::json!({
@@ -2246,7 +2588,12 @@ async fn run_rpc_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
     Ok(())
 }
 
-async fn handle_rpc_command(value: serde_json::Value, apply: bool, mock: bool) -> Result<()> {
+async fn handle_rpc_command(
+    value: serde_json::Value,
+    apply: bool,
+    mock: bool,
+    worktree_override: Option<bool>,
+) -> Result<()> {
     let command = value
         .get("command")
         .and_then(serde_json::Value::as_str)
@@ -2257,7 +2604,7 @@ async fn handle_rpc_command(value: serde_json::Value, apply: bool, mock: bool) -
                 .get("prompt")
                 .and_then(serde_json::Value::as_str)
                 .context("missing string field `prompt`")?;
-            let report = run_report(prompt.to_string(), apply, mock).await?;
+            let report = run_report(prompt.to_string(), apply, mock, worktree_override).await?;
             emit_report_events(&report)?;
             println!(
                 "{}",
@@ -2488,8 +2835,13 @@ fn disable_stdin_echo_if_terminal() -> Result<Option<()>> {
     Ok(None)
 }
 
-async fn run_report(prompt: String, apply: bool, mock: bool) -> Result<RunReport> {
-    run_report_with_overrides(prompt, apply, mock, None, None, None).await
+async fn run_report(
+    prompt: String,
+    apply: bool,
+    mock: bool,
+    worktree_override: Option<bool>,
+) -> Result<RunReport> {
+    run_report_with_overrides(prompt, apply, mock, None, None, None, worktree_override).await
 }
 
 async fn run_report_with_overrides(
@@ -2499,6 +2851,7 @@ async fn run_report_with_overrides(
     goal: Option<GoalSpec>,
     budget_cost_override: Option<u64>,
     budget_tokens_override: Option<u64>,
+    worktree_override: Option<bool>,
 ) -> Result<RunReport> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let mut config = Config::load_from(&cwd)?;
@@ -2515,6 +2868,14 @@ async fn run_report_with_overrides(
     if let Some(spec) = goal {
         options = options.with_goal(spec);
     }
+    if let Some(spec) = config.orchestration.check_ulimit.as_ref()
+        && !spec.is_empty()
+    {
+        options = options.with_ulimit(core_ulimit_from_config(spec));
+    }
+    if let Some(on) = worktree_override {
+        options = options.with_worktree(on);
+    }
     let report = run_synaptic_loop(task, &config, &adapters, options).await?;
     NerveStore::new(&cwd).save_report(&report)?;
     Ok(report)
@@ -2526,6 +2887,15 @@ fn adapters_for_config(mock: bool, config: &Config) -> Vec<Box<dyn ModelAdapter>
         config.orchestration.adapter_timeout_secs,
         config.orchestration.adapter_max_output_bytes,
     )
+}
+
+fn core_ulimit_from_config(spec: &nerve_config::CheckUlimit) -> nerve_core::ulimit::CheckUlimit {
+    nerve_core::ulimit::CheckUlimit {
+        nproc: spec.nproc,
+        address_space_bytes: spec.memory_bytes,
+        file_size_bytes: spec.file_size_bytes,
+        cpu_secs: spec.cpu_secs,
+    }
 }
 
 fn emit_report_events(report: &RunReport) -> Result<()> {
@@ -2777,28 +3147,28 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
-fn print_doctor_check(binary: &str, path: &Option<PathBuf>) {
+fn writeln_doctor_check(stdout: &mut dyn Write, binary: &str, path: &Option<PathBuf>) {
     match path {
-        Some(path) => println!("{binary}: {}", path.display()),
-        None => println!("{binary}: missing"),
+        Some(path) => {
+            writeln!(stdout, "{binary}: {}", path.display()).ok();
+        }
+        None => {
+            writeln!(stdout, "{binary}: missing").ok();
+        }
     }
 }
 
-fn print_auth_status(name: &str, path: &Option<PathBuf>, args: &[&str]) {
+fn writeln_auth_status(stdout: &mut dyn Write, name: &str, path: &Option<PathBuf>, args: &[&str]) {
     let Some(path) = path else {
         return;
     };
     let Ok(output) = StdCommand::new(path).args(args).output() else {
-        println!("{name} auth: unknown");
+        writeln!(stdout, "{name} auth: unknown").ok();
         return;
     };
-    if output.status.success() {
-        let text = String::from_utf8_lossy(&output.stdout);
-        println!("{name} auth: {}", summarize_auth_output(name, &text, true));
-    } else {
-        let text = String::from_utf8_lossy(&output.stdout);
-        println!("{name} auth: {}", summarize_auth_output(name, &text, false));
-    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let summary = summarize_auth_output(name, &text, output.status.success());
+    writeln!(stdout, "{name} auth: {summary}").ok();
 }
 
 fn summarize_auth_output(name: &str, text: &str, success: bool) -> String {
@@ -3018,7 +3388,7 @@ mod tests {
     fn goal_argv_parse_strips_flags() {
         let action = parse_goal_argv(&["--timeout", "30", "cargo", "test"]).unwrap();
         match action {
-            GoalAction::Register { argv, timeout_secs } => {
+            GoalAction::RegisterArgv { argv, timeout_secs } => {
                 assert_eq!(argv, vec!["cargo".to_string(), "test".to_string()]);
                 assert_eq!(timeout_secs, Some(30));
             }
@@ -3033,9 +3403,61 @@ mod tests {
     }
 
     #[test]
-    fn goal_argv_rejects_natural_language() {
-        let err = parse_goal_argv(&["tests", "pass", "&&", "diff", "applied"]).unwrap_err();
-        assert!(matches!(err, GoalParseError::NaturalLanguage));
+    fn parse_goal_argv_still_works() {
+        let tokens = ["exit", "0"];
+        let raw = "exit 0";
+        let action = parse_goal_argv_with_raw(&tokens, raw).unwrap();
+        match action {
+            GoalAction::RegisterArgv { argv, timeout_secs } => {
+                assert_eq!(argv, vec!["exit".to_string(), "0".to_string()]);
+                assert!(timeout_secs.is_none());
+            }
+            other => panic!("expected argv register, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_goal_nl_form_detected_quoted() {
+        let raw = "\"tests pass && diff applied\"";
+        // The whitespace tokenization would split the inner sentence, but the
+        // raw remainder triggers the natural-language short-circuit first.
+        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        let action = parse_goal_argv_with_raw(&tokens, raw).unwrap();
+        assert_eq!(
+            action,
+            GoalAction::RegisterNaturalLanguage {
+                free_form: "tests pass && diff applied".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_goal_nl_prefix_detected() {
+        let raw = ":nl tests pass && diff applied";
+        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        let action = parse_goal_argv_with_raw(&tokens, raw).unwrap();
+        assert_eq!(
+            action,
+            GoalAction::RegisterNaturalLanguage {
+                free_form: "tests pass && diff applied".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_goal_nl_empty_quoted_rejected() {
+        let raw = "\"\"";
+        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        let err = parse_goal_argv_with_raw(&tokens, raw).unwrap_err();
+        assert_eq!(err, GoalParseError::EmptyNaturalLanguage);
+    }
+
+    #[test]
+    fn parse_goal_nl_empty_prefix_rejected() {
+        let raw = ":nl   ";
+        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        let err = parse_goal_argv_with_raw(&tokens, raw).unwrap_err();
+        assert_eq!(err, GoalParseError::EmptyNaturalLanguage);
     }
 
     #[test]
@@ -3067,6 +3489,99 @@ mod tests {
         assert_eq!(format_cost_microusd(0), "$0.0000");
         assert_eq!(format_cost_microusd(123_456), "$0.1234");
         assert_eq!(format_cost_microusd(5_000_000), "$5.0000");
+    }
+
+    #[test]
+    fn doctor_renders_chain_warning() {
+        let broken = DoctorCheck {
+            name: "budget_audit_chain".to_string(),
+            status: DoctorStatus::Fail("chain broken at entry 3".to_string()),
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        render_doctor_check(&broken, &mut stdout, &mut stderr);
+        let stdout_text = String::from_utf8(stdout).unwrap();
+        let stderr_text = String::from_utf8(stderr).unwrap();
+        assert!(
+            stdout_text.is_empty(),
+            "fail status must not pollute stdout"
+        );
+        assert!(
+            stderr_text.contains("budget_audit_chain: fail"),
+            "stderr must surface the failing check (got `{stderr_text}`)"
+        );
+        assert!(
+            stderr_text.contains("chain broken at entry 3"),
+            "stderr must include the failure message"
+        );
+    }
+
+    #[test]
+    fn doctor_renders_ok_to_stdout() {
+        let ok = DoctorCheck {
+            name: "git".to_string(),
+            status: DoctorStatus::Ok,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        render_doctor_check(&ok, &mut stdout, &mut stderr);
+        assert_eq!(String::from_utf8(stdout).unwrap(), "git: ok\n");
+        assert!(String::from_utf8(stderr).unwrap().is_empty());
+    }
+
+    #[test]
+    fn goal_history_appends_jsonl_line() {
+        use chrono::Utc;
+        let dir = tempfile::tempdir().unwrap();
+        let intent = GoalIntent {
+            free_form: "tests pass".into(),
+            proposed_spec: GoalSpec {
+                id: "intent-1".into(),
+                check_cmd: vec!["cargo".into(), "test".into()],
+                timeout_secs: 60,
+                cwd: Some(dir.path().to_path_buf()),
+                env: BTreeMap::new(),
+                no_progress_max: None,
+            },
+            rationale: "user wants cargo test gate".into(),
+            source_adapter: "mock".into(),
+            created_at: Utc::now(),
+        };
+        append_goal_history_entry(dir.path(), &intent).unwrap();
+        append_goal_history_entry(dir.path(), &intent).unwrap();
+        let raw = std::fs::read_to_string(goal_history_path(dir.path())).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            let back: GoalIntent = serde_json::from_str(line).unwrap();
+            assert_eq!(back, intent);
+        }
+    }
+
+    #[test]
+    fn cli_worktree_override_priority() {
+        assert_eq!(cli_worktree_override(false, false), None);
+        assert_eq!(cli_worktree_override(true, false), Some(true));
+        assert_eq!(cli_worktree_override(false, true), Some(false));
+        // --worktree wins over --no-worktree when both are set.
+        assert_eq!(cli_worktree_override(true, true), Some(true));
+    }
+
+    #[test]
+    fn config_check_ulimit_maps_to_core_runtime_spec() {
+        let spec = nerve_config::CheckUlimit {
+            nproc: Some(32),
+            memory_bytes: Some(2_147_483_648),
+            file_size_bytes: Some(104_857_600),
+            cpu_secs: Some(60),
+        };
+
+        let mapped = core_ulimit_from_config(&spec);
+
+        assert_eq!(mapped.nproc, Some(32));
+        assert_eq!(mapped.address_space_bytes, Some(2_147_483_648));
+        assert_eq!(mapped.file_size_bytes, Some(104_857_600));
+        assert_eq!(mapped.cpu_secs, Some(60));
     }
 
     #[test]

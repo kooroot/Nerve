@@ -8,16 +8,19 @@ version.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 fs2.workspace = true
+libc.workspace = true
 nerve-adapter = { path = "../nerve-adapter" }
 nerve-config = { path = "../nerve-config" }
 nerve-patch = { path = "../nerve-patch" }
 nerve-types = { path = "../nerve-types" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
