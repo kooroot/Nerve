@@ -12,7 +12,7 @@ pub mod mcp;
 // submodule path.
 pub use mcp::{
     McpClient, McpError, McpRegistry, default_write_tool_patterns, role_matches,
-    tool_matches_write_pattern,
+    scope_mcp_spec_to_allowlist, tool_matches_write_pattern,
 };
 use serde_json::{Map, Value};
 use std::path::Path;

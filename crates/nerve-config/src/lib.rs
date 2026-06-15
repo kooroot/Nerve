@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use globset::{Glob, GlobSetBuilder};
 use nerve_types::{McpServerSpec, Task};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -435,8 +436,18 @@ impl MayorPatrolConfig {
 
 impl McpConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        let mut names = BTreeSet::new();
         for server in &self.servers {
+            if server.name.trim().is_empty() {
+                return Err(ConfigError::EmptyMcpName);
+            }
+            if !names.insert(server.name.clone()) {
+                return Err(ConfigError::DuplicateMcpServer(server.name.clone()));
+            }
             if server.command.is_empty() {
+                return Err(ConfigError::EmptyMcpCommand(server.name.clone()));
+            }
+            if server.command.iter().any(|arg| arg.trim().is_empty()) {
                 return Err(ConfigError::EmptyMcpCommand(server.name.clone()));
             }
         }
@@ -1382,6 +1393,58 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("roles.mcp invalid"), "got: {msg}");
         assert!(msg.contains("broken"), "got: {msg}");
+    }
+
+    #[test]
+    fn mcp_config_rejects_empty_and_duplicate_names() {
+        let server = |name: &str| nerve_types::McpServerSpec {
+            name: name.to_string(),
+            command: vec!["mcp-server".to_string()],
+            env: Default::default(),
+            transport: nerve_types::McpTransport::Stdio,
+            allowed_tools: Vec::new(),
+            role: nerve_types::McpRole::ReviewerOnly,
+            read_only: true,
+        };
+
+        let empty = McpConfig {
+            servers: vec![server(" ")],
+            allow_tools: Vec::new(),
+            write_tool_patterns: default_mcp_write_patterns(),
+        };
+        assert!(matches!(empty.validate(), Err(ConfigError::EmptyMcpName)));
+
+        let duplicate = McpConfig {
+            servers: vec![server("docs"), server("docs")],
+            allow_tools: Vec::new(),
+            write_tool_patterns: default_mcp_write_patterns(),
+        };
+        assert!(matches!(
+            duplicate.validate(),
+            Err(ConfigError::DuplicateMcpServer(name)) if name == "docs"
+        ));
+    }
+
+    #[test]
+    fn mcp_config_rejects_empty_command_arg() {
+        let mcp = McpConfig {
+            servers: vec![nerve_types::McpServerSpec {
+                name: "broken".into(),
+                command: vec![" ".to_string()],
+                env: Default::default(),
+                transport: nerve_types::McpTransport::Stdio,
+                allowed_tools: Vec::new(),
+                role: nerve_types::McpRole::ReviewerOnly,
+                read_only: true,
+            }],
+            allow_tools: Vec::new(),
+            write_tool_patterns: default_mcp_write_patterns(),
+        };
+
+        assert!(matches!(
+            mcp.validate(),
+            Err(ConfigError::EmptyMcpCommand(name)) if name == "broken"
+        ));
     }
 
     #[test]

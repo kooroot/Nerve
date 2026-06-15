@@ -572,6 +572,7 @@ impl McpRegistry {
         &mut self,
         specs: &[McpServerSpec],
         write_patterns: &[String],
+        allow_tools: &[String],
     ) -> Result<(), McpError> {
         let patterns = if write_patterns.is_empty() {
             default_write_tool_patterns()
@@ -579,6 +580,8 @@ impl McpRegistry {
             write_patterns.to_vec()
         };
         for spec in specs {
+            let mut spec = spec.clone();
+            scope_mcp_spec_to_allowlist(&mut spec, allow_tools);
             let client = Arc::new(McpClient::new(spec.clone(), patterns.clone()));
             if let Err(err) = client.start().await {
                 // Tear down everything we already started so we don't leak
@@ -639,6 +642,18 @@ impl McpRegistry {
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Arc<McpClient>)> {
         self.clients.iter()
     }
+}
+
+pub fn scope_mcp_spec_to_allowlist(spec: &mut McpServerSpec, allow_tools: &[String]) {
+    if allow_tools.is_empty() {
+        return;
+    }
+    if spec.allowed_tools.is_empty() {
+        spec.allowed_tools = allow_tools.to_vec();
+        return;
+    }
+    spec.allowed_tools
+        .retain(|tool| allow_tools.iter().any(|allowed| allowed == tool));
 }
 
 #[cfg(test)]
@@ -716,6 +731,25 @@ mod tests {
         let value = json!({ "not_tools": [] });
         let err = parse_tools_list("fixture", &value).unwrap_err();
         assert!(matches!(err, McpError::Handshake(_)));
+    }
+
+    #[test]
+    fn global_allowlist_intersects_server_allowlist() {
+        let mut spec = spec("scoped");
+        spec.allowed_tools = vec!["read_file".to_string(), "write_file".to_string()];
+
+        scope_mcp_spec_to_allowlist(&mut spec, &["read_file".to_string(), "hover".to_string()]);
+
+        assert_eq!(spec.allowed_tools, vec!["read_file".to_string()]);
+    }
+
+    #[test]
+    fn global_allowlist_applies_when_server_allowlist_is_empty() {
+        let mut spec = spec("global-only");
+
+        scope_mcp_spec_to_allowlist(&mut spec, &["hover".to_string()]);
+
+        assert_eq!(spec.allowed_tools, vec!["hover".to_string()]);
     }
 
     #[tokio::test]

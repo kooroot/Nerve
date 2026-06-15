@@ -43,6 +43,10 @@ pub enum ConfigError {
     #[error("daemon.rpc.{0} must be greater than 0")]
     InvalidRpcValue(&'static str),
     // Tier 3i (v1.0): mcp.servers[].command must be a non-empty argv.
+    #[error("mcp.servers[].name must not be empty")]
+    EmptyMcpName,
+    #[error("mcp.servers[`{0}`] is defined more than once")]
+    DuplicateMcpServer(String),
     #[error("mcp.servers[`{0}`].command must be a non-empty argv vector")]
     EmptyMcpCommand(String),
     // Tier 3j (v1.0): mayor_patrol.* knobs must satisfy the documented ranges.

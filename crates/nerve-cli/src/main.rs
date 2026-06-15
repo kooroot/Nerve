@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerve_adapter::{
     McpClient, McpRegistry, ModelAdapter, SubprocessAdapter, default_adapters_with_limits,
-    default_write_tool_patterns,
+    default_write_tool_patterns, scope_mcp_spec_to_allowlist,
 };
 use nerve_config::{
     Config, DaemonProtocol, GoalIntent, GoalSpec, McpConfig, PlanStrategy, RpcConfig,
@@ -943,10 +943,11 @@ async fn bootstrap_root_session_if_missing(
     // to forge a brand-new parent out of thin air — that would let `nv fork
     // <typo>` silently create an empty bucket.
     let store = NerveStore::new(cwd);
-    if store.load_report(session_id).is_err() {
+    let Ok(report) = store.load_report(session_id) else {
         return Ok(());
-    }
-    let tree = SessionTree::root(session_id, None);
+    };
+    let mut tree = SessionTree::root(session_id, None);
+    tree.rounds = report.rounds;
     forker.persist_root(tree).await?;
     Ok(())
 }
@@ -1052,7 +1053,7 @@ async fn run_mcp_subcommand(command: McpCommand) -> Result<()> {
         McpCommand::ListTools { json } => {
             let mut registry = McpRegistry::new();
             if let Err(err) = registry
-                .register_all(&mcp.servers, &mcp.write_tool_patterns)
+                .register_all(&mcp.servers, &mcp.write_tool_patterns, &mcp.allow_tools)
                 .await
             {
                 anyhow::bail!("failed to start MCP servers: {err}");
@@ -1091,9 +1092,10 @@ async fn run_mcp_subcommand(command: McpCommand) -> Result<()> {
             }
         }
         McpCommand::Probe { server } => {
-            let Some(spec) = mcp.servers.iter().find(|s| s.name == server).cloned() else {
+            let Some(mut spec) = mcp.servers.iter().find(|s| s.name == server).cloned() else {
                 anyhow::bail!("mcp server `{server}` not found in config");
             };
+            scope_mcp_spec_to_allowlist(&mut spec, &mcp.allow_tools);
             let patterns = if mcp.write_tool_patterns.is_empty() {
                 default_write_tool_patterns()
             } else {
@@ -1104,7 +1106,20 @@ async fn run_mcp_subcommand(command: McpCommand) -> Result<()> {
                 .start()
                 .await
                 .with_context(|| format!("mcp `{server}`: start failed"))?;
-            let tools = client.list_tools().await.unwrap_or_default();
+            let tools = client
+                .list_tools()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|tool| {
+                    client.spec().allowed_tools.is_empty()
+                        || client
+                            .spec()
+                            .allowed_tools
+                            .iter()
+                            .any(|allowed| allowed == &tool.name)
+                })
+                .collect::<Vec<_>>();
             println!("mcp `{server}`: handshake ok ({} tool(s))", tools.len());
             for tool in tools {
                 println!(
@@ -1237,7 +1252,7 @@ async fn run_patrol_subcommand(args: PatrolArgs, mock: bool) -> Result<()> {
     })?;
     let rpc_config = patrol_rpc_config(&config, &args.id);
     let _bus = Arc::new(
-        RpcBus::new(rpc_config, &session_meta)
+        RpcBus::new(rpc_config, &cwd)
             .with_context(|| format!("rpc bus init failed for patrol `{}`", args.id))?,
     );
 
@@ -1284,8 +1299,10 @@ fn patrol_rpc_token_path(session_meta: &Path, id: &str) -> PathBuf {
 /// stay consistent with non-patrol callers.
 fn patrol_rpc_config(config: &Config, id: &str) -> RpcConfig {
     let mut rpc = config.daemon.rpc.clone().unwrap_or_default();
-    // session_meta is relative-or-absolute; let RpcBus resolve against meta_dir.
-    rpc.token_path = PathBuf::from(format!("rpc-token-{id}"));
+    // RpcBus resolves relative paths against the workspace root.
+    rpc.token_path = PathBuf::from(".nerve")
+        .join("session-meta")
+        .join(format!("rpc-token-{id}"));
     rpc
 }
 
@@ -2999,7 +3016,7 @@ async fn handle_mcp_slash(raw_command: &str, args: Vec<&str>, cwd: &Path) -> Res
         "list" => {
             let mut registry = McpRegistry::new();
             registry
-                .register_all(&mcp.servers, &mcp.write_tool_patterns)
+                .register_all(&mcp.servers, &mcp.write_tool_patterns, &mcp.allow_tools)
                 .await
                 .context("/mcp list: failed to start configured servers")?;
             for (name, client) in registry.iter() {
@@ -3039,9 +3056,10 @@ async fn handle_mcp_slash(raw_command: &str, args: Vec<&str>, cwd: &Path) -> Res
                     .with_context(|| format!("invalid JSON arguments: `{json_str}`"))?
             };
 
-            let Some(spec) = mcp.servers.iter().find(|s| s.name == server).cloned() else {
+            let Some(mut spec) = mcp.servers.iter().find(|s| s.name == server).cloned() else {
                 anyhow::bail!("/mcp call: server `{server}` not configured");
             };
+            scope_mcp_spec_to_allowlist(&mut spec, &mcp.allow_tools);
             let patterns = if mcp.write_tool_patterns.is_empty() {
                 default_write_tool_patterns()
             } else {
@@ -5523,6 +5541,91 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.file_name().unwrap().to_string_lossy().contains("slot-1"));
         assert!(b.file_name().unwrap().to_string_lossy().contains("slot-2"));
+    }
+
+    #[test]
+    fn patrol_rpc_config_resolves_token_under_workspace_session_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": [],
+              "templates": [],
+              "ui": { "default_mode": "print" },
+              "daemon": { "protocol": "line" }
+            }"#,
+        )
+        .unwrap();
+        let rpc_config = patrol_rpc_config(&config, "slot-7");
+        let expected = dir
+            .path()
+            .join(".nerve")
+            .join("session-meta")
+            .join("rpc-token-slot-7");
+
+        let bus = RpcBus::new(rpc_config, dir.path()).expect("patrol rpc bus init");
+
+        assert!(expected.exists());
+        assert_eq!(bus.bearer_token().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn fork_bootstrap_preserves_legacy_report_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("legacy session", dir.path());
+        let round = nerve_types::RoundRecord {
+            round: 0,
+            lead: nerve_types::AgentOutput::text("lead", "round 0"),
+            reviewer: nerve_types::ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            check_result: None,
+            patch_sha: Some("sha0".to_string()),
+            envelope_id: None,
+        };
+        let report = RunReport {
+            task: task.clone(),
+            selection: nerve_config::ProfileSelection {
+                id: None,
+                lead: "lead".to_string(),
+                reviewer: "reviewer".to_string(),
+                review_strictness: nerve_config::ReviewStrictness::Normal,
+                max_refinement_rounds: 1,
+                plan_strategy: PlanStrategy::Single,
+                plan_system_prompt_override: None,
+            },
+            rounds: vec![round],
+            crossfire_feedback: Vec::new(),
+            final_output: nerve_types::AgentOutput::text("lead", "done"),
+            final_feedback: nerve_types::ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            final_patch: None,
+            events: Vec::new(),
+            usage: Default::default(),
+            budget_exceeded: false,
+            no_progress_exceeded: false,
+            goal_satisfied: None,
+            applied: false,
+            blocked: false,
+        };
+        NerveStore::new(dir.path()).save_report(&report).unwrap();
+
+        let forker = SessionForker::new(CoreForkConfig::default(), dir.path());
+        bootstrap_root_session_if_missing(&forker, dir.path(), &task.id)
+            .await
+            .unwrap();
+        let parent = forker.get(&task.id).await.unwrap().unwrap();
+        assert_eq!(parent.rounds.len(), 1);
+
+        let child = forker
+            .fork(&task.id, CoreForkOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(child.branched_at_round, Some(0));
+        assert_eq!(child.branched_from_patch_sha.as_deref(), Some("sha0"));
+        assert_eq!(child.rounds.len(), 1);
     }
 
     #[test]

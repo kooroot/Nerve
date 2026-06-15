@@ -169,8 +169,12 @@ pub enum MayorError {
     ClaimFailed(String),
     #[error("lock timeout")]
     LockTimeout,
+    #[error("task already exists: {0}")]
+    TaskAlreadyExists(String),
     #[error("budget ceiling exceeded for patrol {0}: requested {1} > ceiling {2}")]
     BudgetCeilingExceeded(String, u64, u64),
+    #[error("invalid {0}: must be 1..=128 chars of [A-Za-z0-9_-]")]
+    InvalidIdentifier(&'static str),
     #[error("orphaned claim recovered: {0}")]
     OrphanRecovered(String),
     #[error("serde: {0}")]
@@ -233,6 +237,7 @@ impl Mayor {
 
     /// Write a task to `pending/<task_id>.json`.
     pub async fn enqueue(&self, task: PatrolTask) -> Result<(), MayorError> {
+        validate_file_component("task_id", &task.task_id)?;
         if let Some(total) = self.total_budget_microusd
             && task.budget_microusd > total
         {
@@ -244,6 +249,9 @@ impl Mayor {
         }
         let layout = QueueLayout::new(&self.workspace_root, &self.config);
         layout.ensure()?;
+        if task_exists_anywhere(&layout, &task.task_id)? {
+            return Err(MayorError::TaskAlreadyExists(task.task_id));
+        }
         let path = layout.pending_path(&task.task_id);
         write_json_atomic(&path, &task)?;
 
@@ -402,8 +410,10 @@ impl Patrol {
     /// Try to claim the lex-smallest task from `pending/`. Returns
     /// `Err(MayorError::QueueEmpty)` when the queue is empty.
     pub fn claim(&self) -> Result<PatrolTask, MayorError> {
+        validate_file_component("patrol_id", &self.id)?;
         let layout = QueueLayout::new(&self.workspace_root, &self.config);
         layout.ensure()?;
+        self.write_heartbeat(&layout)?;
         let _lock = MayorLock::acquire(&self.workspace_root)?;
 
         let pending = sorted_json_filenames(&layout.pending)?;
@@ -426,8 +436,14 @@ impl Patrol {
         }
 
         let task: PatrolTask = read_json(&dst)?;
-        self.write_heartbeat(&layout)?;
-
+        validate_file_component("task_id", &task.task_id)?;
+        let expected_task_id = candidate.trim_end_matches(".json");
+        if task.task_id != expected_task_id {
+            return Err(MayorError::ClaimFailed(format!(
+                "pending filename `{expected_task_id}` did not match payload task_id `{}`",
+                task.task_id
+            )));
+        }
         if let Some(rpc) = &self.rpc {
             let _ = rpc.emit(
                 rpc_kinds::PATROL_CLAIMED,
@@ -458,6 +474,7 @@ impl Patrol {
         let layout = QueueLayout::new(&self.workspace_root, &self.config);
         let ceiling = task.budget_microusd;
         let task_id = task.task_id.clone();
+        validate_file_component("task_id", &task_id)?;
 
         let dispatch_future = dispatch(task.clone());
         let outcome = dispatch_future.await;
@@ -572,6 +589,7 @@ impl Patrol {
     }
 
     fn write_heartbeat(&self, layout: &QueueLayout) -> Result<(), MayorError> {
+        validate_file_component("patrol_id", &self.id)?;
         fs::create_dir_all(&layout.heartbeat)?;
         let path = layout.heartbeat_path(&self.id);
         // Touch the file — open with create + truncate so mtime updates
@@ -704,6 +722,26 @@ fn count_claimed_recursive(dir: &Path) -> Result<usize, MayorError> {
     Ok(count)
 }
 
+fn task_exists_anywhere(layout: &QueueLayout, task_id: &str) -> Result<bool, MayorError> {
+    if layout.pending_path(task_id).exists()
+        || layout.done_path(task_id).exists()
+        || layout.failed_path(task_id).exists()
+        || layout.result_path(task_id).exists()
+    {
+        return Ok(true);
+    }
+    if layout.claimed.exists() {
+        for entry in fs::read_dir(&layout.claimed)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() && entry.path().join(format!("{task_id}.json")).exists()
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn sorted_json_filenames(dir: &Path) -> Result<Vec<String>, MayorError> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -737,6 +775,19 @@ fn list_heartbeats(dir: &Path) -> Result<Vec<String>, MayorError> {
     }
     entries.sort();
     Ok(entries)
+}
+
+fn validate_file_component(kind: &'static str, value: &str) -> Result<(), MayorError> {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(MayorError::InvalidIdentifier(kind))
+    }
 }
 
 // =====================================================================
@@ -878,6 +929,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enqueue_rejects_path_traversal_task_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mayor = Mayor::new(cfg(), dir.path().to_path_buf(), Some(1_000_000));
+        let task = PatrolTask::new("../escape", "prompt", 1000);
+
+        let err = mayor.enqueue(task).await.unwrap_err();
+
+        assert!(matches!(err, MayorError::InvalidIdentifier("task_id")));
+        assert!(
+            !dir.path()
+                .join(".nerve/queue/pending/../escape.json")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_duplicate_task_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mayor = Mayor::new(cfg(), dir.path().to_path_buf(), Some(1_000_000));
+        mayor
+            .enqueue(PatrolTask::new("t-dupe", "first", 1000))
+            .await
+            .unwrap();
+
+        let err = mayor
+            .enqueue(PatrolTask::new("t-dupe", "second", 1000))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, MayorError::TaskAlreadyExists(id) if id == "t-dupe"));
+        let raw = fs::read_to_string(dir.path().join(".nerve/queue/pending/t-dupe.json")).unwrap();
+        assert!(raw.contains("first"));
+        assert!(!raw.contains("second"));
+    }
+
+    #[tokio::test]
     async fn patrol_claims_pending_into_claimed() {
         let dir = tempfile::tempdir().unwrap();
         let mayor = Mayor::new(cfg(), dir.path().to_path_buf(), None);
@@ -898,6 +985,22 @@ mod tests {
         );
         // Heartbeat was written when claim completed.
         assert!(dir.path().join(".nerve/queue/heartbeat/p-1").exists());
+    }
+
+    #[tokio::test]
+    async fn patrol_rejects_path_traversal_patrol_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mayor = Mayor::new(cfg(), dir.path().to_path_buf(), Some(1_000_000));
+        mayor
+            .enqueue(PatrolTask::new("t-claim", "prompt", 1000))
+            .await
+            .unwrap();
+        let patrol = Patrol::new("../escape".to_string(), cfg(), dir.path().to_path_buf());
+
+        let err = patrol.claim().unwrap_err();
+
+        assert!(matches!(err, MayorError::InvalidIdentifier("patrol_id")));
+        assert!(!dir.path().join(".nerve/queue/claimed/../escape").exists());
     }
 
     #[tokio::test]
