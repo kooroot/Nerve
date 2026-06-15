@@ -217,21 +217,21 @@ fn write_audit_log_atomic(
 
 /// Walks the chain and returns (last_hash, count). Each entry's `prev_hash`
 /// must equal the SHA-256 of the previous entry's canonical JSON form.
-/// v0.2.0 entries (no `prev_hash`) are accepted at any position to keep the
-/// upgrade path lossless: their successor links to their computed hash.
+/// v0.2.0 entries (no `prev_hash`) are accepted only as a contiguous prefix to
+/// keep the upgrade path lossless. Once a hashed link appears, missing links are
+/// treated as tampering.
 fn verify_chain(entries: &[BudgetAuditEntry]) -> Result<(Option<String>, usize), AuditError> {
     let mut previous_hash: Option<String> = None;
+    let mut seen_hashed_link = false;
     for (idx, entry) in entries.iter().enumerate() {
         if idx > 0 {
-            // For every link after the first, require prev_hash to match the
-            // previous entry's hash, UNLESS the entry itself is a legacy
-            // (v0.2.0) record whose `prev_hash` is `None` — those re-link to
-            // the previous computed hash transparently.
             match (&entry.prev_hash, &previous_hash) {
-                (Some(claimed), Some(expected)) if claimed == expected => {}
-                (None, Some(_)) => {
-                    // Legacy entry inside a chain: tolerated; successor links
-                    // to its hash regardless.
+                (Some(claimed), Some(expected)) if claimed == expected => {
+                    seen_hashed_link = true;
+                }
+                (None, Some(_)) if !seen_hashed_link => {
+                    // Legacy prefix entry: tolerated; successor links to its
+                    // hash regardless.
                 }
                 (claimed, expected) => {
                     return Err(AuditError::ChainBroken {
@@ -351,6 +351,32 @@ mod tests {
             } => {
                 assert_eq!(at_entry, 1);
                 assert!(actual_prev.unwrap().starts_with("deadbeef"));
+            }
+            other => panic!("expected broken chain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hash_chain_detects_removed_link_after_chain_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("budget-audit.json");
+        append_budget_audit_entry(&audit, entry(100, 200, "slash")).unwrap();
+        append_budget_audit_entry(&audit, entry(200, 300, "slash")).unwrap();
+        append_budget_audit_entry(&audit, entry(300, 400, "slash")).unwrap();
+
+        let mut entries = read_audit_log(&audit).unwrap();
+        entries[2].prev_hash = None;
+        let raw = serde_json::to_vec_pretty(&entries).unwrap();
+        std::fs::write(&audit, raw).unwrap();
+
+        match AuditChainState::verify(&audit).unwrap() {
+            ChainStatus::Broken {
+                at_entry,
+                actual_prev,
+                ..
+            } => {
+                assert_eq!(at_entry, 2);
+                assert_eq!(actual_prev, None);
             }
             other => panic!("expected broken chain, got {other:?}"),
         }

@@ -323,9 +323,21 @@ async fn main() -> Result<()> {
                 .map(|config| matches!(config.daemon.protocol, DaemonProtocol::Rpc))
                 .unwrap_or(false);
             if rpc || config_prefers_rpc {
-                run_rpc_daemon(cli.apply, matches!(cli.adapter, AdapterMode::Mock), once).await
+                run_rpc_daemon(
+                    cli.apply,
+                    matches!(cli.adapter, AdapterMode::Mock),
+                    once,
+                    cli_worktree_override(cli.worktree, cli.no_worktree),
+                )
+                .await
             } else {
-                run_daemon(cli.apply, matches!(cli.adapter, AdapterMode::Mock), once).await
+                run_daemon(
+                    cli.apply,
+                    matches!(cli.adapter, AdapterMode::Mock),
+                    once,
+                    cli_worktree_override(cli.worktree, cli.no_worktree),
+                )
+                .await
             }
         }
         Some(Command::Setup) => run_setup(matches!(cli.adapter, AdapterMode::Mock)),
@@ -2498,7 +2510,12 @@ fn confirm_raise_interactive(label: &str) -> Result<bool> {
     Ok(matches!(answer.as_str(), "y" | "yes"))
 }
 
-async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
+async fn run_daemon(
+    apply: bool,
+    mock: bool,
+    once: bool,
+    worktree_override: Option<bool>,
+) -> Result<()> {
     let _echo_guard = disable_stdin_echo_if_terminal()?;
     let stdin = io::BufReader::new(io::stdin());
     let mut lines = stdin.lines();
@@ -2509,7 +2526,7 @@ async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
             continue;
         }
 
-        let report = run_report(prompt.to_string(), apply, mock, None).await?;
+        let report = run_report(prompt.to_string(), apply, mock, worktree_override).await?;
         println!("{}", serde_json::to_string(&report)?);
 
         if once {
@@ -2520,7 +2537,12 @@ async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_rpc_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
+async fn run_rpc_daemon(
+    apply: bool,
+    mock: bool,
+    once: bool,
+    worktree_override: Option<bool>,
+) -> Result<()> {
     let _echo_guard = disable_stdin_echo_if_terminal()?;
     let stdin = io::BufReader::new(io::stdin());
     let mut lines = stdin.lines();
@@ -2548,7 +2570,7 @@ async fn run_rpc_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
             }
         };
 
-        if let Err(error) = handle_rpc_command(value, apply, mock).await {
+        if let Err(error) = handle_rpc_command(value, apply, mock, worktree_override).await {
             println!(
                 "{}",
                 serde_json::json!({
@@ -2566,7 +2588,12 @@ async fn run_rpc_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
     Ok(())
 }
 
-async fn handle_rpc_command(value: serde_json::Value, apply: bool, mock: bool) -> Result<()> {
+async fn handle_rpc_command(
+    value: serde_json::Value,
+    apply: bool,
+    mock: bool,
+    worktree_override: Option<bool>,
+) -> Result<()> {
     let command = value
         .get("command")
         .and_then(serde_json::Value::as_str)
@@ -2577,7 +2604,7 @@ async fn handle_rpc_command(value: serde_json::Value, apply: bool, mock: bool) -
                 .get("prompt")
                 .and_then(serde_json::Value::as_str)
                 .context("missing string field `prompt`")?;
-            let report = run_report(prompt.to_string(), apply, mock, None).await?;
+            let report = run_report(prompt.to_string(), apply, mock, worktree_override).await?;
             emit_report_events(&report)?;
             println!(
                 "{}",
@@ -2841,6 +2868,11 @@ async fn run_report_with_overrides(
     if let Some(spec) = goal {
         options = options.with_goal(spec);
     }
+    if let Some(spec) = config.orchestration.check_ulimit.as_ref()
+        && !spec.is_empty()
+    {
+        options = options.with_ulimit(core_ulimit_from_config(spec));
+    }
     if let Some(on) = worktree_override {
         options = options.with_worktree(on);
     }
@@ -2855,6 +2887,15 @@ fn adapters_for_config(mock: bool, config: &Config) -> Vec<Box<dyn ModelAdapter>
         config.orchestration.adapter_timeout_secs,
         config.orchestration.adapter_max_output_bytes,
     )
+}
+
+fn core_ulimit_from_config(spec: &nerve_config::CheckUlimit) -> nerve_core::ulimit::CheckUlimit {
+    nerve_core::ulimit::CheckUlimit {
+        nproc: spec.nproc,
+        address_space_bytes: spec.memory_bytes,
+        file_size_bytes: spec.file_size_bytes,
+        cpu_secs: spec.cpu_secs,
+    }
 }
 
 fn emit_report_events(report: &RunReport) -> Result<()> {
@@ -3524,6 +3565,23 @@ mod tests {
         assert_eq!(cli_worktree_override(false, true), Some(false));
         // --worktree wins over --no-worktree when both are set.
         assert_eq!(cli_worktree_override(true, true), Some(true));
+    }
+
+    #[test]
+    fn config_check_ulimit_maps_to_core_runtime_spec() {
+        let spec = nerve_config::CheckUlimit {
+            nproc: Some(32),
+            memory_bytes: Some(2_147_483_648),
+            file_size_bytes: Some(104_857_600),
+            cpu_secs: Some(60),
+        };
+
+        let mapped = core_ulimit_from_config(&spec);
+
+        assert_eq!(mapped.nproc, Some(32));
+        assert_eq!(mapped.address_space_bytes, Some(2_147_483_648));
+        assert_eq!(mapped.file_size_bytes, Some(104_857_600));
+        assert_eq!(mapped.cpu_secs, Some(60));
     }
 
     #[test]
