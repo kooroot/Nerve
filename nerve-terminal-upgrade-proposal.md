@@ -668,8 +668,9 @@ nv template list|run
 - **Cherny 3가지 정지 조건 매핑** (§0.5.3):
   - Max iteration → `max_refinement_rounds` (현행 유지, hard ceiling)
   - **No-progress detection (신규)** → 연속 2라운드 동안 patch hash가
-    동일하면 `Verdict::NoProgress`로 강제 종료. `RoundRecord`에
-    `patch_sha` 필드 추가
+    동일하면 **`Verdict::Block` + `RunReport.no_progress=true` 플래그**
+    조합으로 강제 종료 (별도 Verdict 변형 추가 금지 — 호환 가드 ma-1 참조).
+    `RoundRecord`에 `patch_sha` 필드 추가
     - **호환 가드**: `RoundRecord`는 현재 `#[serde(default)]` 미적용
       (`nerve-types/src/lib.rs:157-162`). 신규 `patch_sha` 필드는 반드시
       `#[serde(default)]` 어노테이션으로 추가해야 기존 `.nerve/sessions/`
@@ -679,7 +680,8 @@ nv template list|run
     - **patch_sha 출처**: hash 입력은 `select_final_patch`의 출력
       (`nerve-core/src/lib.rs:573-580`) 기준. `ConflictPolicy::ReviewerPriority`
       또는 `MergeAttempt` 정책에서 lead patch가 매 라운드 달라져도 reviewer가
-      동일 final_patch에 수렴하면 NoProgress로 판정된다. 단일 필드만으로 충분.
+      동일 final_patch에 수렴하면 `no_progress=true` 플래그가 세팅된다
+      (ma-1 호환 가드 참조). 단일 필드만으로 충분.
     - **정규화 규칙 (필수)**: hash 계산 전 `files`를 path 기준 정렬 → 각 파일의
       `path` + LF로 통일된 `modified` 내용만 직렬화 → SHA-256. `original_sha256`/
       `modified_sha256` 같은 별도 해시 필드와 메타데이터는 입력에서 제외해야
