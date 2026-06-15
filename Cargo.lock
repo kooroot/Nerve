@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-adapter"
-version = "0.1.9"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -692,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-cli"
-version = "0.1.9"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-config"
-version = "0.1.9"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -726,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-core"
-version = "0.1.9"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -751,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-patch"
-version = "0.1.9"
+version = "1.0.0"
 dependencies = [
  "serde",
  "sha2",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-tui"
-version = "0.1.9"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-types"
-version = "0.1.9"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "nerve-patch",

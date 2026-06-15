@@ -2,6 +2,53 @@
 
 All notable changes to Nerve are documented here.
 
+## v1.0.0 - 2026-06-15
+
+### Added
+
+- `/goal` support in the terminal workspace, including deterministic argv checks, natural-language goal conversion with interactive confirmation, active-goal persistence, goal history audit entries, timeout/output caps, no-progress detection, and ulimit-backed check execution.
+- `/budget` support in the terminal workspace with session token/cost caps, global ceiling enforcement, raise confirmation, and append-only budget audit hash-chain validation.
+- Worktree-isolated apply mode with `--worktree` / `--no-worktree` overrides and safety checks for dirty trees, symlink escapes, orphaned worktrees, and main-branch movement during merge/discard.
+- Typed RPC envelope streaming for `nv daemon --rpc`, including lifecycle events, bearer-token rotation, envelope metadata, payload caps, backpressure tracking, and RPC doctor checks.
+- `nv plan` read-only planning mode with structured Markdown validation, optional dual review, profile-aware plan strategy, and hard guards against patch/diff artifacts.
+- Ratatui-backed terminal summary/TUI support through the `nerve-tui` crate.
+- Session fork/branch support with `nv fork`, `nv branch`, `nv sessions list`, and `nv sessions tree`.
+- MCP client support with `nv mcp list-tools`, `nv mcp probe`, and interactive `/mcp list` / `/mcp call`.
+- Mayor/Patrol multi-instance queue primitives with `nv mayor`, `nv patrol`, queue/result directories, atomic claim transitions, heartbeat/orphan recovery, and per-task budget ceilings.
+- New shared v1.0 wire types for RPC envelopes, plan reports, MCP tools, session trees, and patrol state.
+
+### Changed
+
+- README and usage docs now describe the v1.0 command surface, configuration knobs, operational safety model, and release install flow.
+- Mock one-shot plan responses now emit valid structured plan Markdown, so `nv --adapter mock plan "<task>"` works as a local smoke test.
+- Profile matching and plan mode now populate context paths from prompt path tokens and respect per-profile plan settings.
+- RPC token paths are resolved relative to the workspace root; patrol tokens are isolated under `.nerve/session-meta/rpc-token-<patrol-id>`.
+- MCP global `allow_tools` is enforced by scoping each server's effective allowlist before list/call operations.
+
+### Fixed
+
+- Budget audit-chain verification now detects removed links after hashed entries begin while still accepting a contiguous legacy prefix.
+- Natural-language goal conversion rejects model-controlled `cwd` changes and freezes the caller workspace.
+- Worktree merge/discard refuses to reset when main HEAD moved after round preparation.
+- Worktree chmod handling skips symlink targets.
+- Legacy stored sessions keep their round history when bootstrapped into the fork index.
+- Mayor/Patrol queue IDs are validated as safe file components and duplicate task IDs are rejected before enqueue.
+- Patrol claim writes a heartbeat before moving a pending task so status/orphan recovery does not immediately reclaim fresh work.
+
+### Verified
+
+- `cargo fmt --check`
+- `cargo test --workspace`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo run -p nerve-cli -- config validate`
+- `cargo run -p nerve-cli -- --adapter mock benchmark pi --iterations 1 --json`
+- `cargo run -p nerve-cli -- --adapter mock doctor`
+- `cargo run -p nerve-cli -- --adapter mock plan "update docs"`
+- `cargo run -p nerve-cli -- mcp list-tools`
+- `cargo run -p nerve-cli -- mayor --status-only`
+- `cargo run -p nerve-cli -- patrol --id slot-1 --status`
+- `cargo run -p nerve-cli -- sessions list --json`
+
 ## v0.1.9 - 2026-05-14
 
 ### Added

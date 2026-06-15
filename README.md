@@ -6,9 +6,10 @@
   <p align="center">
     <a href="#quick-start">Quick Start</a> &middot;
     <a href="#agent-loop">Agent Loop</a> &middot;
+    <a href="#plan-goal-and-budget">Plan, Goal, Budget</a> &middot;
+    <a href="#forks-mcp-and-mayorpatrol">Forks, MCP, Mayor/Patrol</a> &middot;
     <a href="#architecture">Architecture</a> &middot;
-    <a href="#configuration">Configuration</a> &middot;
-    <a href="#roadmap">Roadmap</a>
+    <a href="#configuration">Configuration</a>
   </p>
 </p>
 
@@ -43,7 +44,7 @@ Single-agent coding has a predictable failure mode: the same model that writes a
 
 ## Current Status
 
-Nerve has the Phase 1 MVP plus the planned Phase 2/3 CLI execution features implemented.
+Nerve v1.0.0 has the original lead/reviewer patch loop plus the terminal-control, goal, budget, planning, RPC, fork, MCP, and Mayor/Patrol surfaces implemented.
 
 | Area | Status |
 |------|--------|
@@ -63,6 +64,15 @@ Nerve has the Phase 1 MVP plus the planned Phase 2/3 CLI execution features impl
 | Prompt templates | Implemented with `nv template` |
 | Terminal product UX | Implemented with `nv`, `nv interactive`, `--tui`, `daemon`, and `daemon --rpc` |
 | Pi workflow benchmark | Implemented with `nv benchmark pi` |
+| Goal mode | Implemented with interactive `/goal`, deterministic checks, NL conversion, persistence, timeout/output caps, no-progress guard, and active-goal reload |
+| Budget controls | Implemented with interactive `/budget`, global ceilings, raise confirmation, budget audit hash-chain, and doctor validation |
+| Worktree-isolated apply | Implemented with config plus `--worktree` / `--no-worktree` overrides |
+| RPC envelope lifecycle | Implemented with typed JSONL envelopes, bearer-token lifecycle, payload caps, and metadata |
+| Read-only plan mode | Implemented with `nv plan`, `/plan`, dual review, and patch-artifact rejection |
+| Ratatui TUI | Implemented through `nerve-tui` |
+| Session forks | Implemented with `nv fork`, `nv branch`, and `nv sessions` |
+| MCP client | Implemented with `nv mcp` and interactive `/mcp` |
+| Mayor/Patrol queue | Implemented with `nv mayor`, `nv patrol`, queue files, heartbeat/orphan recovery, and budget ceilings |
 
 Important: the mock adapter path produces structured `NvPatch` values directly. The real subprocess path extracts unified diffs from raw text or JSONL string fields, converts create/modify/delete/rename diffs into safe `NvPatch` values, and attaches reported usage when provider JSONL includes token or cost fields.
 
@@ -162,7 +172,7 @@ If `which -a nv` shows an older path before the newly installed binary, your she
 
 ## Agent Loop
 
-Nerve exposes one CLI today:
+Nerve exposes one CLI binary, `nv`.
 
 | Command | Purpose |
 |---------|---------|
@@ -172,10 +182,13 @@ Nerve exposes one CLI today:
 | `nv --adapter real "<task>"` | Spawn real `claude` and `codex` subprocesses |
 | `nv --json "<task>"` | Emit a structured session report for downstream tooling |
 | `nv --tui "<task>"` | Render a three-pane terminal summary |
+| `nv --worktree "<task>"` | Force worktree-isolated apply for this run |
+| `nv --no-worktree "<task>"` | Force legacy in-place apply for this run |
 | `nv` | Start the terminal workspace when run from a terminal |
 | `nv interactive` | Force the terminal workspace, useful for scripts and tests |
 | `nv setup` | Initialize `.nerve/` and check config plus adapter prerequisites |
 | `nv login [all\|claude\|codex]` | Start provider login using Claude Code and/or Codex CLI subscriptions |
+| `nv plan [--dual-review] "<task>"` | Produce a read-only structured plan; never applies or emits a patch |
 | `nv history` | List stored session summaries from `.nerve/sessions/` |
 | `nv history --applied --blocked --named` | Filter stored session summaries |
 | `nv resume <session-id>` | Print a stored session report |
@@ -189,6 +202,17 @@ Nerve exposes one CLI today:
 | `nv template run <template-id> [args...]` | Run a configured prompt template |
 | `nv daemon` | Run a line-oriented daemon for editor and shell integrations |
 | `nv daemon --rpc` | Run a JSONL RPC daemon with lifecycle events |
+| `nv daemon --rpc --print-token` | Start RPC mode and print a typed `rpc.token` envelope |
+| `nv rpc rotate-token` | Rotate the RPC bearer token under `.nerve/session-meta/` |
+| `nv fork <session-id>` | Fork a stored session into a child branch |
+| `nv branch <session-id>` | Create a child session using branch defaults |
+| `nv sessions list` | List registered session roots |
+| `nv sessions tree <root-id>` | Print a fork tree |
+| `nv mcp list-tools` | Start configured MCP servers and list advertised tools |
+| `nv mcp probe <server>` | Handshake one configured MCP server and print its tools |
+| `nv mayor --status-only` | Show Mayor queue depth without dispatching |
+| `nv patrol --id <slot> --status` | Show a patrol slot's token/worktree/status view |
+| `nv patrol --id <slot> --once` | Claim and run one queued patrol task |
 | `nv benchmark pi` | Run the deterministic Pi-inspired workflow benchmark |
 | `nv config validate` | Validate `nerve.config.json` |
 
@@ -230,6 +254,19 @@ Available workspace commands:
 /templates
 /template <template-id> [args...]
 /benchmark pi [iterations]
+/goal <argv...>
+/goal :nl <natural language condition>
+/goal show
+/goal clear
+/budget show
+/budget cost=$5
+/budget tokens=200000
+/plan <task>
+/fork [--from-round N] [--name NAME]
+/mcp list
+/mcp call <server> <tool> <json>
+/mayor status
+/patrol status
 /diff
 /apply [patch-id]
 /rollback [patch-id]
@@ -250,7 +287,7 @@ Verified real output shapes:
 - Codex CLI 0.128.0 emits assistant text under `item.text` in `item.completed` events.
 - Only assistant-authored text fields are considered for unified diff parsing; tool inputs/results and other JSON string fields are ignored.
 
-The subprocess boundary is intentionally CLI-first. Nerve does not depend on a vendor SDK in Phase 1; it treats model tools as external executables and streams their output into the orchestration state.
+The subprocess boundary is intentionally CLI-first. Nerve does not depend on a vendor SDK; it treats model tools as external executables and streams their output into the orchestration state.
 
 ### Session Reports
 
@@ -302,9 +339,16 @@ Use `nv daemon --rpc` when integrations need structured JSONL commands and lifec
 
 ```bash
 printf '%s\n' '{"command":"prompt","prompt":"add a health endpoint"}' | nv daemon --rpc --once
+printf '%s\n' '{"command":"plan","prompt":"map the migration"}' | nv daemon --rpc --once
 ```
 
-Supported RPC commands are `prompt`, `get_state`, `history`, `resume`, `list_patches`, `apply_patch`, and `rollback_patch`. Prompt runs emit `session_start`, `lead_start`, `lead_event`, `review_start`, `review_event`, `patch_ready`, `apply_result`, and `session_end` events.
+Supported RPC commands are `prompt`, `plan`, `get_state`, `history`, `resume`, `list_patches`, `apply_patch`, and `rollback_patch`. Prompt runs emit typed envelopes such as `session.started`, `round.started`, `lead.stdout_chunk`, `reviewer.stdout_chunk`, `budget.changed`, `patch.applied`, `patch.discarded`, and `session.ended`. Plan runs emit `plan.proposed`.
+
+Use `--print-token` to print a typed `rpc.token` envelope at daemon startup:
+
+```bash
+nv daemon --rpc --print-token
+```
 
 ### Pi Benchmark
 
@@ -313,6 +357,98 @@ Use `nv benchmark pi` to run a deterministic local benchmark of the Pi-inspired 
 ### Terminal TUI
 
 Use `--tui` to render the final run as a three-pane terminal summary: Lead, Reviewer, and Orchestrator. This is the built-in fallback layout when a cmux-specific integration is not available.
+
+## Plan, Goal, And Budget
+
+### Plan Mode
+
+Use `nv plan` when you want read-only analysis before allowing implementation. The adapter must return structured Markdown with the required sections, and Nerve rejects patch artifacts such as `NvPatch`, `diff --git`, or fenced diff blocks.
+
+```bash
+nv --adapter mock plan "split the CLI RPC code into smaller modules"
+nv plan --dual-review "audit the new MCP client lifecycle"
+```
+
+Plan mode supports profile-level `plan_strategy` and `plan_system_prompt_override` settings. `--dual-review` forces a reviewer pass over the generated plan.
+
+### Goal Mode
+
+Goal mode is interactive and lives in the terminal workspace. It registers a deterministic stop check that runs at round boundaries.
+
+```text
+nerve:real:dry-run:main> /goal --timeout 60 cargo test --workspace
+nerve:real:dry-run:main> /goal show
+nerve:real:dry-run:main> fix the flaky test until the workspace passes
+nerve:real:dry-run:main> /goal clear
+```
+
+Natural-language goal conversion is also available, but only in an interactive terminal because Nerve shows the proposed command and requires confirmation before persisting it:
+
+```text
+/goal :nl all workspace tests pass
+/goal "the CLI smoke test succeeds"
+```
+
+Goal checks are argv-based, not shell strings. Nerve rejects unsafe programs, freezes the workspace cwd, applies timeout/output caps, can apply configured ulimits, and stores the active goal under `.nerve/session-meta/active-goal.json`.
+
+### Budget Controls
+
+Use `/budget` to set per-session token or cost caps during an interactive run:
+
+```text
+/budget show
+/budget cost=$5
+/budget tokens=200000
+/budget cost=$10 --force
+```
+
+Budget changes are appended to `.nerve/session-meta/budget-audit.json` as a hash chain. `nv doctor` validates the chain and reports tampering or missing links. Global ceilings can be set in config so an interactive budget raise cannot exceed operator policy.
+
+## Forks, MCP, And Mayor/Patrol
+
+### Session Forks
+
+Forks create child session records without rewriting the parent. They are useful for trying a follow-up path from a reviewed session while keeping the original report readable.
+
+```bash
+nv fork <session-id> --from-round 1 --name retry_tests
+nv branch <session-id>
+nv sessions list
+nv sessions tree <root-id>
+```
+
+Fork payloads live under `.nerve/sessions/` with an index guarded by an advisory lock. Legacy stored sessions are bootstrapped into the fork index with their round history when first forked.
+
+### MCP Tools
+
+MCP support is configured in `roles.mcp` or `profiles[].mcp`. Nerve currently supports stdio MCP servers.
+
+```bash
+nv mcp list-tools
+nv mcp probe docs
+```
+
+From the terminal workspace:
+
+```text
+/mcp list
+/mcp call docs search '{"query":"release workflow"}'
+```
+
+MCP servers default to `read_only: true`. Tool calls are blocked when the name matches write patterns such as `shell`, `exec`, `fs.write`, or `write_file`. A global `mcp.allow_tools` list is intersected with each server's own `allowed_tools`.
+
+### Mayor/Patrol
+
+Mayor/Patrol is the v1.0 multi-instance queue primitive. The Mayor owns queue state on disk; Patrol workers atomically claim tasks, write results, and heartbeat for orphan recovery.
+
+```bash
+nv mayor --status-only
+nv mayor --queue-dir .nerve/queue --results-dir .nerve/results
+nv patrol --id slot-1 --status
+nv patrol --id slot-1 --once
+```
+
+Queue state lives under `.nerve/queue/{pending,claimed,done,failed,heartbeat}/`; results live under `.nerve/results/`. Task IDs and patrol IDs are validated as safe filename components, duplicate task IDs are rejected, and stale claimed tasks can be recovered when heartbeats exceed the configured TTL.
 
 ## Architecture
 
@@ -347,10 +483,11 @@ Workspace layout:
 ```text
 crates/
   nerve-cli/       `nv` binary, clap args, terminal output
-  nerve-core/      Synapse state and refinement loop
-  nerve-adapter/   ModelAdapter trait, mock adapter, subprocess adapters
+  nerve-core/      Synapse, refinement loop, goals, RPC, forks, Mayor/Patrol
+  nerve-adapter/   ModelAdapter trait, mock/subprocess adapters, MCP stdio client
   nerve-config/    nerve.config.json loading and profile matching
   nerve-patch/     NvPatch model, hash validation, apply, rollback
+  nerve-tui/       Ratatui terminal summary widgets
   nerve-types/     Shared task, event, output, verdict, and round types
 ```
 
@@ -362,10 +499,11 @@ Task
   -> Strategy selection: consensus / pipeline / tournament
   -> Lead adapter implementation
   -> Reviewer adapter critique
+  -> Optional goal check / budget gate
   -> Optional lead refinement
   -> Conflict policy
   -> Final NvPatch
-  -> Dry-run output or --apply
+  -> Dry-run output, --apply, or worktree-isolated apply
 ```
 
 ## Configuration
@@ -422,6 +560,63 @@ Default shape:
 }
 ```
 
+Optional v1.0 sections can be added only when needed:
+
+```json
+{
+  "orchestration": {
+    "worktree_apply": true,
+    "check_ulimit": {
+      "nproc": 64,
+      "memory_bytes": 2147483648,
+      "file_size_bytes": 104857600,
+      "cpu_secs": 120
+    },
+    "budget_cost_microusd_ceiling": 5000000,
+    "budget_tokens_ceiling": 200000,
+    "mayor_patrol": {
+      "queue_dir": ".nerve/queue",
+      "results_dir": ".nerve/results",
+      "max_patrols": 8,
+      "heartbeat_secs": 30,
+      "claim_ttl_secs": 600
+    }
+  },
+  "roles": {
+    "architect": "claude-code",
+    "reviewer": "codex",
+    "plan_strategy": "single",
+    "fork": {
+      "copy_patch_history": true,
+      "auto_name": false
+    },
+    "mcp": {
+      "allow_tools": ["search", "read_file"],
+      "write_tool_patterns": ["shell", "exec", "fs.write", "write_file"],
+      "servers": [
+        {
+          "name": "docs",
+          "command": ["node", "server.js"],
+          "role": "reviewer_only",
+          "read_only": true,
+          "allowed_tools": ["search"]
+        }
+      ]
+    }
+  },
+  "daemon": {
+    "protocol": "rpc",
+    "rpc": {
+      "per_consumer_queue": 1024,
+      "payload_cap_kib": 64,
+      "token_path": ".nerve/session-meta/rpc-token",
+      "token_size_bytes": 32,
+      "envelope_version": "1.0.0"
+    }
+  }
+}
+```
+
 ### Profile Matching
 
 Profiles can route work by:
@@ -433,6 +628,9 @@ Profiles can route work by:
 - Per-profile `reviewer`
 - Per-profile `review_strictness`
 - Optional per-profile `max_refinement_rounds`
+- Optional per-profile `plan_strategy` and `plan_system_prompt_override`
+- Optional per-profile `fork`
+- Optional per-profile `mcp`
 
 `match_rules` accepts the original shorthand array or a logical rule object:
 
@@ -440,11 +638,27 @@ Profiles can route work by:
 { "all": ["*.rs", "contract"], "any": ["audit", "security"] }
 ```
 
+### Worktree Apply
+
+Set `orchestration.worktree_apply: true` to run apply attempts in an isolated Git worktree. Use `--worktree` or `--no-worktree` to override the config for one CLI invocation. Nerve refuses dirty trees, symlink escapes, and merge/discard operations when main moved after round preparation.
+
+### RPC Config
+
+`daemon.protocol: "rpc"` makes daemon mode use JSONL RPC envelopes by default. Relative `daemon.rpc.token_path` values are resolved from the workspace root, so the default token path is `.nerve/session-meta/rpc-token`. `nv rpc rotate-token` rotates the bearer secret.
+
+### MCP Config
+
+Each MCP server needs a unique non-empty `name` and non-empty `command` argv. `read_only` defaults to `true`; keep it enabled unless the server is intentionally allowed to mutate state. Global `allow_tools` is intersected with each server's `allowed_tools`.
+
+### Mayor/Patrol Config
+
+`orchestration.mayor_patrol` controls queue and result directories, max patrol count, heartbeat interval, claim TTL, and optional per-patrol budget. `claim_ttl_secs` must be at least twice `heartbeat_secs`.
+
 ### Conflict Policies
 
 The config schema includes:
 
-| Policy | Phase 1 behavior |
+| Policy | Behavior |
 |--------|------------------|
 | `lead_priority` | Prefer the lead patch |
 | `reviewer_priority` | Prefer reviewer suggested patch when present |
@@ -489,6 +703,12 @@ Nerve is built around conservative file mutation:
 - Created files are removed during rollback.
 - Deleted files are restored from the original content during rollback.
 - Reviewer `BLOCK` can prevent application depending on conflict policy.
+- Worktree-isolated apply refuses dirty worktrees, symlink escapes, and stale main resets.
+- `/goal` deterministic checks are argv-only, cwd-frozen, timeout-capped, output-capped, and can run under configured ulimits.
+- `/budget` changes are persisted as an append-only hash chain and checked by `nv doctor`.
+- RPC tokens are stored under `.nerve/session-meta/` with restrictive permissions on Unix.
+- MCP servers default to read-only mode and enforce write-tool blacklist plus allowlist filtering.
+- Mayor/Patrol queue identifiers are restricted to safe file-component characters and duplicate task IDs are rejected.
 - Generated runtime state under `.nerve/` is ignored by Git.
 
 Runtime persistence and patch indexing are implemented under `.nerve/`.
@@ -498,9 +718,11 @@ Runtime persistence and patch indexing are implemented under `.nerve/`.
 ```bash
 cargo test
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p nerve-cli -- config validate
-NERVE_ADAPTER=mock cargo run -p nerve-cli -- "add log line to main.rs"
+cargo run -p nerve-cli -- --adapter mock "add log line to main.rs"
+cargo run -p nerve-cli -- --adapter mock plan "update docs"
+cargo run -p nerve-cli -- --adapter mock benchmark pi --iterations 1 --json
 ```
 
 Current test coverage verifies:
@@ -530,7 +752,15 @@ Current test coverage verifies:
 - `merge_attempt` conflict policy patch merging
 - Scratch-file crossfire watcher feedback during lead execution
 - Line-oriented `nv daemon` mode for editor and shell integrations
+- Typed RPC daemon envelopes, token rotation, metadata, and payload caps
 - Three-pane terminal TUI summary
+- `/goal`, natural-language goal conversion, active-goal reload, and goal history audit
+- `/budget`, budget raise confirmation, global ceilings, and audit-chain tamper detection
+- Worktree-isolated apply and stale-main refusal
+- Plan mode validation and dual review
+- Session fork/branch persistence and legacy session bootstrap
+- MCP read-only guard, role matching, and global allowlist scoping
+- Mayor/Patrol queue claim, result movement, orphan recovery, duplicate task rejection, and ID validation
 - Pi workflow benchmark command
 
 ## How It Works
@@ -558,28 +788,21 @@ User: "add a health endpoint"
    - apply only when --apply and policy allows it
 ```
 
-## Roadmap
+## Release Scope
 
-### Phase 1
+v1.0.0 includes the original lead/reviewer patch loop plus:
 
-- Phase 1 MVP is implemented, including machine-readable session reports.
+- terminal workspace commands for login, doctor, templates, diff/apply/rollback, goal, budget, plan, fork, MCP, Mayor, and Patrol
+- config-backed real adapter execution with timeout/output caps, usage capture, and suggested patch extraction
+- persistent sessions, named sessions, linked reruns, patch index, and session forks
+- worktree-isolated apply mode
+- typed RPC daemon envelopes for editor and shell integrations
+- read-only plan mode
+- MCP stdio client with read-only and allowlist guards
+- Mayor/Patrol queue primitives for multi-instance orchestration
+- installable release binaries for macOS, Linux, and Windows
 
-### Phase 2
-
-- Persisted session history and `.nerve/patches/index.json` are implemented.
-- `nv history`, `nv resume`, `nv list`, `nv apply <id>`, and `nv rollback <id>` are implemented.
-- Temp-file based write staging is implemented for patch file writes.
-- Token and estimated-cost budgets are implemented for adapters that report usage.
-- `nv doctor` checks config validity and real adapter binaries.
-- Scratch-file crossfire feedback is implemented for lead execution.
-
-### Phase 3
-
-- Real-time scratch-file cross-firing between lead and reviewer is implemented.
-- Profile `all` / `any` match rule groups are implemented.
-- Strategy dispatch for `consensus`, `pipeline`, and `tournament` is implemented.
-- Terminal TUI layout for lead, reviewer, and orchestrator state is implemented.
-- Long-running daemon mode for editor and shell integrations is implemented.
+The next hardening areas are long-duration Mayor/Patrol operation, live MCP server compatibility across popular servers, and more end-to-end tests around real Claude/Codex adapter combinations.
 
 ## Design Documents
 
