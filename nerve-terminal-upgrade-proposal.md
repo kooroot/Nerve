@@ -25,12 +25,13 @@ Nerve는 이미 슬래시 명령 20종, 서브커맨드 11종, raw TTY 라인 �
 네 가지**를 v0.2.0으로 묶는 것이 ROI가 가장 크다.
 (상태 바·템플릿 = **가시성** 축, `/goal`·`/budget` = **목표 지향 자동화** 축
 — 위 두 격차에 1:1로 분배된다.) 이 네 항목이 모두 들어오면
-Cherny가 정의한 프로덕션 loop의 3가지 정지 조건(§0.5.3: max iteration /
-no-progress / budget cap)이 v0.2.0에서 모두 충족된다.
+Cherny가 식별한 것으로 정리되는(§0.5.3) 프로덕션 loop의 3가지 정지 조건
+(max iteration / no-progress / budget cap)이 v0.2.0에서 모두 충족된다.
 
-전체 로드맵은 Anthropic의 Boris Cherny가 'Acquired Unplugged' (2026-06-02)
-에서 정의한 **3단계 loop 진화**와 **harness engineering** 관점에서 재배치되어
-있다 (§0.5 참조).
+전체 로드맵은 Boris Cherny가 'Acquired Unplugged' (2026-06-02)에서 정리한
+것으로 알려진 **3단계 loop 진화**와 loop engineering 담론의 **harness 관점**
+에서 재배치되어 있다 (§0.5 인용 정책 박스 참조 — 1차 transcript 미확보,
+Njuguna 2026-06 등 2차 정리 매체 기준).
 
 ### 방향성 요약 (§0.6 인용)
 
@@ -57,7 +58,7 @@ Boris Cherny(Claude Code 책임자, Anthropic)의 'Acquired Unplugged'(2026-06-0
 > 정리 및 §2.8의 2차 정리 매체 기준이다. 1차 출처 확보 시 인용 톤을
 > 단정형으로 강화 예정.
 
-### 0.5.1 Cherny가 정의한 loop 진화 3단계
+### 0.5.1 Cherny가 정리한 것으로 알려진 loop 진화 3단계
 
 | 단계 | 모습 | 인간의 역할 |
 |------|------|-------------|
@@ -119,10 +120,12 @@ Huntley의 'ralph wiggum as a software engineer'에서 비롯되어 Cherny 발�
   강제 종료 (신규 enum 변형 없이 기존 Block 재사용, 결정표는 §3 Tier 1b
   "Verdict × CheckResult 결정표" 참조)
 
-단, `Verdict::Block`은 budget cap 초과 시에도 재사용된다(§3 Tier 2g 참조,
-`nerve-core/src/lib.rs:408`). 두 경우는 `RunReport.budget_exceeded` 플래그로
-구분되며, 사용자 표면(`/status`, 상태 바)에서 "검증 실패로 인한 Block"과
-"예산 초과로 인한 Block"이 다른 라벨로 보이도록 §3 Tier 1a·2g가 함께 다룬다.
+단, `Verdict::Block`은 budget cap 초과 및 no-progress 강제 종료에도 재사용된다
+(§3 Tier 2g, §3 Tier 1b ma-1 참조; `nerve-core/src/lib.rs:408`). 세 경우는
+`RunReport.budget_exceeded` / `no_progress` 플래그로 구분되며, 사용자 표면
+(`/status`, 상태 바)에서 (1) "검증 실패로 인한 Block", (2) "예산 초과로 인한
+Block", (3) "no-progress로 인한 Block"의 세 라벨로 보이도록 §3 Tier 1a·1b·2g가
+함께 다룬다.
 
 따라서 `/goal`은 **새 validator를 도입하는 게 아니라, 기존 reviewer의 판정
 + 사용자 정의 deterministic check(shell/regex)를 AND 결합**하는 형태로 간다
@@ -180,8 +183,11 @@ Anthropic의 Claude Code 공식 문서(`goal.md`, `scheduled-tasks.md`; §2.8 �
 | "큰 파일을 size budget 아래로 쪼개기" | `/goal` | size라는 측정 가능한 조건 |
 | "매일 아침 이슈 트리아지" | `/loop` (cron) | 시간 기반 스케줄 |
 
-(수치 출처: §2.8의 `goal.md`(`#requirements`)와 `scheduled-tasks.md`
-(`#seven-day-expiry`); 2026-06 기준.)
+(수치 출처: §2.8의 `goal.md`/`scheduled-tasks.md` 1차 URL은 §2.8에 확보됨.
+다만 본 표의 anchor·수치 매핑(`#requirements`, `#seven-day-expiry`, '세션당
+1개/최대 50개', '7일 만료')은 2026-06 시점 정리 기준이며 docs 개정 시 변경
+가능. 동일 docs의 다른 항목(line 284·642 모델 이름)이 '1차 확인 필요'로
+표기된 것과 톤 정합.)
 
 **한 줄 요약**: `/goal`은 **"끝까지 가는"** 명령, `/loop`은 **"계속 깨우는"**
 명령. 이 구분은 §0.6에서 Nerve가 어느 쪽을 우선 채택할지의 근거가 된다.
@@ -193,6 +199,11 @@ Anthropic의 Claude Code 공식 문서(`goal.md`, `scheduled-tasks.md`; §2.8 �
 본 절은 §0.5의 loop engineering 담론을 Nerve의 도메인(코드 패치 + Lead/Reviewer
 adversarial orchestration)에 적용해, **"어떤 mode를 언제 쓸 것인지, 무엇을
 선결해야 하는지, 어디로 가는지"** 를 정의한다.
+
+> ※ **인용 정책 승계**: 본 절(§0.6)의 Cherny/Yegge 귀속 표현(예: 'Cherny 매핑',
+> 'Cherny의 3단계 loop 진화', 'Steve Yegge의 Gas Town')은 모두 §0.5 인용 정책
+> 박스를 그대로 따른다 — 1차 transcript/출처 미확보 상태이며, Njuguna(Medium
+> 2026-06)·§2.8 2차 정리 매체 기준이다. 1차 출처 확보 시 톤 강화 예정.
 
 ### 0.6.1 Nerve의 도메인 특성
 
@@ -299,15 +310,18 @@ Cherny의 3단계 loop 진화(§0.5.1)에 맞춰 Nerve의 운영을 세 모드�
 | 버전 | 목표 | 포함 항목 | 활성화되는 mode |
 |------|------|----------|----------------|
 | v0.2.0 | Mode A 기본 완성 | §3 Tier 1 a+b+c + 2g | Mode A (기본형) |
-| v0.3.0 | Mode A 정밀화 | §3 Tier 2 d+e+f | Mode A (worktree 격리 + plan 게이트 + RPC 라이브) |
+| v0.3.0 | Mode A 정밀화 | §3 Tier 2 d+e+f + Tier 1b Phase 2 (자연어→GoalSpec 등록) | Mode A (worktree 격리 + plan 게이트 + RPC 라이브) |
 | v0.4.0 | 가시성 완성 | §3 Tier 3g (ratatui) | Mode A (TUI 패널) |
-| v0.5.0 | Mode B 도입 결정 시점 | (외부 수요 검토 후) `nv loop` 신설 또는 보류 — Mode B는 §0.6.5 기준 6개 요구사항 중 5개 신규, **추가 마이너 버전 1~2회 누적 필요 (v0.5~v0.7)** | Mode B (선택) |
-| v1.0.0 | Mode C 활성화 | §3 Tier 3 h+i+j — Mode C는 §0.6.5 기준 5개 모두 신규 또는 Tier 2 의존, **Mode A·B 안정성 의존 + 인증 토큰 분리·작업 큐 등으로 v0.7~v0.9 누적 작업 필요** | Mode C (Mayor/Patrol) |
+| v0.5.0 | Mode B 도입 결정 시점 | (외부 수요 검토 후) `nv loop` 신설 또는 보류 | Mode B (선택) |
+| v1.0.0 | Mode C 활성화 | §3 Tier 3 h+i+j | Mode C (Mayor/Patrol) |
 
 → **버전 간 cross-reference**: Tier 2 전체(d/e/f/g)는 v0.3.0에서 완료되며,
-Mode C(§0.6.5)는 v1.0.0에서 활성화된다. v0.5.0 → v1.0.0 점프는 실제로
-Mode B 수요 검증 결과에 따라 0.6~0.9 사이 여러 마이너 릴리스를 거쳐 누적
-도달하는 경로이며, 단일 점프가 아니다.
+Mode C(§0.6.5)는 v1.0.0에서 활성화된다. v0.5.0은 Mode B의 §0.6.5 기준 6개
+요구사항 중 5개가 신규이므로 **v0.5~v0.7 사이 추가 마이너 버전 1~2회 누적**이
+필요하며, v1.0.0은 Mode C의 §0.6.5 기준 5개 모두 신규 또는 Tier 2 의존이라
+**Mode A·B 안정성 의존 + 인증 토큰 분리·작업 큐 등으로 v0.7~v0.9 누적 작업**이
+필요하다. v0.5.0 → v1.0.0 점프는 실제로 Mode B 수요 검증 결과에 따라 0.6~0.9
+사이 여러 마이너 릴리스를 거쳐 누적 도달하는 경로이며, 단일 점프가 아니다.
 
 **의도적 순서**: Mode A를 먼저 끝까지 다듬는다. Cherny가 식별한 것으로
 정리되는(§0.5.3 참조) 프로덕션 loop의 3가지 정지 조건이 v0.2.0에서 모두
@@ -325,8 +339,8 @@ Mode B 수요 검증 결과에 따라 0.6~0.9 사이 여러 마이너 릴리스�
 |----------|----------|----------|
 | 종료 조건 등록 명령 | ❌ | §3 Tier 1b (`/goal`) |
 | Validator (Reviewer + check) | ⚠ Reviewer만 | §3 Tier 1b deterministic check |
-| Hard ceiling (max iter) | ✅ `max_refinement_rounds` | (유지) |
-| No-progress 감지 | ❌ | §3 Tier 1b patch hash 비교 |
+| Hard ceiling (max iter) | ✅ `max_refinement_rounds` | (유지 — `/goal`과 카운터 공유, §3 Tier 1b ma-7 참조) |
+| No-progress 감지 | ❌ | §3 Tier 1b patch hash 비교 (별도 카운터 미신설, `max_refinement_rounds` 내에서 작동 — ma-7 참조) |
 | Budget cap (코어 게이트) | ✅ `exceeds_budget()` 매 라운드 호출 (lib.rs:392, 150/186/212/283/317) | (유지) |
 | Budget cap 인터랙티브 노출 | ❌ 슬래시 명령·게이지 없음 | §3 Tier 2g (`/budget`) |
 | 실시간 가시성 | ❌ | §3 Tier 1a status bar |
@@ -360,7 +374,7 @@ Mode B 수요 검증 결과에 따라 0.6~0.9 사이 여러 마이너 릴리스�
 | Worktree 격리 | ❌ | §3 Tier 2d |
 | 작업 큐 | ❌ | §3 Tier 3j 신규 |
 | Patrol 상태 RPC | ❌ | §3 Tier 2e |
-| Global budget + per-patrol cap | ❌ | §3 Tier 2g + 신규 |
+| Global budget + per-patrol sub-budget (ceiling) | ❌ | §3 Tier 2g + 신규 |
 | 동시 인증 토큰 분리 | ❌ | `CLAUDE_CONFIG_DIR` 인스턴스별 |
 
 → 5개 모두 신규 또는 Tier 2 의존. **Mode C는 Mode A + Tier 2 전체 완료
@@ -371,9 +385,10 @@ Mode B 수요 검증 결과에 따라 0.6~0.9 사이 여러 마이너 릴리스�
 > **Nerve는 Claude Code/Codex의 단일 에이전트 loop 위에, adversarial review를
 > 내장한 *achievement-first orchestrator*로 자리잡는다.**
 
-- **Achievement-first**: Mode A를 v1.0까지의 1차 가치 명제로 삼는다. Cherny의
-  `/goal` 패턴(§0.5.4)을 단일 에이전트 turn이 아니라 dual-LLM (lead+reviewer)
-  round 위에 얹는다. Mode B와 C는 Mode A의 안정성 위에만 얹는다.
+- **Achievement-first**: Mode A를 v1.0까지의 1차 가치 명제로 삼는다. Claude
+  Code 공식 문서의 `/goal` 패턴(§0.5.4, §2.8 `goal.md` 기준)을 단일 에이전트
+  turn이 아니라 dual-LLM (lead+reviewer) round 위에 얹는다. Mode B와 C는
+  Mode A의 안정성 위에만 얹는다.
 - **Adversarial validator**: validator를 작은 모델로 두지 않고 강한 모델
   (Codex 또는 Claude)을 reviewer로 쓴다. 검증 비용을 감수하고 품질을 얻는다.
 - **Deterministic gate**: LLM 판정만 믿지 않고 shell exit code + regex로
@@ -391,14 +406,17 @@ Mode B 수요 검증 결과에 따라 0.6~0.9 사이 여러 마이너 릴리스�
 - **Operational visibility**: 코어에 이미 있는 게이트(max iteration,
   `exceeds_budget()`)를 상태 바와 슬래시 명령으로 사용자 손에 쥐어준다
   (§3 Tier 1a, 2g). 게이트는 보이지 않으면 존재하지 않는 것과 같다 —
-  Cherny의 3가지 정지 조건이 인터랙티브 표면에 드러나야 사용자가 신뢰한다.
+  §0.5.3에서 정리한 3가지 정지 조건이 인터랙티브 표면에 드러나야 사용자가
+  신뢰한다.
 
 이 다섯 가지가 Nerve의 "고유 곡선"이다. Claude Code의 속도·생태계와
 Codex의 비용 효율은 §2에서 폭넓게 *차용*하되, 그 위에 **adversarial reviewer
 + deterministic gate** 라는 *추가 축*을 얹는 것이 Nerve의 차별점이다.
-단순한 속도·비용 경쟁이 아니라, **dual-LLM adversarial review를 기본값으로
-강제하는 코드 패치 orchestrator** 포지션을 노린다 — 같은 모델이 자기 작업을
-채점하지 않는 구조 자체가 Nerve의 정체성이다.
+단순한 속도·비용 경쟁이 아니라, **dual-LLM adversarial review를 v0.2.0부터
+인터랙티브 표면에서 기본값으로 강제하는 코드 패치 orchestrator** 포지션을
+노린다 — 같은 모델이 자기 작업을 채점하지 않는 구조 자체가 Nerve의 정체성이다.
+(단, `suggested_patch` 자동 승격 차단 가드는 §3 Tier 1b에서 완성된다 — §5
+위험표 "코어 공통 (Mode A 전반)" 행 참조.)
 
 ---
 
@@ -604,6 +622,11 @@ nv template list|run
 > 일부)은 v1.0 이후 보류로 본다. 반대로 §3 Tier 2g(`/budget`)와 Tier 3j
 > (Mayor/Patrol)는 §2가 아닌 §0.5의 Cherny/Yegge 담론에서 직접 유도된
 > 항목이라 1:1 매핑이 없다 — 이 두 항목은 Nerve의 도메인 특화 확장이다.
+>
+> **인용 정책 승계**: §0.5 인용 정책(Cherny/Yegge 1차 출처 미확보, 2차 정리
+> 매체 기준)은 §3 Tier 1b 헤딩의 'Cherny식'·Tier 3j '영감' 표현, §4·§5에서
+> §0.5.3을 가리키는 'Cherny의 3가지 정지 조건' 류 표현 등 §3·§4·§5의 모든
+> Cherny/Yegge 귀속 표현에도 그대로 적용된다 — 1차 출처 확보 시 톤 강화 예정.
 
 ### Tier 1 — 비용 낮고 가치 큼 (1a/1c 각 0.5~1일, 1b 2~3일)
 
@@ -616,7 +639,7 @@ nv template list|run
 - **데이터 출처**: `RunReport.usage`(cost_microusd, tokens), refinement 카운터,
   `AgentEvent::Stdout/Stderr` 빈도
   - cost 표시(`$0.018`)는 §3 Tier 2g `/budget`이 요구하는 게이지의 piggyback이며,
-    코어의 `exceeds_budget()`가 이미 매 라운드 호출 중(`lib.rs:392` + 6개 call site)이라
+    코어의 `exceeds_budget()`가 이미 매 라운드 호출 중(`lib.rs:392` + 5개 call site: 150/186/212/283/317)이라
     신규 hook이 아니다 — Tier 1a 상태 바는 그 값을 픽업해 노출만 한다
 - **구현 위치**:
   - `crates/nerve-cli/src/main.rs:904` (`InteractiveLineEditor`) 위에
@@ -626,6 +649,8 @@ nv template list|run
 - **영감**: Claude Code agent view ✽/✻/∙/✢ + elapsed/spend 표시
 
 #### 1b. `/goal` 명령 — Cherny식 종료 조건 + Validator 결합
+
+**1b.1 명세**
 
 - **무엇을**: `/goal tests pass && diff applied` 형태로 종료 조건 등록
 - **동작**: orchestrator가 max_rounds 이전이라도 조건 충족 시 stop;
@@ -670,21 +695,37 @@ nv template list|run
     `/quit` arm 1392 위) 안에 신규 arm으로 추가. 구현 완료 후 §1.1
     인벤토리의 슬래시 명령 카운트는 20 → 21로 갱신해야 한다 (Tier 2g `/budget`
     까지 들어오면 → 22).
-- **자연어 등록 (Phase 2)**: Loop engineering 담론에서 자주 인용되는
-  "/loop babysit all my PRs..." 같은 형태처럼(§0.5.5 참조) 자연어 한 줄을
-  받아 lead가 GoalSpec JSON으로 변환 → 사용자 확인 후 등록
+- **자연어 등록 (Phase 2, v0.3.0 후속 — ma-5 참조)**: Loop engineering 담론에서
+  자주 인용되는 "/loop babysit all my PRs..." 같은 형태처럼(§0.5.5 참조) 자연어
+  한 줄을 받아 lead가 GoalSpec JSON으로 변환 → 사용자 확인 후 등록
+
+**1b.2 운영 가드 (보안·호환·책임 분리)**
 
 - **보안 가드 (sec-1)**: `/goal`의 deterministic check가 임의 shell command를
   실행하는 표면이라 다음 가드가 필수다:
   1. `check_cmd`는 **argv 배열** (`Vec<String>`)로 받고 `sh -c` 금지. 명시적
      opt-in으로만 `--shell` 허용.
   2. 실행 cwd는 task 시작 시 freeze된 워크스페이스 루트로 고정(§3 Tier 1b 동작 + sec-7 참조).
-  3. PATH/환경변수 화이트리스트 (`HOME`, `LANG`, `NERVE_*`만 통과; `nerve.config.json::orchestration.check_env`로 추가 허용).
-  4. `tokio::time::timeout` 적용 (어댑터와 동일한 기본 5분).
+  3. PATH/환경변수 화이트리스트 (`HOME`, `LANG`, `NERVE_*`만 통과; `nerve.config.json::orchestration.check_env` (신규 필드, v0.2.0 추가)로 추가 허용).
+  4. `tokio::time::timeout` 적용 (v0.2.0 어댑터 timeout과 같은 기본 5분 — §5 위험표 마지막 행, §4 묶음 선결 참조).
   5. `.nerve/goals/<id>.json` 영속화 전 path traversal 검사 (`../`, 절대 경로 거부).
   6. **Phase 2 자연어→GoalSpec 변환 결과**는 raw `check_cmd` + cwd + env까지
      사용자 확인 prompt에 표시한 뒤에만 저장. LLM이 만든 shell command가 곧바로
      evaluator에 들어가는 경로를 차단.
+  7. **check_cmd stdout/stderr는 평가기 측에서 N MiB(기본 1 MiB) streaming cap**.
+     `Command::output()` 금지 — `tokio::process::Command` + `stdout(Stdio::piped())`로
+     `ChildStdout::take(N)` 누적 읽기, cap 초과 시 `CheckResult::Fail { reason: "output exceeded 1 MiB" }`
+     + 라운드 종료. RPC `goal_check.output` 4 KiB truncate(§3 Tier 2e sec-4 3항)는 *emit 시점*
+     이라 평가기 메모리 자체는 별도로 보호해야 한다. `nerve.config.json::orchestration.check_output_cap_bytes`로
+     오버라이드.
+  8. **stdin 격리**: check_cmd의 stdin은 `Stdio::null()` 강제, stdout/stderr는
+     `Stdio::piped()`로 캡처해 부모 raw TTY와 분리. evaluator는 부모 stdin을 자식에게
+     상속시키지 않는다 — `RawTerminalGuard`(`main.rs:1664-1710`) 활성 중 raw 키스트로크
+     leak·echo 깨짐·SIGINT/SIGTSTP 전파 꼬임 방지.
+  9. **자원 한도(권장)**: v0.2.0은 cgroups/job object 강제 미지원. `nerve.config.json::orchestration.check_ulimit`
+     (옵션)으로 사용자가 nproc/메모리 cap을 등록 가능(Linux=`prlimit`, macOS=`launchctl limit`).
+     `docs/security.md`에 권장 ulimit 예시 안내, v1.0에서 cgroups v2 재검토. fork bomb·OOM·fd
+     고갈은 argv 강제·timeout만으로 차단되지 않는 표면이므로 minor 가드로 명시.
 
 - **Verdict 호환 가드 (ma-1)**: No-progress 종료는 신규 enum 변형을 만들지
   않고 **기존 `Verdict::Block` + `RunReport.no_progress=true` 플래그** 패턴을
@@ -695,9 +736,10 @@ nv template list|run
 
 - **Evaluator 책임 분리 (ma-2)**: `GoalSpec` 타입은 `nerve-config`에 두고,
   `GoalEvaluator` 실행기는 `nerve-core::goal` 모듈에 신설한다. orchestrator는
-  `run_synaptic_loop` 내부의 `reviewer.review()` 직후, `Verdict::is_terminal_success`
-  체크 *위에서* evaluator를 호출 — Reviewer LGTM ∧ CheckResult Pass일 때만
-  종료된다. `CheckResult` enum(`Pass`, `Fail { reason }`, `Skipped`)은
+  `run_synaptic_loop` 내부의 `reviewer.review()` 직후 evaluator를 호출하고,
+  종료 판정에서 `Verdict::is_terminal_success`와 `CheckResult::Pass`를 AND 결합
+  — Reviewer LGTM ∧ CheckResult Pass일 때만 종료된다 (호출지: `nerve-core/src/lib.rs:155-160`
+  종료 분기). `CheckResult` enum(`Pass`, `Fail { reason }`, `Skipped`, 신설)은
   `nerve-types`에 두어 RPC 이벤트에도 그대로 흐른다.
 
 - **Verdict × CheckResult 결정표 (ma-6)**:
@@ -711,6 +753,10 @@ nv template list|run
   | RequestChanges | Fail | next round | 양쪽 모두 미달, 정상 refinement |
   | Block | * (any) | **stop (Block 우선)** | hard fail은 항상 종료 강제 |
 
+  본 결정표는 **reviewer-emitted Verdict**에 한정된다. no-progress / budget
+  exceeded로 인한 Block은 결정표 외부에서 orchestrator가 합성하며, ma-1 호환
+  가드의 플래그(`no_progress` / `budget_exceeded`)로 구분된다.
+
   `Block`은 단독으로 종료를 강제한다 (§0.5.4 참조).
 
 - **카운터 정책 (ma-7)**: `/goal` 자체 카운터를 따로 두지 않고 `max_refinement_rounds`
@@ -718,12 +764,15 @@ nv template list|run
   종료. `RoundRecord.round`는 라운드당 1회 기록, `CheckResult`는 `Option<CheckResult>`
   로 누적되어 history에 보존된다. §0.6.5 Mode A 매트릭스의 "Hard ceiling (max iter)"
   요구는 `/goal` 카운터와 *공유*되어 별도 카운터 미신설.
+  **swap 시점**: `/goal` 재등록은 다음 라운드 시작 boundary에만 반영(라운드 중간
+  swap 금지) — Verdict 결정 시점과 일관.
 
 - **v0.2.0 스코프 (ma-5)**: 본 Tier 1b는 **Phase 1만** v0.2.0에 들어간다 —
   즉 `/goal "<argv 형식 check_cmd>"` 직접 등록 + 결정표 + no-progress + 보안
-  가드까지. **Phase 2 자연어 등록**(LLM 변환)은 v0.3.0 후속으로 분리한다 (§4
-  묶음 설명 참조). 이는 자연어→shell 변환의 보안 가드(위 6번)가 v0.2.0
-  스코프를 넘기 때문이다.
+  가드 **1~5번까지**. **보안 가드 #6번(Phase 2 자연어→GoalSpec 변환 사용자 확인)
+  과 Phase 2 자연어 등록**(LLM 변환)은 v0.3.0 후속으로 분리한다 (§4 묶음 설명
+  참조). 이는 자연어→shell 변환의 보안 가드(위 6번)가 v0.2.0 스코프를 넘기
+  때문이다.
 
 #### 1c. `/templates` 검색·정렬 강화
 
@@ -750,6 +799,20 @@ nv template list|run
   3. `nv doctor`에 "고아 worktree 검사" 추가: `.nerve/scratch/orphaned-worktrees/`
      비어 있어야 통과.
   4. dirty worktree(`git status --porcelain` non-empty) 검출 시 머지 거부.
+  5. **symlink escape 차단**: 머지 직전 `git diff --name-only main-pre.ref HEAD`로 신규/변경
+     파일 수집, 각 파일에 `std::fs::symlink_metadata().is_symlink()` + `canonicalize()`로
+     prefix 검증. symlink 또는 main repo prefix 밖을 가리키는 파일 발견 시 머지 거부 +
+     orphaned-worktrees로 격리. lead 어댑터가 NvPatch 외 직접 git/shell 명령으로 symlink를
+     worktree 브랜치에 커밋해 main `.git/config`/인증 토큰 경로를 변조하는 경로 방어.
+  6. **디스크 가용 공간 사전 검사**: 머지 시작 전 `statvfs(.nerve/)`로 가용 공간 확인(기본
+     임계 100 MiB 미만이면 거부 + 사용자 안내). `main-pre.ref` 쓰기 ENOSPC 시 `ApplyError::DiskFull`
+     로 즉시 abort하고 patch는 worktree에 보존. `nv doctor`에 `.nerve/scratch/orphaned-worktrees/`
+     비어 있음 검사에 더해 디스크 잔량 임계 검사 추가.
+  7. **reset 자체 실패 폴백**: `git reset --hard <backup>` 실패(read-only fs, immutable flag,
+     AppleDouble metadata, ACL) 시 `git reset --merge` 폴백 → 그래도 실패하면 main HEAD를
+     `.nerve/scratch/main-recovery/<ts>.bundle`로 `git bundle create` 백업 + RED 경고 +
+     `nv doctor --recover` 안내. 잔재 worktree `mv` 실패 시에는 in-place `chmod 0600` +
+     `.nerve/scratch/orphaned-worktrees/manifest.jsonl`에 위치 기록.
 
 #### 2e. RPC 이벤트 스트리밍 확장
 
@@ -767,10 +830,33 @@ nv template list|run
   2. `lead_stdout_chunk`/`reviewer_stdout_chunk`는 기본적으로 `bytes` 카운터만
      emit. raw 본문은 명시적 opt-in (`nv daemon --rpc --include-content`)에서만.
   3. `goal_check.output`은 사용자 shell 명령 stdout이라 API 키·토큰 누설 위험.
-     N바이트(기본 4 KiB) truncate + 정규식 기반 시크릿 마스킹(`AKIA...`, `sk-...`,
-     `ghp_...` 등 일반 패턴).
+     N바이트(기본 4 KiB) truncate + 정규식 기반 시크릿 마스킹. 기본 패턴은 `AKIA...`,
+     `sk-...`, `sk-ant-...`, `ghp_...`, `vrcl_...`, `org-...`, GCP service account JSON
+     필드(`private_key_id`, `private_key`)를 포함하며 `nerve.config.json::secret_patterns`로
+     사용자/커뮤니티 확장 가능. 라인 경계 회피(`sk-` + `proj-` + `XYZ...` 분할 출력)를
+     막기 위해 sliding-window(기본 64자) 매칭 + base64/hex 인코딩 우회 대응으로 Shannon
+     entropy ≥ 4.5 + length ≥ 32 휴리스틱으로 의심 토큰 마스킹. **JSONL invariant**:
+     `output`/`stdout_chunk`의 raw payload는 serde JSON string으로만 직렬화하여
+     `\n`/`{`/`}` 자동 escape — 한 줄=한 이벤트 invariant를 LLM 출력이 위장 이벤트로
+     injection하지 못하게 강제.
   4. 파일 경로는 워크스페이스 루트 기준 상대 경로로 정규화, 절대 경로 금지.
   5. Mode C에서 patrol마다 별도 Unix socket 또는 토픽 prefix로 컨슈머 격리.
+  6. **RPC payload hard cap + bounded channel**: 모든 RPC 이벤트는 직렬화 후 N KiB(기본
+     64 KiB) hard cap. 초과 시 metadata(`truncated: true, original_size: N`) 동반 + 본문은
+     head/tail 256B만 emit. raw 본문 opt-in(`--include-content`)에서도 동일 적용. emit
+     queue는 컨슈머별 bounded channel(기본 1024 events) — 가득 차면 oldest drop +
+     `dropped_count` metric 노출. multi-instance(Mode C)에서 한 patrol의 빠른 emit이 다른
+     patrol consumer 버퍼를 막아 cascade hang/OOM되는 경로 방어.
+  7. **envelope schema 버저닝**: RPC 이벤트는 `{schema_version: "1.x", kind, payload}`
+     envelope 고정. `schema_version`은 semver string — minor bump는 필드 추가만 허용하고
+     컨슈머는 unknown 필드 silently ignore, major bump는 daemon이 handshake 시 컨슈머
+     max-supported version으로 downgrade하거나 거부. v0.2.0은 v1.0 envelope 고정.
+     downgrade(daemon v0.5 → consumer v0.2) 시 unknown 필드는 round-trip 보존 정책.
+  8. **bearer 토큰 lifecycle**: 1항의 TCP bearer 토큰은 `nv daemon --rpc` 시작 시 32B
+     랜덤 생성 → `.nerve/session-meta/rpc-token`(0600) 저장, 데몬 종료 시 자동 삭제.
+     토큰 stdout 출력은 `--print-token` 명시 opt-in에서만. rotation은 `nv rpc rotate-token`
+     수동(v0.2.0은 자동 회전 미지원). Mode C에서는 patrol마다 별도 토큰 → 5항 socket
+     격리와 결합. 누설 의심 시 데몬 재시작 = 토큰 새로 발급.
 
 #### 2f. `/plan` (Plan mode)
 
@@ -827,12 +913,32 @@ nv template list|run
      `--force` 플래그 + 인터랙티브 확인 prompt.
   2. **Lowering만 자유**: 세션 한도를 글로벌 이하로 줄이는 것은 자유 (안전
      방향).
-  3. **Mode C 분배**: Mayor가 부여한 sub-budget이 patrol의 ceiling이 된다.
-     patrol이 자기 `/budget`을 sub-budget 위로 raising 시 Mayor 토큰 없이는
-     거부. global cap을 patrol이 우회할 수 없게 강제.
+  3. **Mode C 분배**: Mayor가 부여한 sub-budget이 patrol의 ceiling이 된다
+     (용어 정의: **per-patrol sub-budget = patrol ceiling**, §0.6.2 / §0.6.5
+     Mode C 매트릭스와 통일). patrol이 자기 `/budget`을 sub-budget 위로 raising
+     시 Mayor 토큰 없이는 거부. global cap을 patrol이 우회할 수 없게 강제.
   4. **변경 감사**: `/budget` 호출마다 `.nerve/session-meta/budget-audit.json`
-     에 (이전 값, 새 값, 호출 시각, 사용자 확인 여부) 기록. `/status` 출력에
-     누적 변경 횟수 노출.
+     (신규 파일)에 (이전 값, 새 값, 호출 시각, 사용자 확인 여부) 기록. `/status`
+     출력에 누적 변경 횟수 노출.
+  5. **입력 sanity**: `/budget` 파서는 (a) 음수·NaN을 u64 파서 단계에서 거부
+     (`InvalidValue`), (b) `cost=$0`/`tokens=0`은 config validation(`nerve-config/src/lib.rs:216-221`)
+     과 일관되게 거부, (c) 단위 명시 필수 — `$` 접두는 cost, `tokens` 접미는 tokens,
+     단위 누락 시 거부, (d) 빈 값/공백 거부, (e) decimal cost(`$5.00`)는 microusd
+     정수(`5_000_000`)로 변환 후 저장 — 변환 실패 시 `InvalidValue`. `nv doctor` 시작
+     시 현재 세션 budget이 sane한지 1회 검사.
+  6. **audit log hash-chain**: `.nerve/session-meta/budget-audit.json`은 append-only +
+     각 entry가 직전 entry의 SHA-256을 `prev_hash` 필드로 포함하는 hash chain. `/budget`
+     호출 시 직전 hash 검증 후 새 entry append. `nv doctor`가 chain integrity 검사 +
+     깨졌으면 RED 경고. NvPatch 블랙리스트(§5 "코어 공통 NvPatch" 행)는 lead/reviewer
+     경로 한정 보호이므로 외부 LLM CLI(claude/codex)가 cwd 안 파일을 자유 편집해
+     audit row를 삭제·변조하는 경로는 chain으로 검출. Mode C에서 patrol이 sub-budget을
+     위로 raising한 흔적 은폐도 동일하게 방어.
+  7. **advisory lock + atomic write**: `/budget` 핸들러는 `.nerve/session-meta/budget.lock`
+     advisory file lock(`fs2::FileExt::lock_exclusive`)으로 직렬화. lock 획득 후
+     (read audit → validate raise/lower → atomic write audit + 세션 한도) 한 트랜잭션.
+     `nerve-core/src/store.rs::write_json_atomic` 패턴(tempfile + rename(2)) 재사용해
+     partial JSON write 방지. lock 5초 timeout 시 "다른 인스턴스가 budget 수정 중"
+     경고. Mode C에서 Mayor/patrol은 동일 lock 공유.
 
 ### Tier 3 — 큰 작업 (1~2주)
 
@@ -866,8 +972,8 @@ nv template list|run
     의 task 파일이 들어오면 idle한 patrol 슬롯에 할당
   - `nv patrol --watch <glob>` — N개의 patrol이 각자 worktree에서 대기,
     Mayor가 dispatch한 task를 처리 후 결과를 `.nerve/results/` 에 기록
-  - 상태 전부 git + `.nerve/` JSON — 크래시/재시작 견딤 (Cherny가 강조한
-    "상태를 git에 저장" 철학과 일치)
+  - 상태 전부 git + `.nerve/` JSON — 크래시/재시작 견딤 (§0.5.5에서 정리한
+    "상태를 git에 저장" 철학과 일치 — 원 귀속은 Yegge의 Gas Town 패턴)
 - **선결 조건**: 2d(worktree), 2g(budget), 1b(`/goal`)
 - **활용 시나리오**: PR 백로그를 patrol 풀이 동시에 갈아치우는 야간 배치
 - **위험**: 동시 인증 토큰 소비량 폭증 → `/budget` global cap이 필수 안전망
@@ -880,12 +986,12 @@ nv template list|run
 
 - 1a 상태 바와 2g `/budget`은 데이터 출처가 동일(`RunReport.usage`)해서
   같은 사이클에 묶으면 비용 회계 관련 코드를 한 번에 정리할 수 있다.
-- Cherny의 3가지 정지 조건(§0.5.3) 중 max iteration과 budget cap **게이트**
+- §0.5.3에서 정리한 3가지 정지 조건 중 max iteration과 budget cap **게이트**
   는 이미 코어에 있고(`max_refinement_rounds`, `exceeds_budget()`), 2g는
   그 budget 게이트를 사용자 표면(슬래시 명령 + 상태 바 게이지 + 종료 사유
   명시)으로 끌어올린다. no-progress는 1b에서 신규 추가된다. **이 묶음이
-  들어가면 사용자가 Cherny의 3가지 정지 조건을 모두 *보고 만질 수 있는*
-  상태가 된다.**
+  들어가면 사용자가 §0.5.3 정리 기준 3가지 정지 조건을 모두 *보고 만질 수
+  있는* 상태가 된다.**
 - 인터랙티브 모드를 켰을 때 **즉시 체감되는 변화** 네 가지:
   1. 상시 노출되는 상태 바 (cost gauge 포함)
   2. `/goal`로 자동 종료/재시도 + no-progress 보호 (Tier 1b **Phase 1만**;
@@ -895,8 +1001,9 @@ nv template list|run
 - **선결 (1b 의존)**: 어댑터 timeout 가드(§5 위험표 첫 행) — `nv interactive`
   와 `/goal` 검증이 신뢰 가능해지려면 `tokio::time::timeout` 도입이 묶음 안에
   들어와야 한다.
-- 예상 작업량: **5~7일** (1a/1c 각 0.5~1일 + 1b /goal 2~3일 + 2g 1일 +
-  adapter timeout 0.5일). 단일 PR로 묶기 적합하나, 1b가 가장 큰 비중.
+- 예상 작업량: **4.5~6.5일 (라운드업 5~7일)** (1a/1c 각 0.5~1일 + 1b /goal
+  2~3일 + 2g 1일 + adapter timeout 0.5일). 단일 PR로 묶기 적합하나, 1b가 가장
+  큰 비중.
 - §4.2 체크리스트에 'adapter hang 시뮬레이션 테스트(어댑터 무한 sleep 시
   5분 후 timeout 종료)' 항목 추가.
 
@@ -908,11 +1015,12 @@ nv template list|run
 | orchestrator → 상태 채널 | `crates/nerve-core/src/lib.rs` (`run_synaptic_loop`, line ~113) |
 | `/goal` 슬래시 핸들러 | `crates/nerve-cli/src/main.rs` 슬래시 match 블록(약 1240–1393, `/quit` arm 위) |
 | `GoalSpec` 타입 + no-progress 카운터 | `crates/nerve-config/src/lib.rs` |
+| `Orchestration::check_env` 신규 필드 | `crates/nerve-config/src/lib.rs` (`Orchestration` 구조체, `#[serde(default)] check_env: Vec<String>` 신설) |
 | `/budget` 슬래시 핸들러 | `crates/nerve-cli/src/main.rs` 슬래시 match 블록(약 1240–1393) |
 | Budget 누적 체크 | `crates/nerve-core/src/lib.rs::run_synaptic_loop` 라운드 종료부 (`exceeds_budget()` line 392, 호출지 150/186/212/283/317에 wired) |
 | `RoundRecord.patch_sha` 필드 (no-progress 감지) | `crates/nerve-types/src/lib.rs:158` (`RoundRecord`) |
-| `GoalEvaluator` 실행기 + `CheckResult` enum | `crates/nerve-core/src/goal.rs` (신설), `crates/nerve-types/src/lib.rs` (`CheckResult`) |
-| `NvPatch::canonical_hash()` 헬퍼 (no-progress 정규화) | `crates/nerve-patch/src/lib.rs` |
+| `GoalEvaluator` 실행기 + `CheckResult` enum | `crates/nerve-core/src/goal.rs` (신설), `crates/nerve-types/src/lib.rs` (`CheckResult` enum 신설) |
+| `NvPatch::canonical_hash()` 헬퍼 (no-progress 정규화) | `crates/nerve-patch/src/lib.rs` (`canonical_hash` 헬퍼 신설) |
 | `/templates` 검색 팔레트 | `crates/nerve-cli/src/main.rs:836` |
 | 사용 카운터 영속화 | `.nerve/session-meta/template-usage.json` |
 
@@ -933,26 +1041,41 @@ cargo run -p nerve-cli -- "<task>" /goal "exit 0"   # goal 자동 종료 확인
 
 | Tier | 위험 | 완화 |
 |------|------|------|
-| 1a 상태 바 | raw TTY 모드와 다른 출력 간 깜빡임 | 출력 갱신 시 cursor save/restore (`\x1b[s` / `\x1b[u`) |
-| 1b /goal | 조건 평가가 무한 루프 유발 | `max_refinement_rounds` hard ceiling + no-progress 카운터 |
-| 1b /goal | `check_cmd` injection (임의 shell 실행 표면) | argv 배열 강제(`sh -c` 금지) + Phase 2 자연어 변환 사용자 확인 + cwd/env 화이트리스트 + `tokio::time::timeout` + `.nerve/goals/<id>.json` path traversal 검사 (§3 Tier 1b "보안 가드" 참조) |
-| 1b /goal | `RoundRecord`에 `patch_sha` 추가 시 기존 세션 JSON 역직렬화 깨짐 | 필드를 `Option<String>` + `#[serde(default)]`로 도입 (§3 Tier 1b 본문 참조) |
-| 코어 공통 (NvPatch) | LLM이 제안한 patch가 `.git/`, `.nerve/` 메타 디렉터리에 쓰기 (`nerve-patch::ensure_safe_relative_path`는 traversal/abs path는 막지만 메타 디렉터리 블랙리스트 없음) | `NvPatch::validate`에 메타 디렉터리(`.git/`, `.nerve/`) 블랙리스트 추가. lead/reviewer 양쪽 patch 모두 동일 규칙 |
-| 1b /goal | `patch_sha` 비정규화 시 동일 의미 patch가 다른 hash 생성 → no-progress 가드 우회 | `NvPatch::canonical_hash()` 헬퍼 신설(path 정렬·LF 통일·메타 제외; §3 Tier 1b "정규화 규칙" 참조) |
-| 코어 공통 (Mode A 전반) | Reviewer `suggested_patch`가 `ConflictPolicy::ReviewerPriority`/`MergeAttempt` 정책에서 `select_final_patch` (`nerve-core/src/lib.rs:573-580`)로 자동 승격, 1라운드부터 발생 — `/goal` 자동 재투입 무관 | `/goal` 자동 재투입 경로에서도 `suggested_patch`는 dry-run/diff 미리보기 강제 + `/apply` 명시 요구. `--apply` + `ReviewerPriority` 조합은 §0.6.6 "사람 in-the-loop" 원칙으로 거부하거나 인터랙티브 재확인 게이트 부착 |
-| 1c 템플릿 검색 | 사용 카운터 동시성 | `nerve-core/src/store.rs`의 atomic write 패턴 재사용 |
-| 2d worktree | git 버전·플랫폼 차이 | `nv doctor`에 `git --version` 검사 추가 |
-| 2d worktree | 머지 도중 실패 시 main 트리에 partial-state 잔재, `git worktree remove` 실패 시 인증 캐시 누설 | main HEAD ref backup → 머지 실패 시 `git reset --hard`로 원복, 잔재 worktree는 `.nerve/scratch/orphaned-worktrees/`(0600)로 격리, doctor 고아 검사 (§3 Tier 2d "트랜잭션 보장" 참조) |
-| 2e RPC 확장 | 외부 컨슈머 호환성 | 이벤트에 `version` 필드 + unknown type ignore 가이드 |
-| 2e RPC 누설 | `stdout_chunk`/`goal_check.output`이 prompt·시크릿·파일 경로 그대로 노출, multi-instance에서 컨슈머 격리 부재 | Unix socket 0600 (TCP 사용 시 토큰 인증) + raw 본문 opt-in + 시크릿 정규식 마스킹 + 경로 정규화 + Mode C patrol별 socket 격리 (§3 Tier 2e "보안" 참조) |
-| 2f /plan | lead가 read-only 분석을 무시하고 patch 생성 시도 | prompt prefix("write a plan only")를 hard refuse하는 reviewer 룰 추가 + dry-run 강제 |
-| 2g /budget | 부정확한 cost_microusd 추정 | adapter usage 파서에 fallback (`0`이면 token×요금표) + 경고 로그 |
-| 2g /budget 권한 | 사용자가 `/budget cost=$10000`처럼 임의 raising → global cap 무력화, Mode C에서 patrol이 sub-budget 우회 | raising은 글로벌 ceiling 강제 + `--force` 시 인터랙티브 확인, Mode C patrol은 Mayor sub-budget 위로 raising 거부, `.nerve/session-meta/budget-audit.json`에 변경 감사 (§3 Tier 2g "권한 모델" 참조) |
-| 3h fork/branch | session fork 시 patch 인덱스 키 충돌 | `.nerve/sessions/<parent>/<child>.json` 트리 + patch index에 `session_id` 컬럼 추가 |
-| 3i MCP | 외부 MCP 서버가 dangerous tool(`shell`/`fs`)을 reviewer에게 노출 | reviewer adapter는 read-only MCP whitelist만 통과 + `tool.allowed` 설정 |
-| **1b 선결 (v0.2.0 진입)** 어댑터 공통 timeout 가드 | `Command::output().await`(`nerve-adapter/src/lib.rs:208-213`)에 timeout 부재 — claude/codex 바이너리 hang 시 영구 대기, refinement loop 전체가 멈춤. **§4.2 체크리스트의 `nv interactive`/`/goal` 검증이 timeout 가드 없이는 신뢰 불가**(Tier 1b의 max iter·no-progress·budget cap 세 정지 조건도 adapter hang 위에서 무력화됨) | `tokio::time::timeout`으로 래핑 (기본 5분, `nerve.config.json::adapter.timeout_secs`로 오버라이드). 타임아웃 시 `AdapterError::Timeout` + 다음 라운드는 skip. **§4 v0.2.0 묶음에 명시 포함** |
-| 3g ratatui | 의존성 트리 증가 | feature gate (`--features tui`)로 옵션화 |
-| 3j Mayor/Patrol | 다중 인증 토큰 폭주 | `/budget` global cap 필수 선결 + patrol당 sub-budget |
+| Tier 1a 상태 바: 깜빡임 | raw TTY 모드와 다른 출력 간 깜빡임 | 출력 갱신 시 cursor save/restore (`\x1b[s` / `\x1b[u`) |
+| Tier 1b /goal: 무한 루프 | 조건 평가가 무한 루프 유발 | `max_refinement_rounds` hard ceiling + no-progress 카운터 |
+| Tier 1b /goal: check_cmd injection | `check_cmd` injection (임의 shell 실행 표면) | argv 배열 강제(`sh -c` 금지) + Phase 2 자연어 변환 사용자 확인 (v0.3.0 Phase 2 추가) + cwd freeze (sec-7, `/goal` 자동 재투입의 cwd 변경 보호) + env 화이트리스트 + `tokio::time::timeout` + `.nerve/goals/<id>.json` path traversal 검사 (§3 Tier 1b "보안 가드" 참조) |
+| Tier 1b /goal: stdout DoS | `check_cmd` stdout DoS (`yes`/`dd if=/dev/zero`/무한 `echo` 등이 timeout 전 평가기 메모리 폭주, RPC 4 KiB truncate는 emit 시점이라 메모리 보호 안 됨) | 평가기 측 streaming 1 MiB cap (`tokio::process` + `Stdio::piped()` + `ChildStdout::take`) + 초과 시 `CheckResult::Fail` (§3 Tier 1b sec-1 7항 참조) |
+| Tier 1b /goal: stdin leak | `check_cmd`가 부모 raw TTY stdin 점유 → 키스트로크 leak·echo 깨짐·SIGINT/SIGTSTP 전파 꼬임 | `Stdio::null()` 강제 + stdout/stderr `Stdio::piped()` 캡처 (§3 Tier 1b sec-1 8항 참조) |
+| Tier 1b /goal: resource exhaustion | resource exhaustion (fork bomb `:(){ :\|:& };:`, OOM, fd 고갈) — argv 강제·timeout만으로 차단 불가 | v0.2.0은 `check_ulimit` config 옵션 + docs/security.md 권장 ulimit 예시, v1.0에서 cgroups v2 재검토 (§3 Tier 1b sec-1 9항 참조) |
+| Tier 1b /goal: concurrent race | concurrent `/goal` 등록 race + `.nerve/goals/<id>.json` partial JSON write (Mode C는 §0.6.5 기준 v0.2.0 미지원) | `store.rs::write_json_atomic`(rename(2)) 패턴 재사용 + goal 변경은 다음 라운드 boundary에만 반영 (§3 Tier 1b ma-7 "swap 시점" 참조) |
+| Tier 1b /goal: RoundRecord 호환 | `RoundRecord`에 `patch_sha` 추가 시 기존 세션 JSON 역직렬화 깨짐 | 필드를 `Option<String>` + `#[serde(default)]`로 도입 (§3 Tier 1b 본문 참조) |
+| Tier 1b /goal: patch_sha 정규화 | `patch_sha` 비정규화 시 동일 의미 patch가 다른 hash 생성 → no-progress 가드 우회 | `NvPatch::canonical_hash()` 헬퍼 신설(path 정렬·LF 통일·메타 제외; §3 Tier 1b "정규화 규칙" 참조) |
+| Tier 1b 선결 (v0.2.0 진입): 어댑터 timeout | `Command::output().await`(`nerve-adapter/src/lib.rs:208-213`)에 timeout 부재 — claude/codex 바이너리 hang 시 영구 대기, refinement loop 전체가 멈춤. **§4.2 체크리스트의 `nv interactive`/`/goal` 검증이 timeout 가드 없이는 신뢰 불가**(Tier 1b의 max iter·no-progress·budget cap 세 정지 조건도 adapter hang 위에서 무력화됨) | `tokio::time::timeout`으로 래핑 (기본 5분, `nerve.config.json::adapter.timeout_secs`로 오버라이드). 타임아웃 시 `AdapterError::Timeout` + 다음 라운드는 skip. **§4 v0.2.0 묶음에 명시 포함** |
+| Tier 1b 선결 (v0.2.0 진입): 어댑터 응답 크기 cap | `Command::output().await`이 stdout/stderr 전체를 메모리 버퍼링 — 거대 응답(GB 단위 JSON dump) 시 timeout 5분 안에 OOM. timeout 가드만으로는 cap 미충족, Mode C에서 cascade OOM | `Command::output()` 대신 `spawn() + ChildStdout::take()` streaming 읽기, 누적 N MiB(기본 16 MiB, `nerve.config.json::adapter.max_output_bytes`) 초과 시 `AdapterError::OutputTooLarge` + child kill, doctor에서 cap 도달 metric 진단 (§3 Tier 2e sec-4 cross-ref) |
+| Tier 1c 템플릿 검색: 동시성 | 사용 카운터 동시성 | `nerve-core/src/store.rs`의 atomic write 패턴 재사용 |
+| 코어 공통 (NvPatch): 메타 디렉터리 쓰기 | LLM이 제안한 patch가 `.git/`, `.nerve/` 메타 디렉터리에 쓰기 (`crates/nerve-patch/src/lib.rs:938`의 비공개 헬퍼 `ensure_safe_relative_path` (`FileOperation::validate` 등 내부에서만 호출)는 traversal/abs path는 막지만 메타 디렉터리 블랙리스트 없음) | `NvPatch::validate`에 메타 디렉터리(`.git/`, `.nerve/`) 블랙리스트 추가. lead/reviewer 양쪽 patch 모두 동일 규칙 |
+| 코어 공통 (Mode A 전반): suggested_patch 자동 승격 | Reviewer `suggested_patch`가 `ConflictPolicy::ReviewerPriority`/`MergeAttempt` 정책에서 `select_final_patch` (`nerve-core/src/lib.rs:573-580`)로 자동 승격, 1라운드부터 발생 — `/goal` 자동 재투입 무관 | `/goal` 자동 재투입 경로에서도 `suggested_patch`는 dry-run/diff 미리보기 강제 + `/apply` 명시 요구. `--apply` + `ReviewerPriority` 조합은 §0.6.6 "사람 in-the-loop" 원칙으로 거부하거나 인터랙티브 재확인 게이트 부착 |
+| Tier 2d worktree: 버전 차이 | git 버전·플랫폼 차이 | `nv doctor`에 `git --version` 검사 추가 |
+| Tier 2d worktree: 머지 트랜잭션 | 머지 도중 실패 시 main 트리에 partial-state 잔재, `git worktree remove` 실패 시 인증 캐시 누설 | main HEAD ref backup → 머지 실패 시 `git reset --hard`로 원복, 잔재 worktree는 `.nerve/scratch/orphaned-worktrees/`(0600)로 격리, doctor 고아 검사 (§3 Tier 2d "트랜잭션 보장" 참조) |
+| Tier 2d worktree: symlink escape | symlink escape — lead 어댑터가 worktree 브랜치에 `escape -> ../../main/.git/config` 같은 symlink 커밋 후 머지 시 main `.git/config`·인증 토큰 경로 변조 | 머지 직전 `git diff --name-only main-pre.ref HEAD` + `symlink_metadata().is_symlink()` + `canonicalize()` prefix 검사, 발견 시 머지 거부+격리 (§3 Tier 2d sec-5 5항 참조) |
+| Tier 2d worktree: disk full | disk full로 트랜잭션 abort 불가 — `main-pre.ref` 쓰기 ENOSPC 시 트랜잭션 시작도 못 함 | `statvfs(.nerve/)` 사전 검사(임계 100 MiB) + `ApplyError::DiskFull` 분리 + doctor 잔량 임계 검사 (§3 Tier 2d sec-5 6항 참조) |
+| Tier 2d worktree: reset 실패 | `git reset --hard` 자체 실패(read-only fs/immutable flag/ACL/AppleDouble) 시 main partial state 잔재 | `git reset --merge` 폴백 → `git bundle create` 백업 → RED 경고 + `nv doctor --recover`, 잔재 worktree `mv` 실패 시 in-place chmod 0600 + manifest 기록 (§3 Tier 2d sec-5 7항 참조) |
+| Tier 2e RPC: 외부 호환성 | 외부 컨슈머 호환성 | 이벤트에 `version` 필드 + unknown type ignore 가이드 |
+| Tier 2e RPC: 누설 | `stdout_chunk`/`goal_check.output`이 prompt·시크릿·파일 경로 그대로 노출, multi-instance에서 컨슈머 격리 부재 | Unix socket 0600 (TCP 사용 시 토큰 인증) + raw 본문 opt-in + 시크릿 정규식 마스킹 + 경로 정규화 + Mode C patrol별 socket 격리 (§3 Tier 2e "보안" 참조) |
+| Tier 2e RPC: DoS | slow consumer + 거대 payload buffering으로 daemon OOM, Mode C에서 patrol간 cascade hang | per-event hard cap 64 KiB(초과 시 head/tail 256B + truncated metadata) + per-consumer bounded channel 1024 events + oldest-drop + `dropped_count` metric (§3 Tier 2e sec-4 6항 참조) |
+| Tier 2e RPC: schema migration | major schema migration 절차 부재 — `lead_agent` 필드 의미 변경/downgrade 호환 미정 | envelope `{schema_version, kind, payload}` semver 고정 — minor=필드 추가+ignore, major=handshake downgrade/거부, v0.2.0=v1.0 envelope 고정 (§3 Tier 2e sec-4 7항 참조) |
+| Tier 2e RPC: 토큰 lifecycle | bearer 토큰 lifecycle 부재 — 발급/저장/회전/누설 대응 미정 → 장기 세션 토큰 누설 확대 | 32B 랜덤 + `.nerve/session-meta/rpc-token`(0600) + 데몬 종료 시 삭제 + `--print-token` opt-in + `nv rpc rotate-token` 수동, Mode C patrol별 분리 (§3 Tier 2e sec-4 8항 참조) |
+| Tier 2e RPC: 마스킹 bypass | 토큰 분할/base64-hex 인코딩/신규 provider 패턴/JSONL log injection bypass | sliding-window(64자) 매칭 + Shannon entropy ≥ 4.5 휴리스틱 + `secret_patterns` config 확장(`sk-ant-`/`vrcl_`/`org-`/GCP SA JSON) + serde JSON string escape로 JSONL invariant 강제 (§3 Tier 2e sec-4 3항 확장 참조) |
+| Tier 2f /plan: read-only 무시 | lead가 read-only 분석을 무시하고 patch 생성 시도 | prompt prefix("write a plan only")를 hard refuse하는 reviewer 룰 추가 + dry-run 강제 |
+| Tier 2g /budget: cost 추정 | 부정확한 cost_microusd 추정 | adapter usage 파서에 fallback (`0`이면 token×요금표) + 경고 로그 |
+| Tier 2g /budget: 권한 | 사용자가 `/budget cost=$10000`처럼 임의 raising → global cap 무력화, Mode C에서 patrol이 sub-budget 우회 | raising은 글로벌 ceiling 강제 + `--force` 시 인터랙티브 확인, Mode C patrol은 Mayor sub-budget 위로 raising 거부, `.nerve/session-meta/budget-audit.json`에 변경 감사 (§3 Tier 2g "권한 모델" 참조) |
+| Tier 2g /budget: 입력 sanity | 음수/NaN/0/단위 누락/빈 값/decimal 변환 실패로 cap 우회 또는 즉시 종료 트랩 | 파서가 음수·NaN 거부 + `cost=$0`/`tokens=0` 거부(config 일관) + 단위(`$`/`tokens`) 명시 필수 + decimal microusd 변환 실패 시 `InvalidValue` + doctor 시작 시 sane 검사 (§3 Tier 2g sec-3 5항 참조) |
+| Tier 2g /budget: 감사 위변조 | audit log 직접 편집/삭제/truncate로 raising 흔적 은폐 — 외부 LLM CLI(claude/codex)는 NvPatch 블랙리스트를 우회 | `.nerve/session-meta/budget-audit.json` append-only + `prev_hash` SHA-256 hash chain + doctor chain integrity 검사(깨졌으면 RED 경고) (§3 Tier 2g sec-3 6항 참조) |
+| Tier 2g /budget: 동시성 | concurrent `/budget` race (lost update + audit/한도 drift + partial JSON) | `.nerve/session-meta/budget.lock` advisory lock 직렬화 + atomic write(`store.rs::write_json_atomic`) + lock 5초 timeout 시 경고, Mode C Mayor/patrol 공유 lock (§3 Tier 2g sec-3 7항 참조) |
+| Tier 3g ratatui: 의존성 | 의존성 트리 증가 | feature gate (`--features tui`)로 옵션화 |
+| Tier 3h fork/branch: 인덱스 충돌 | session fork 시 patch 인덱스 키 충돌 | `.nerve/sessions/<parent>/<child>.json` 트리 + patch index에 `session_id` 컬럼 추가 |
+| Tier 3i MCP: 외부 도구 노출 | 외부 MCP 서버가 dangerous tool(`shell`/`fs`)을 reviewer에게 노출 | reviewer adapter는 read-only MCP whitelist만 통과 + `tool.allowed` 설정 |
+| Tier 3j Mayor/Patrol: 토큰 폭주 | 다중 인증 토큰 폭주 | `/budget` global cap 필수 선결 + patrol당 sub-budget |
 
 ---
 
