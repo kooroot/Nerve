@@ -116,13 +116,13 @@ Huntley의 'ralph wiggum as a software engineer'에서 비롯되어 Cherny 발�
 - Reviewer `Verdict::LGTM` ⇔ validator pass
 - Reviewer `Verdict::Block` ⇔ validator hard fail (단독 종료 강제)
 - Reviewer `Verdict::RequestChanges` ⇔ validator soft fail → REPEAT
-- `Verdict::Block` + `RunReport.no_progress=true` 플래그 ⇔ No-progress
+- `Verdict::Block` + `RunReport.no_progress_exceeded=true` 플래그 ⇔ No-progress
   강제 종료 (신규 enum 변형 없이 기존 Block 재사용, 결정표는 §3 Tier 1b
   "Verdict × CheckResult 결정표" 참조)
 
 단, `Verdict::Block`은 budget cap 초과 및 no-progress 강제 종료에도 재사용된다
 (§3 Tier 2g, §3 Tier 1b ma-1 참조; `nerve-core/src/lib.rs:408`). 세 경우는
-`RunReport.budget_exceeded` / `no_progress` 플래그로 구분되며, 사용자 표면
+`RunReport.budget_exceeded` / `no_progress_exceeded` 플래그로 구분되며, 사용자 표면
 (`/status`, 상태 바)에서 (1) "검증 실패로 인한 Block", (2) "예산 초과로 인한
 Block", (3) "no-progress로 인한 Block"의 세 라벨로 보이도록 §3 Tier 1a·1b·2g가
 함께 다룬다.
@@ -668,7 +668,7 @@ nv template list|run
 - **Cherny 3가지 정지 조건 매핑** (§0.5.3):
   - Max iteration → `max_refinement_rounds` (현행 유지, hard ceiling)
   - **No-progress detection (신규)** → 연속 2라운드 동안 patch hash가
-    동일하면 **`Verdict::Block` + `RunReport.no_progress=true` 플래그**
+    동일하면 **`Verdict::Block` + `RunReport.no_progress_exceeded=true` 플래그**
     조합으로 강제 종료 (별도 Verdict 변형 추가 금지 — 호환 가드 ma-1 참조).
     `RoundRecord`에 `patch_sha` 필드 추가
     - **호환 가드**: `RoundRecord`는 현재 `#[serde(default)]` 미적용
@@ -680,7 +680,7 @@ nv template list|run
     - **patch_sha 출처**: hash 입력은 `select_final_patch`의 출력
       (`nerve-core/src/lib.rs:573-580`) 기준. `ConflictPolicy::ReviewerPriority`
       또는 `MergeAttempt` 정책에서 lead patch가 매 라운드 달라져도 reviewer가
-      동일 final_patch에 수렴하면 `no_progress=true` 플래그가 세팅된다
+      동일 final_patch에 수렴하면 `no_progress_exceeded=true` 플래그가 세팅된다
       (ma-1 호환 가드 참조). 단일 필드만으로 충분.
     - **정규화 규칙 (필수)**: hash 계산 전 `files`를 path 기준 정렬 → 각 파일의
       `path` + LF로 통일된 `modified` 내용만 직렬화 → SHA-256. `original_sha256`/
@@ -690,7 +690,8 @@ nv template list|run
       헬퍼 신설 권장.
   - Budget cap → §2g(`/budget`)에서 별도 처리
 - **구현 위치**:
-  - `crates/nerve-config/src/lib.rs`에 `GoalSpec { check_cmd, success_pattern, max_no_progress }`
+  - `crates/nerve-config/src/lib.rs`에
+    `GoalSpec { id, check_cmd, timeout_secs, cwd, env, no_progress_max }`
     타입 추가
   - `crates/nerve-core/src/lib.rs`의 `run_synaptic_loop` 종료 조건 hook
   - `/goal` 슬래시 명령 핸들러는 `main.rs`의 match-name 블록(약 1240–1393,
@@ -730,10 +731,10 @@ nv template list|run
      고갈은 argv 강제·timeout만으로 차단되지 않는 표면이므로 minor 가드로 명시.
 
 - **Verdict 호환 가드 (ma-1)**: No-progress 종료는 신규 enum 변형을 만들지
-  않고 **기존 `Verdict::Block` + `RunReport.no_progress=true` 플래그** 패턴을
+  않고 **기존 `Verdict::Block` + `RunReport.no_progress_exceeded=true` 플래그** 패턴을
   쓴다(§0.5.4 매핑표 4번째 행 참조). 같은 `Block`이라도 (a) reviewer hard fail,
   (b) budget exceeded(`RunReport.budget_exceeded=true`), (c) no-progress
-  (`RunReport.no_progress=true`) 세 경우는 플래그로 구분되어 §3 Tier 1a 상태 바
+  (`RunReport.no_progress_exceeded=true`) 세 경우는 플래그로 구분되어 §3 Tier 1a 상태 바
   종료 사유 라벨에 다르게 표시된다.
 
 - **Evaluator 책임 분리 (ma-2)**: `GoalSpec` 타입은 `nerve-config`에 두고,
@@ -757,7 +758,7 @@ nv template list|run
 
   본 결정표는 **reviewer-emitted Verdict**에 한정된다. no-progress / budget
   exceeded로 인한 Block은 결정표 외부에서 orchestrator가 합성하며, ma-1 호환
-  가드의 플래그(`no_progress` / `budget_exceeded`)로 구분된다.
+  가드의 플래그(`no_progress_exceeded` / `budget_exceeded`)로 구분된다.
 
   `Block`은 단독으로 종료를 강제한다 (§0.5.4 참조).
 
