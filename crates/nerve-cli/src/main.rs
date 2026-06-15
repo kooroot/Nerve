@@ -31,6 +31,8 @@ use std::time::Instant;
 use tokio::io::{self, AsyncBufReadExt};
 use tokio::sync::{broadcast, watch};
 
+const SURFACE_WIDTH: usize = 78;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "nv",
@@ -2010,6 +2012,7 @@ async fn run_interactive_lines(state: &mut InteractiveState) -> Result<()> {
         let Some(line) = lines.next_line().await? else {
             break;
         };
+        println!();
         if process_interactive_input(line.trim_end(), state, &mut paste_lines).await? {
             break;
         }
@@ -2576,27 +2579,110 @@ impl InteractiveState {
     }
 }
 
+fn color_enabled() -> bool {
+    std::io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
+}
+
+fn paint(code: &str, value: impl AsRef<str>) -> String {
+    let value = value.as_ref();
+    if color_enabled() {
+        format!("\x1b[{code}m{value}\x1b[0m")
+    } else {
+        value.to_string()
+    }
+}
+
+fn accent(value: impl AsRef<str>) -> String {
+    paint("1;36", value)
+}
+
+fn muted(value: impl AsRef<str>) -> String {
+    paint("2", value)
+}
+
+fn success(value: impl AsRef<str>) -> String {
+    paint("1;32", value)
+}
+
+fn warn(value: impl AsRef<str>) -> String {
+    paint("1;33", value)
+}
+
+fn error_style(value: impl AsRef<str>) -> String {
+    paint("1;31", value)
+}
+
+fn visible_len(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn fit_line(value: &str, width: usize) -> String {
+    if visible_len(value) <= width {
+        return value.to_string();
+    }
+    if width <= 1 {
+        return "…".to_string();
+    }
+    let mut out: String = value.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn print_box(title: &str, lines: &[String]) {
+    let inner = SURFACE_WIDTH.saturating_sub(2);
+    let title_text = format!(" {title} ");
+    let title_len = visible_len(&title_text);
+    let dash_len = inner.saturating_sub(title_len);
+    println!("╭{}{}╮", title_text, "─".repeat(dash_len));
+    for line in lines {
+        let fitted = fit_line(line, inner.saturating_sub(2));
+        let pad = inner.saturating_sub(2).saturating_sub(visible_len(&fitted));
+        println!("│ {}{} │", fitted, " ".repeat(pad));
+    }
+    println!("╰{}╯", "─".repeat(inner));
+}
+
+fn print_command_section(title: &str, commands: &[(&str, &str)]) {
+    let mut lines = Vec::with_capacity(commands.len() + 2);
+    lines.push("command                         action".to_string());
+    lines.push("───────                         ──────".to_string());
+    for (command, description) in commands {
+        lines.push(format!("  {command:<30} {description}"));
+    }
+    print_box(title, &lines);
+}
+
 fn print_interactive_banner(state: &InteractiveState) {
-    println!("┌─ Nerve Terminal ─────────────────────────────────────────────┐");
-    println!("│ Lead/reviewer coding loop with reviewed, auditable patches.  │");
-    println!("│ Type a task, /paste multiline input, or !cmd for shell.      │");
-    println!("│ Then inspect with /diff, /apply, /rollback, or /history.     │");
-    println!("└──────────────────────────────────────────────────────────────┘");
+    print_box(
+        "Nerve Terminal",
+        &[
+            "Lead writes. Reviewer blocks. Nerve applies only reviewed patches.".to_string(),
+            "Type a task, use /paste for long input, or run !cmd in this workspace.".to_string(),
+            "Inspect with /diff, commit intent with /apply, recover with /rollback.".to_string(),
+        ],
+    );
     print_interactive_status(state);
 }
 
 fn print_interactive_status(state: &InteractiveState) {
     let branch = git_branch_label(env::current_dir().ok().as_deref()).unwrap_or_else(|| "-".into());
-    println!(
-        "adapter={} mode={} branch={} sessions={} patches={} cwd={}",
-        state.adapter_label(),
-        state.apply_label(),
-        branch,
-        state.session_count,
-        state.patch_count,
-        env::current_dir()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|_| "?".to_string())
+    let cwd = env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    print_box(
+        "Workspace",
+        &[
+            format!(
+                "adapter={} mode={} branch={}",
+                state.adapter_label(),
+                state.apply_label(),
+                branch
+            ),
+            format!(
+                "sessions={} patches={} cwd={}",
+                state.session_count, state.patch_count, cwd
+            ),
+        ],
     );
     print_status_bar(state);
 }
@@ -2622,18 +2708,30 @@ fn render_status_bar(state: &InteractiveState) -> String {
     } else {
         format!("round {}/{}", state.last_round_count, state.last_max_rounds)
     };
-    let verdict_label = format!("verdict={}", state.last_verdict_label());
+    let verdict_value = state.last_verdict_label();
+    let verdict_label = match verdict_value {
+        "lgtm" => success("verdict lgtm"),
+        "changes" => warn("verdict changes"),
+        value if value.starts_with("block") => error_style(format!("verdict {value}")),
+        _ => "verdict -".to_string(),
+    };
     let total_tokens = state
         .cumulative_input_tokens
         .saturating_add(state.cumulative_output_tokens);
     let cost_label = format_cost_microusd(state.cumulative_cost_microusd);
     let goal_label = match state.active_goal.as_ref() {
-        Some(spec) => format!("goal={}", spec.id),
-        None => "goal=-".to_string(),
+        Some(spec) => format!("goal {}", spec.id),
+        None => "goal -".to_string(),
     };
     format!(
-        "[status] {} | {} | cost={} | tokens={} | {} | no-progress={}",
-        round_label, verdict_label, cost_label, total_tokens, goal_label, state.no_progress_counter
+        "{}  {}  │  {}  │  cost {}  │  tokens {}  │  {}  │  no-progress {}",
+        muted("status"),
+        round_label,
+        verdict_label,
+        cost_label,
+        total_tokens,
+        goal_label,
+        state.no_progress_counter
     )
 }
 
@@ -2660,14 +2758,14 @@ fn interactive_prompt(state: &InteractiveState) -> String {
         .as_deref()
         .map(|id| format!(" session={}", short_id(id)))
         .unwrap_or_default();
-    format!(
+    accent(format!(
         "nerve:{}:{}{}{}{}> ",
         state.adapter_label(),
         state.apply_label(),
         branch_hint,
         session_hint,
         patch_hint
-    )
+    ))
 }
 
 fn print_interactive_error(error: &anyhow::Error) {
@@ -3129,49 +3227,107 @@ async fn handle_patrol_slash(args: Vec<&str>, cwd: &Path) -> Result<()> {
 }
 
 fn print_interactive_help() {
-    println!("Tasks:");
-    println!("  type a coding request to run the lead/reviewer loop");
-    println!("  /paste                 enter a multiline task; finish with /end");
-    println!("  !<command>             run a shell command in the current workspace");
-    println!("Workflow:");
-    println!("  /diff                  show the last reviewed patch");
-    println!("  /apply [patch-id]      apply the last or selected patch");
-    println!("  /rollback [patch-id]   roll back the last or selected patch");
-    println!("  /history               show recent sessions");
-    println!("  /resume <id>           print a stored session report");
-    println!("  /list                  list stored patches");
-    println!("Workspace:");
-    println!("  /status                show adapter, mode, branch, counts, cwd");
-    println!("  /mode <dry-run|apply>  switch apply behavior without restarting");
-    println!("  /adapter <real|mock>   switch providers without restarting");
-    println!("  /cd <path>             change workspace directory");
-    println!("  /pwd                   print workspace directory");
-    println!("  /clear                 redraw the terminal workspace");
-    println!("Setup:");
-    println!("  /login                 start provider login flows");
-    println!("  /doctor                inspect config, adapters, and auth");
-    println!("  /templates [query]     list or search prompt templates");
-    println!("  /template <id> [args]  run a prompt template");
-    println!("  /benchmark pi [n]      run the Pi workflow benchmark");
-    println!("Fork & multi-instance (v1.0):");
-    println!("  /fork [--from-round N] [--name NAME]  branch the current session");
-    println!("  /mcp list | call <s> <t> <json>      inspect or dispatch MCP tools");
-    println!("  /mayor status                        show queue depth + active patrols");
-    println!("  /patrol status                       show local heartbeat + queue");
-    println!("Loop controls:");
-    println!("  /plan <task>           run read-only plan analysis (never patches)");
-    println!("  /goal <argv...>        register a deterministic stop check_cmd");
-    println!("  /goal :nl <prose>      LLM-convert natural language into a check_cmd");
-    println!("  /goal \"<prose>\"        quoted form of :nl (must be the entire argument)");
-    println!("  /goal show | clear     inspect or remove the active goal");
-    println!("  /budget show           show current cap, cumulative, and remaining");
-    println!("  /budget cost=$X        cap session cost (microusd-aware)");
-    println!("  /budget tokens=N       cap session total tokens");
-    println!("  /quit                  exit");
-    println!("Tips:");
-    println!("  type / to open the command palette");
-    println!("  use Up/Down for history or command selection");
-    println!("  use Tab or Right to complete a selected command");
+    print_box(
+        "Command Map",
+        &[
+            "Type a request to start the lead/reviewer loop for this workspace.".to_string(),
+            "Slash commands operate on the active session; shell commands start with !."
+                .to_string(),
+            "Use /clear to redraw this surface after long output.".to_string(),
+        ],
+    );
+    print_command_section(
+        "Tasks",
+        &[
+            ("request text", "run the lead/reviewer loop"),
+            ("/paste", "enter multiline input; finish with /end"),
+            ("!<command>", "run a shell command in the workspace"),
+        ],
+    );
+    print_command_section(
+        "Review",
+        &[
+            ("/diff", "show the last reviewed patch"),
+            ("/apply [patch-id]", "apply the last or selected patch"),
+            (
+                "/rollback [patch-id]",
+                "roll back the last or selected patch",
+            ),
+            ("/history", "show recent sessions"),
+            ("/resume <id>", "print a stored session report"),
+            ("/list", "list stored patches"),
+        ],
+    );
+    print_command_section(
+        "Workspace",
+        &[
+            ("/status", "show adapter, mode, branch, counts, cwd"),
+            (
+                "/mode <dry-run|apply>",
+                "switch apply behavior without restarting",
+            ),
+            (
+                "/adapter <real|mock>",
+                "switch providers without restarting",
+            ),
+            ("/cd <path>", "change workspace directory"),
+            ("/pwd", "print workspace directory"),
+            ("/clear", "redraw the terminal workspace"),
+        ],
+    );
+    print_command_section(
+        "Setup",
+        &[
+            ("/login", "start provider login flows"),
+            ("/doctor", "inspect config, adapters, and auth"),
+            ("/templates [query]", "list or search prompt templates"),
+            ("/template <id> [args]", "run a prompt template"),
+            ("/benchmark pi [n]", "run the Pi workflow benchmark"),
+        ],
+    );
+    print_command_section(
+        "Multi-Instance",
+        &[
+            (
+                "/fork [--from-round N] [--name NAME]",
+                "branch the current session",
+            ),
+            (
+                "/mcp list | call <s> <t> <json>",
+                "inspect or dispatch MCP tools",
+            ),
+            ("/mayor status", "show queue depth + active patrols"),
+            ("/patrol status", "show local heartbeat + queue"),
+        ],
+    );
+    print_command_section(
+        "Loop Controls",
+        &[
+            ("/plan <task>", "run read-only plan analysis"),
+            ("/goal <argv...>", "register a deterministic stop check_cmd"),
+            (
+                "/goal :nl <prose>",
+                "LLM-convert natural language into a check_cmd",
+            ),
+            (
+                "/goal \"<prose>\"",
+                "quoted form of :nl for the whole argument",
+            ),
+            ("/goal show | clear", "inspect or remove the active goal"),
+            ("/budget show", "show cap, cumulative, and remaining"),
+            ("/budget cost=$X", "cap session cost"),
+            ("/budget tokens=N", "cap session total tokens"),
+            ("/quit", "exit"),
+        ],
+    );
+    print_box(
+        "Keys",
+        &[
+            "type / to open the command palette".to_string(),
+            "use Up/Down for history or command selection".to_string(),
+            "use Tab or Right to complete a selected command".to_string(),
+        ],
+    );
 }
 
 fn resolve_workspace_path(target: &str, cwd: &Path) -> PathBuf {
@@ -4735,49 +4891,93 @@ fn print_events(events: &[AgentEvent]) {
     }
 }
 
+fn push_panel_text(lines: &mut Vec<String>, value: &str) {
+    let value = truncate_panel_text(value);
+    let mut wrote_line = false;
+    for line in value.lines() {
+        wrote_line = true;
+        if line.trim().is_empty() {
+            lines.push("  ".to_string());
+        } else {
+            lines.push(format!("  {line}"));
+        }
+    }
+    if !wrote_line {
+        lines.push("  -".to_string());
+    }
+}
+
 fn print_tui_report(report: &RunReport) {
-    println!("Nerve TUI {}", report.task.id);
-    println!("{}", "=".repeat(72));
-    println!("[ Lead ]");
-    println!("agent: {}", report.final_output.agent_id);
-    println!("{}", truncate_panel_text(&report.final_output.raw_text));
+    print_box(
+        "Nerve TUI",
+        &[
+            format!("session {}", report.task.id),
+            format!(
+                "profile {}  rounds {}  verdict {:?}",
+                report.selection.id.as_deref().unwrap_or("default"),
+                report.rounds.len(),
+                report.final_feedback.verdict
+            ),
+            format!(
+                "applied {}  blocked {}  budget_exceeded {}",
+                report.applied, report.blocked, report.budget_exceeded
+            ),
+        ],
+    );
+
+    let mut lead_lines = vec![
+        format!("agent {}", report.final_output.agent_id),
+        "output".to_string(),
+    ];
+    push_panel_text(&mut lead_lines, &report.final_output.raw_text);
     if let Some(patch) = &report.final_patch {
-        println!("patch: {} file(s), id={}", patch.files.len(), patch.id);
+        lead_lines.push(format!(
+            "patch {} file(s), id {}",
+            patch.files.len(),
+            patch.id
+        ));
     } else {
-        println!("patch: none");
+        lead_lines.push("patch none".to_string());
     }
-    println!("{}", "-".repeat(72));
-    println!("[ Reviewer ]");
-    println!(
-        "agent: {} | verdict: {:?}",
+    print_box("[ Lead ]", &lead_lines);
+
+    let mut reviewer_lines = vec![format!(
+        "agent {}  verdict {:?}",
         report.final_feedback.reviewer_id, report.final_feedback.verdict
-    );
-    println!("{}", truncate_panel_text(&report.final_feedback.raw_text));
+    )];
+    push_panel_text(&mut reviewer_lines, &report.final_feedback.raw_text);
     if !report.crossfire_feedback.is_empty() {
-        println!("crossfire events: {}", report.crossfire_feedback.len());
+        reviewer_lines.push(format!(
+            "crossfire events {}",
+            report.crossfire_feedback.len()
+        ));
     }
-    println!("{}", "-".repeat(72));
-    println!("[ Orchestrator ]");
-    println!(
-        "profile={} rounds={} applied={} blocked={} budget_exceeded={}",
-        report.selection.id.as_deref().unwrap_or("default"),
-        report.rounds.len(),
-        report.applied,
-        report.blocked,
-        report.budget_exceeded
+    print_box("[ Reviewer ]", &reviewer_lines);
+
+    print_box(
+        "[ Orchestrator ]",
+        &[
+            format!(
+                "profile {}  rounds {}",
+                report.selection.id.as_deref().unwrap_or("default"),
+                report.rounds.len()
+            ),
+            format!(
+                "usage input {}  output {}  total {}",
+                report.usage.input_tokens,
+                report.usage.output_tokens,
+                report.usage.total_tokens()
+            ),
+            format!(
+                "cost_microusd {}",
+                report
+                    .usage
+                    .estimated_cost_microusd
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            ),
+        ],
     );
-    println!(
-        "usage: input={} output={} total={} cost_microusd={}",
-        report.usage.input_tokens,
-        report.usage.output_tokens,
-        report.usage.total_tokens(),
-        report
-            .usage
-            .estimated_cost_microusd
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "-".to_string())
-    );
-    println!("{}", "=".repeat(72));
 }
 
 fn truncate_panel_text(value: &str) -> String {
