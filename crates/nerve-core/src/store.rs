@@ -401,6 +401,8 @@ mod tests {
             events: Vec::new(),
             usage: Default::default(),
             budget_exceeded: false,
+            no_progress_exceeded: false,
+            goal_satisfied: None,
             applied: false,
             blocked: false,
         };
@@ -440,6 +442,8 @@ mod tests {
             events: Vec::new(),
             usage: Default::default(),
             budget_exceeded: false,
+            no_progress_exceeded: false,
+            goal_satisfied: None,
             applied: false,
             blocked: false,
         };

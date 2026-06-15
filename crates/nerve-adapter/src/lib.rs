@@ -6,8 +6,29 @@ use nerve_types::{
 };
 use serde_json::{Map, Value};
 use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
+use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
+
+/// Default subprocess wall-clock timeout (5 minutes). Wraps both Claude and Codex
+/// adapter invocations to prevent runaway LLM CLIs from hanging Nerve.
+pub const DEFAULT_ADAPTER_TIMEOUT_SECS: u64 = 300;
+
+/// Default per-stream output cap (16 MiB) applied to both stdout and stderr.
+/// Exceeding this kills the child and surfaces `AdapterError::OutputTooLarge`.
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Error)]
+pub enum AdapterError {
+    #[error("adapter timed out after {secs}s")]
+    Timeout { secs: u64 },
+    #[error("adapter output exceeded limit of {limit_bytes} bytes")]
+    OutputTooLarge { limit_bytes: usize },
+}
 
 #[async_trait]
 pub trait ModelAdapter: Send + Sync {
@@ -84,7 +105,7 @@ impl ModelAdapter for MockAdapter {
     ) -> Result<AgentOutput> {
         send_stdout(&tx, self.id(), "mock lead produced initial patch").await;
         let patch = NvPatch::new(vec![FilePatch::create(
-            ".nerve/mock-output.txt",
+            "mock-output.txt",
             format!("Task: {}\nStatus: initial\n", task.prompt),
         )]);
         Ok(AgentOutput::with_patch(
@@ -136,7 +157,7 @@ impl ModelAdapter for MockAdapter {
     ) -> Result<AgentOutput> {
         send_stdout(&tx, self.id(), "mock lead refined patch").await;
         let patch = NvPatch::new(vec![FilePatch::create(
-            ".nerve/mock-output.txt",
+            "mock-output.txt",
             format!(
                 "Task: {}\nStatus: refined\nReviewer: {}\n",
                 task.prompt, feedback.raw_text
@@ -155,6 +176,8 @@ pub struct SubprocessAdapter {
     id: String,
     command: String,
     args: Vec<String>,
+    timeout_secs: u64,
+    max_output_bytes: usize,
 }
 
 impl SubprocessAdapter {
@@ -163,7 +186,21 @@ impl SubprocessAdapter {
             id: id.into(),
             command: command.into(),
             args,
+            timeout_secs: DEFAULT_ADAPTER_TIMEOUT_SECS,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
+    }
+
+    /// Override the wall-clock timeout applied to each adapter invocation.
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout_secs = secs;
+        self
+    }
+
+    /// Override the per-stream output cap (bytes) before the child is killed.
+    pub fn with_max_output_bytes(mut self, bytes: usize) -> Self {
+        self.max_output_bytes = bytes;
+        self
     }
 
     pub fn claude_code() -> Self {
@@ -205,28 +242,79 @@ impl SubprocessAdapter {
             .map(|arg| arg.replace("{prompt}", &prompt))
             .collect::<Vec<_>>();
 
-        let output = Command::new(&self.command)
+        // Detach the child from the parent TTY: stdin null, stdout/stderr piped
+        // so we can stream-cap them. Without Stdio::null on stdin, a raw-TTY
+        // parent could leak keystrokes into the spawned LLM CLI.
+        let mut child = Command::new(&self.command)
             .args(args)
             .current_dir(cwd)
-            .output()
-            .await
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .with_context(|| format!("failed to spawn `{}` adapter", self.id))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout_pipe = child
+            .stdout
+            .take()
+            .context("subprocess stdout pipe unavailable")?;
+        let stderr_pipe = child
+            .stderr
+            .take()
+            .context("subprocess stderr pipe unavailable")?;
 
-        for line in stdout.lines() {
-            send_stdout(tx, self.id(), line).await;
-        }
-        for line in stderr.lines() {
-            send_stderr(tx, self.id(), line).await;
-        }
+        let drain = async {
+            // try_join short-circuits on the first error so a single overflowing
+            // stream doesn't block forever on the still-live partner stream.
+            let (stdout, stderr) = tokio::try_join!(
+                drain_stream(
+                    stdout_pipe,
+                    self.id.clone(),
+                    self.max_output_bytes,
+                    tx.clone(),
+                    StreamKind::Stdout,
+                ),
+                drain_stream(
+                    stderr_pipe,
+                    self.id.clone(),
+                    self.max_output_bytes,
+                    tx.clone(),
+                    StreamKind::Stderr,
+                ),
+            )?;
+            Ok::<_, anyhow::Error>((stdout, stderr))
+        };
 
-        if !output.status.success() {
+        let (stdout, stderr) = match timeout(Duration::from_secs(self.timeout_secs), drain).await {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(drain_err)) => {
+                // One of the drains failed (e.g., output cap exceeded). Kill the
+                // child so the partner drain doesn't hang and so the LLM CLI
+                // doesn't keep burning quota.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(drain_err);
+            }
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(AdapterError::Timeout {
+                    secs: self.timeout_secs,
+                }
+                .into());
+            }
+        };
+
+        let status = child
+            .wait()
+            .await
+            .with_context(|| format!("failed to await `{}` adapter exit status", self.id))?;
+
+        if !status.success() {
             anyhow::bail!(
                 "adapter `{}` exited with status {}: {}",
                 self.id,
-                output.status,
+                status,
                 stderr.trim()
             );
         }
@@ -238,6 +326,80 @@ impl SubprocessAdapter {
             .await;
 
         Ok(stdout)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
+/// Read a child stream, forwarding complete lines to the event channel while
+/// enforcing `max_bytes`. The cap is checked on raw chunks, not line boundaries,
+/// so a single unterminated line cannot grow without bound.
+async fn drain_stream<R>(
+    mut reader: R,
+    agent_id: String,
+    max_bytes: usize,
+    tx: mpsc::Sender<AgentEvent>,
+    kind: StreamKind,
+) -> Result<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffered = Vec::new();
+    let mut pending_line = Vec::new();
+    let mut chunk = [0_u8; 8192];
+
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .await
+            .with_context(|| format!("failed to read {:?} from `{}` adapter", kind, agent_id))?;
+        if n == 0 {
+            break;
+        }
+        if buffered.len().saturating_add(n) > max_bytes {
+            return Err(AdapterError::OutputTooLarge {
+                limit_bytes: max_bytes,
+            }
+            .into());
+        }
+        buffered.extend_from_slice(&chunk[..n]);
+
+        for byte in &chunk[..n] {
+            if *byte == b'\n' {
+                emit_stream_line(&tx, &agent_id, kind, &pending_line).await;
+                pending_line.clear();
+            } else {
+                pending_line.push(*byte);
+            }
+        }
+    }
+
+    if !pending_line.is_empty() {
+        emit_stream_line(&tx, &agent_id, kind, &pending_line).await;
+    }
+
+    Ok(String::from_utf8_lossy(&buffered).into_owned())
+}
+
+async fn emit_stream_line(
+    tx: &mpsc::Sender<AgentEvent>,
+    agent_id: &str,
+    kind: StreamKind,
+    raw_line: &[u8],
+) {
+    let line = if raw_line.ends_with(b"\r") {
+        &raw_line[..raw_line.len().saturating_sub(1)]
+    } else {
+        raw_line
+    };
+    let line = String::from_utf8_lossy(line);
+    match kind {
+        StreamKind::Stdout => send_stdout(tx, agent_id, &line).await,
+        StreamKind::Stderr => send_stderr(tx, agent_id, &line).await,
     }
 }
 
@@ -295,6 +457,14 @@ impl ModelAdapter for SubprocessAdapter {
 }
 
 pub fn default_adapters(mock: bool) -> Vec<Box<dyn ModelAdapter>> {
+    default_adapters_with_limits(mock, None, None)
+}
+
+pub fn default_adapters_with_limits(
+    mock: bool,
+    timeout_secs: Option<u64>,
+    max_output_bytes: Option<usize>,
+) -> Vec<Box<dyn ModelAdapter>> {
     if mock {
         vec![
             Box::new(MockAdapter::lead()),
@@ -302,10 +472,32 @@ pub fn default_adapters(mock: bool) -> Vec<Box<dyn ModelAdapter>> {
         ]
     } else {
         vec![
-            Box::new(SubprocessAdapter::claude_code()),
-            Box::new(SubprocessAdapter::codex()),
+            Box::new(apply_adapter_limits(
+                SubprocessAdapter::claude_code(),
+                timeout_secs,
+                max_output_bytes,
+            )),
+            Box::new(apply_adapter_limits(
+                SubprocessAdapter::codex(),
+                timeout_secs,
+                max_output_bytes,
+            )),
         ]
     }
+}
+
+fn apply_adapter_limits(
+    mut adapter: SubprocessAdapter,
+    timeout_secs: Option<u64>,
+    max_output_bytes: Option<usize>,
+) -> SubprocessAdapter {
+    if let Some(secs) = timeout_secs {
+        adapter = adapter.with_timeout_secs(secs);
+    }
+    if let Some(bytes) = max_output_bytes {
+        adapter = adapter.with_max_output_bytes(bytes);
+    }
+    adapter
 }
 
 fn feedback_from_text(reviewer_id: &str, raw_text: String) -> ReviewerFeedback {
@@ -769,6 +961,35 @@ Lead notes before the patch.
 
         assert!(adapter.args.contains(&"--skip-git-repo-check".to_string()));
         assert!(adapter.args.contains(&"--json".to_string()));
+    }
+
+    #[test]
+    fn adapter_limits_are_applied_to_real_adapters() {
+        let adapter = apply_adapter_limits(SubprocessAdapter::codex(), Some(7), Some(11));
+
+        assert_eq!(adapter.timeout_secs, 7);
+        assert_eq!(adapter.max_output_bytes, 11);
+    }
+
+    #[tokio::test]
+    async fn drain_stream_caps_unterminated_lines() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (tx, _rx) = mpsc::channel(4);
+        let drain = tokio::spawn(drain_stream(
+            reader,
+            "fixture".to_string(),
+            8,
+            tx,
+            StreamKind::Stdout,
+        ));
+
+        writer.write_all(b"0123456789").await.unwrap();
+        drop(writer);
+
+        let err = drain.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("exceeded"));
     }
 
     #[test]

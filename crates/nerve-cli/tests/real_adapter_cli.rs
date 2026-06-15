@@ -108,6 +108,51 @@ JSON
     );
 }
 
+#[test]
+fn real_adapter_fixture_honors_configured_output_cap() {
+    let fixture = RealAdapterFixture::with_scripts(
+        Some(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 0,
+                "conflict_policy": "lead_priority",
+                "adapter_max_output_bytes": 8
+              },
+              "roles": {
+                "architect": "claude-code",
+                "reviewer": "codex"
+              },
+              "profiles": []
+            }"#,
+        ),
+        r#"#!/bin/sh
+printf '0123456789'
+"#,
+        r#"#!/bin/sh
+printf '%s\n' 'LGTM: should not run'
+"#,
+    );
+
+    let output = fixture
+        .command()
+        .args(["--adapter", "real", "overflow adapter output"])
+        .output()
+        .expect("failed to run nv binary");
+
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("adapter output exceeded"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 struct RealAdapterFixture {
     _tempdir: tempfile::TempDir,
     cwd: PathBuf,

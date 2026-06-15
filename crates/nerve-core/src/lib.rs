@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use nerve_adapter::ModelAdapter;
 use nerve_config::{
-    Config, ConflictPolicy, Orchestration, ProfileSelection, ReviewStrictness, Strategy,
+    Config, ConflictPolicy, GoalSpec, Orchestration, ProfileSelection, ReviewStrictness, Strategy,
 };
 use nerve_patch::{FileOperation, FilePatch, NvPatch};
 use nerve_types::{
-    AgentEvent, AgentOutput, Issue, IssueSeverity, ReviewerFeedback, RoundRecord, Task, UsageStats,
-    Verdict,
+    AgentEvent, AgentOutput, CheckResult, Issue, IssueSeverity, ReviewerFeedback, RoundRecord,
+    Task, UsageStats, Verdict,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::Write as _;
@@ -19,7 +19,12 @@ use std::time::SystemTime;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::{Duration, sleep};
 
+pub mod budget_audit;
+pub mod goal;
 pub mod store;
+
+pub use budget_audit::{BudgetAuditEntry, BudgetSnapshot, append_budget_audit_entry};
+pub use goal::{GoalError, GoalEvaluator};
 
 #[derive(Debug, Clone)]
 pub struct Synapse {
@@ -37,7 +42,7 @@ pub struct SynapseState {
     pub events: Vec<AgentEvent>,
 }
 
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunReport {
     pub task: Task,
     pub selection: ProfileSelection,
@@ -52,13 +57,31 @@ pub struct RunReport {
     pub usage: UsageStats,
     #[serde(default)]
     pub budget_exceeded: bool,
+    #[serde(default)]
+    pub no_progress_exceeded: bool,
+    #[serde(default)]
+    pub goal_satisfied: Option<bool>,
     pub applied: bool,
     pub blocked: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
 pub struct RunOptions {
     pub apply: bool,
+    /// Optional deterministic check_cmd evaluated each round. AND-combined with
+    /// reviewer verdict per §3 Tier 1b ma-2 / ma-6 decision table.
+    pub goal: Option<GoalSpec>,
+}
+
+impl RunOptions {
+    pub fn new(apply: bool) -> Self {
+        Self { apply, goal: None }
+    }
+
+    pub fn with_goal(mut self, goal: GoalSpec) -> Self {
+        self.goal = Some(goal);
+        self
+    }
 }
 
 impl Synapse {
@@ -159,6 +182,17 @@ pub async fn run_synaptic_loop(
         Strategy::Tournament => unreachable!("tournament strategy returns before consensus loop"),
     };
 
+    let goal_evaluator = build_goal_evaluator(&task, &options, &config.orchestration)?;
+    let no_progress_max = options
+        .goal
+        .as_ref()
+        .and_then(|spec| spec.no_progress_max)
+        .unwrap_or(0);
+    let mut previous_patch_sha: Option<String> = None;
+    let mut no_progress_count: u8 = 0;
+    let mut no_progress_exceeded = false;
+    let mut last_check: Option<CheckResult> = None;
+
     for round_index in 0..=max_refinement_rounds {
         if budget_exceeded {
             break;
@@ -176,10 +210,19 @@ pub async fn run_synaptic_loop(
             .with_context(|| format!("reviewer adapter `{}` failed", reviewer.id()))?;
         accumulate_feedback_usage(&mut usage, &feedback);
 
+        let check_result = run_goal_check(goal_evaluator.as_ref()).await;
+        last_check = Some(check_result.clone());
+        let patch_sha = lead_output
+            .proposed_patch
+            .as_ref()
+            .map(NvPatch::canonical_hash);
+
         let round = RoundRecord {
             round: round_index,
             lead: lead_output.clone(),
             reviewer: feedback.clone(),
+            check_result: Some(check_result.clone()),
+            patch_sha: patch_sha.clone(),
         };
         synapse.record_round(round).await;
         final_feedback = feedback;
@@ -190,9 +233,33 @@ pub async fn run_synaptic_loop(
             break;
         }
 
-        if final_feedback.verdict.is_terminal_success() {
+        // ma-6 decision table: stop iff reviewer says LGTM AND check_result is Pass/Skipped.
+        let reviewer_success = final_feedback.verdict.is_terminal_success();
+        let check_success = matches!(check_result, CheckResult::Pass | CheckResult::Skipped);
+        if reviewer_success && check_success {
             break;
         }
+
+        if matches!(final_feedback.verdict, Verdict::Block) {
+            break;
+        }
+
+        // ma-1 no-progress guard: identical patch hash + RequestChanges in a row.
+        if no_progress_max > 0
+            && matches!(final_feedback.verdict, Verdict::RequestChanges)
+            && let Some(current) = patch_sha.as_ref()
+            && previous_patch_sha.as_deref() == Some(current.as_str())
+        {
+            no_progress_count = no_progress_count.saturating_add(1);
+            if no_progress_count >= no_progress_max {
+                no_progress_exceeded = true;
+                final_feedback = no_progress_feedback(reviewer.id(), no_progress_count);
+                break;
+            }
+        } else {
+            no_progress_count = 0;
+        }
+        previous_patch_sha = patch_sha;
 
         if round_index == max_refinement_rounds {
             break;
@@ -223,8 +290,11 @@ pub async fn run_synaptic_loop(
         &final_feedback,
         &config.orchestration.conflict_policy,
     )?;
-    let blocked =
-        budget_exceeded || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
+    let goal_check_failed = goal_check_failed(&options.goal, last_check.as_ref());
+    let blocked = budget_exceeded
+        || no_progress_exceeded
+        || goal_check_failed
+        || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
 
     let applied = if options.apply && !blocked {
         if let Some(patch) = &final_patch {
@@ -237,6 +307,15 @@ pub async fn run_synaptic_loop(
         false
     };
 
+    let goal_satisfied = options.goal.as_ref().map(|_| {
+        matches!(
+            last_check,
+            Some(CheckResult::Pass) | Some(CheckResult::Skipped)
+        ) && final_feedback.verdict.is_terminal_success()
+            && !budget_exceeded
+            && !no_progress_exceeded
+    });
+
     Ok(RunReport {
         task,
         selection,
@@ -248,6 +327,8 @@ pub async fn run_synaptic_loop(
         events: synapse.events().await,
         usage,
         budget_exceeded,
+        no_progress_exceeded,
+        goal_satisfied,
         applied,
         blocked,
     })
@@ -332,10 +413,20 @@ async fn run_tournament_strategy(
         }
     };
 
+    // Tournament strategy only runs one round; AND-combine the optional goal check.
+    let goal_evaluator = build_goal_evaluator(&task, &options, &config.orchestration)?;
+    let check_result = run_goal_check(goal_evaluator.as_ref()).await;
+    let patch_sha = final_output
+        .proposed_patch
+        .as_ref()
+        .map(NvPatch::canonical_hash);
+
     let round = RoundRecord {
         round: 0,
         lead: final_output.clone(),
         reviewer: final_feedback.clone(),
+        check_result: Some(check_result.clone()),
+        patch_sha,
     };
     synapse.record_round(round).await;
 
@@ -347,8 +438,10 @@ async fn run_tournament_strategy(
         &final_feedback,
         &config.orchestration.conflict_policy,
     )?;
-    let blocked =
-        budget_exceeded || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
+    let goal_check_failed = goal_check_failed(&options.goal, Some(&check_result));
+    let blocked = budget_exceeded
+        || goal_check_failed
+        || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
 
     let applied = if options.apply && !blocked {
         if let Some(patch) = &final_patch {
@@ -361,6 +454,12 @@ async fn run_tournament_strategy(
         false
     };
 
+    let goal_satisfied = options.goal.as_ref().map(|_| {
+        matches!(check_result, CheckResult::Pass | CheckResult::Skipped)
+            && final_feedback.verdict.is_terminal_success()
+            && !budget_exceeded
+    });
+
     Ok(RunReport {
         task,
         selection,
@@ -372,9 +471,55 @@ async fn run_tournament_strategy(
         events: synapse.events().await,
         usage,
         budget_exceeded,
+        no_progress_exceeded: false,
+        goal_satisfied,
         applied,
         blocked,
     })
+}
+
+fn build_goal_evaluator(
+    task: &Task,
+    options: &RunOptions,
+    orchestration: &Orchestration,
+) -> Result<Option<GoalEvaluator>> {
+    let Some(spec) = options.goal.clone() else {
+        return Ok(None);
+    };
+    let cwd = spec.cwd.clone().unwrap_or_else(|| task.cwd.clone());
+    let evaluator = GoalEvaluator::new(
+        spec,
+        orchestration.check_env.clone(),
+        orchestration.check_output_cap_bytes,
+        cwd,
+    )
+    .map_err(|err| anyhow::anyhow!("goal evaluator setup failed: {err}"))?;
+    Ok(Some(evaluator))
+}
+
+async fn run_goal_check(evaluator: Option<&GoalEvaluator>) -> CheckResult {
+    match evaluator {
+        Some(eval) => eval.evaluate().await,
+        None => CheckResult::Skipped,
+    }
+}
+
+fn goal_check_failed(goal: &Option<GoalSpec>, check_result: Option<&CheckResult>) -> bool {
+    goal.is_some() && !matches!(check_result, Some(CheckResult::Pass | CheckResult::Skipped))
+}
+
+fn no_progress_feedback(reviewer_id: &str, count: u8) -> ReviewerFeedback {
+    ReviewerFeedback {
+        reviewer_id: reviewer_id.to_string(),
+        verdict: Verdict::Block,
+        issues: vec![Issue {
+            severity: IssueSeverity::Blocking,
+            message: format!("No progress for {count} consecutive rounds (identical patch hash)"),
+        }],
+        suggested_patch: None,
+        cost: None,
+        raw_text: format!("BLOCK: no-progress exceeded after {count} identical rounds"),
+    }
 }
 
 fn accumulate_output_usage(total: &mut UsageStats, output: &AgentOutput) {
@@ -720,7 +865,7 @@ mod tests {
             Box::new(MockAdapter::reviewer()) as Box<dyn ModelAdapter>,
         ];
 
-        let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply: false })
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false))
             .await
             .unwrap();
 
@@ -755,7 +900,7 @@ mod tests {
             Box::new(BudgetAdapter::new("budget-reviewer", 1, 1)) as Box<dyn ModelAdapter>,
         ];
 
-        let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply: true })
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(true))
             .await
             .unwrap();
 
@@ -791,7 +936,7 @@ mod tests {
             Box::new(MockAdapter::reviewer()) as Box<dyn ModelAdapter>,
         ];
 
-        let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply: false })
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false))
             .await
             .unwrap();
 
@@ -824,7 +969,7 @@ mod tests {
             Box::new(TournamentAdapter::new("candidate-b")) as Box<dyn ModelAdapter>,
         ];
 
-        let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply: false })
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false))
             .await
             .unwrap();
 
@@ -857,7 +1002,7 @@ mod tests {
             Box::new(ScratchReviewerAdapter) as Box<dyn ModelAdapter>,
         ];
 
-        let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply: false })
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false))
             .await
             .unwrap();
 
@@ -994,7 +1139,7 @@ mod tests {
             Box::new(StubbornAdapter::new("stubborn-reviewer")) as Box<dyn ModelAdapter>,
         ];
 
-        let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply: false })
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false))
             .await
             .unwrap();
 
@@ -1026,13 +1171,13 @@ mod tests {
             Box::new(MockAdapter::reviewer()) as Box<dyn ModelAdapter>,
         ];
 
-        let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply: true })
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(true))
             .await
             .unwrap();
 
         assert!(report.blocked);
         assert!(!report.applied);
-        assert!(!dir.path().join(".nerve/mock-output.txt").exists());
+        assert!(!dir.path().join("mock-output.txt").exists());
     }
 
     #[tokio::test]
@@ -1059,14 +1204,14 @@ mod tests {
             Box::new(MockAdapter::reviewer()) as Box<dyn ModelAdapter>,
         ];
 
-        let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply: true })
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(true))
             .await
             .unwrap();
 
         assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
         assert!(report.blocked);
         assert!(!report.applied);
-        assert!(!dir.path().join(".nerve/mock-output.txt").exists());
+        assert!(!dir.path().join("mock-output.txt").exists());
     }
 
     #[derive(Debug)]
@@ -1355,6 +1500,125 @@ mod tests {
             _tx: mpsc::Sender<AgentEvent>,
         ) -> Result<ReviewerFeedback> {
             Ok(ReviewerFeedback::lgtm(self.id(), scratch_summary))
+        }
+    }
+
+    fn consensus_config() -> Config {
+        Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": {
+                "architect": "claude-code",
+                "reviewer": "codex"
+              },
+              "profiles": []
+            }"#,
+        )
+        .unwrap()
+    }
+
+    fn goal_spec(cmd: &[&str]) -> GoalSpec {
+        GoalSpec {
+            id: "g1".into(),
+            check_cmd: cmd.iter().map(|s| (*s).to_string()).collect(),
+            timeout_secs: 5,
+            cwd: None,
+            env: std::collections::BTreeMap::new(),
+            no_progress_max: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_and_combines_lgtm_with_check_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("watch and pass", dir.path());
+        let config = consensus_config();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let options = RunOptions::new(false).with_goal(goal_spec(&["true"]));
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
+        assert_eq!(report.goal_satisfied, Some(true));
+        assert!(!report.no_progress_exceeded);
+        // mock_loop_refines_until_lgtm normally takes 2 rounds before LGTM; check Pass keeps it the same.
+        assert!(!report.rounds.is_empty());
+        assert!(report.rounds.iter().all(|r| r.check_result.is_some()));
+    }
+
+    #[tokio::test]
+    async fn orchestrator_and_keeps_running_when_check_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("check always fails", dir.path());
+        let config = consensus_config();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let options = RunOptions::new(false).with_goal(goal_spec(&["false"]));
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        // Even after reviewer LGTM, check Fail prevents early termination.
+        // Loop runs the full max_refinement_rounds + 1 reviews and ends with goal_satisfied=false.
+        assert_eq!(report.goal_satisfied, Some(false));
+        assert_eq!(report.rounds.len(), 3);
+        let last = report.rounds.last().unwrap();
+        match &last.check_result {
+            Some(CheckResult::Fail { .. }) => {}
+            other => panic!("expected last round check to be Fail, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_blocks_apply_when_goal_check_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("check blocks apply", dir.path());
+        let config = consensus_config();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let options = RunOptions::new(true).with_goal(goal_spec(&["false"]));
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert_eq!(report.goal_satisfied, Some(false));
+        assert!(report.blocked);
+        assert!(!report.applied);
+        assert!(!dir.path().join("mock-output.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn orchestrator_records_skipped_check_when_no_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("no goal", dir.path());
+        let config = consensus_config();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false))
+            .await
+            .unwrap();
+
+        assert_eq!(report.goal_satisfied, None);
+        for round in &report.rounds {
+            assert_eq!(round.check_result.as_ref(), Some(&CheckResult::Skipped));
         }
     }
 }
