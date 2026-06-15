@@ -4,6 +4,16 @@ use nerve_patch::{FilePatch, NvPatch};
 use nerve_types::{
     AgentEvent, AgentOutput, Issue, IssueSeverity, ReviewerFeedback, Task, UsageStats, Verdict,
 };
+
+pub mod mcp;
+
+// Tier 3i (v1.0): re-export the MCP client surface so callers can `use
+// nerve_adapter::{McpClient, McpRegistry, McpError}` without reaching into the
+// submodule path.
+pub use mcp::{
+    McpClient, McpError, McpRegistry, default_write_tool_patterns, role_matches,
+    tool_matches_write_pattern,
+};
 use serde_json::{Map, Value};
 use std::path::Path;
 use std::process::Stdio;

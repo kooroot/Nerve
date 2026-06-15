@@ -1,16 +1,24 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use nerve_adapter::{ModelAdapter, SubprocessAdapter, default_adapters_with_limits};
-use nerve_config::{Config, DaemonProtocol, GoalIntent, GoalSpec, PlanStrategy, RpcConfig};
+use nerve_adapter::{
+    McpClient, McpRegistry, ModelAdapter, SubprocessAdapter, default_adapters_with_limits,
+    default_write_tool_patterns,
+};
+use nerve_config::{
+    Config, DaemonProtocol, GoalIntent, GoalSpec, McpConfig, PlanStrategy, RpcConfig,
+};
+use nerve_core::session_fork::{ForkOptions as CoreForkOptions, SessionTree};
 use nerve_core::store::NerveStore;
 use nerve_core::{
     AuditChainState, BudgetAuditEntry, BudgetSnapshot, ChainStatus, DoctorCheck, DoctorStatus,
-    GoalIntentConverter, PlanError, PlanRunOptions, RpcBus, RunOptions, RunReport,
-    append_budget_audit_entry, doctor_checks, format_chain_broken, run_plan_mode,
-    run_synaptic_loop,
+    ForkConfig as CoreForkConfig, GoalIntentConverter, Mayor, Patrol, PatrolTask, PlanError,
+    PlanRunOptions, RpcBus, RunOptions, RunReport, SessionForker, append_budget_audit_entry,
+    doctor_checks, format_chain_broken, run_plan_mode, run_synaptic_loop,
 };
 use nerve_tui::{TuiApp, TuiAppOptions, TuiState};
-use nerve_types::{AgentEvent, PlanReport, RPC_SCHEMA_VERSION, RpcEnvelope, Task, Verdict};
+use nerve_types::{
+    AgentEvent, McpToolCall, PlanReport, RPC_SCHEMA_VERSION, RpcEnvelope, Task, Verdict,
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::env;
@@ -180,6 +188,119 @@ enum Command {
         #[command(subcommand)]
         command: TemplateCommand,
     },
+    /// v1.0 Tier 3h: Fork a stored session into a child branch.
+    #[command(about = "Fork a session into a child branch (Tier 3h)")]
+    Fork(ForkArgs),
+    /// v1.0 Tier 3h: alias for `fork` that auto-names the child via
+    /// `ForkConfig.auto_name`. Maps to a regular `SessionForker::fork`
+    /// invocation with `name=None` so the parent-side history stays untouched.
+    #[command(about = "Branch a task into a child session (alias for fork)")]
+    Branch {
+        #[arg(help = "Parent task/session id")]
+        task_id: String,
+    },
+    /// v1.0 Tier 3h: read-only inspectors over `.nerve/sessions/`.
+    #[command(about = "List stored sessions and forks (Tier 3h)")]
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
+    },
+    /// v1.0 Tier 3i: MCP probe / list helpers.
+    #[command(about = "Inspect or probe configured MCP servers (Tier 3i)")]
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+    /// v1.0 Tier 3j: long-lived Mayor dispatcher.
+    #[command(about = "Run the Mayor dispatcher (Tier 3j)")]
+    Mayor(MayorArgs),
+    /// v1.0 Tier 3j: Patrol worker bound to a slot id.
+    #[command(about = "Run a Patrol worker (Tier 3j)")]
+    Patrol(PatrolArgs),
+}
+
+/// Tier 3h `nv fork` arguments. Defaults preserve byte-identical legacy
+/// behaviour — when no flags are passed and no parent is on-disk, the
+/// command short-circuits to a clean ParentNotFound error.
+#[derive(Debug, clap::Args)]
+struct ForkArgs {
+    #[arg(help = "Parent session id to branch off")]
+    session_id: String,
+    #[arg(long, help = "Inclusive parent round index to branch from")]
+    from_round: Option<u32>,
+    #[arg(long, help = "Optional child name (A-Za-z0-9_-, 1..=64 chars)")]
+    name: Option<String>,
+    #[arg(long, help = "Pin the child to an explicit base patch SHA")]
+    from_patch_sha: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionsCommand {
+    #[command(about = "List root sessions")]
+    List {
+        #[arg(long, help = "Emit sessions as JSON")]
+        json: bool,
+    },
+    #[command(about = "Render the fork tree rooted at <root-id>")]
+    Tree {
+        #[arg(help = "Root session id")]
+        root_id: String,
+        #[arg(long, help = "Emit the tree as JSON")]
+        json: bool,
+    },
+}
+
+/// Tier 3i `nv mcp` arguments.
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    #[command(about = "List MCP tools exposed by configured servers")]
+    ListTools {
+        #[arg(long, help = "Emit tool list as JSON")]
+        json: bool,
+    },
+    #[command(about = "Start, handshake, list tools, and tear down a server")]
+    Probe {
+        #[arg(help = "MCP server name from nerve.config.json")]
+        server: String,
+    },
+}
+
+/// Tier 3j `nv mayor` arguments. Defaults to running until idle so a
+/// non-interactive `nv mayor` invocation drains the on-disk queue and exits
+/// — the long-lived supervisor form is opt-in via the slash command.
+#[derive(Debug, clap::Args)]
+struct MayorArgs {
+    #[arg(long, help = "Override the max-patrols ceiling")]
+    max_patrols: Option<u32>,
+    #[arg(long, help = "Per-patrol budget ceiling in micro-USD")]
+    per_patrol_budget_microusd: Option<u64>,
+    #[arg(long, help = "Override the queue directory (defaults to .nerve/queue)")]
+    queue_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Override the results directory (defaults to .nerve/results)"
+    )]
+    results_dir: Option<PathBuf>,
+    #[arg(long, help = "Print the queue status and exit (no dispatch)")]
+    status_only: bool,
+}
+
+/// Tier 3j `nv patrol` arguments.
+#[derive(Debug, clap::Args)]
+struct PatrolArgs {
+    #[arg(long, help = "Patrol slot id (used as the on-disk claim key)")]
+    id: String,
+    #[arg(long, help = "Per-patrol worktree directory (best-effort hint)")]
+    worktree: Option<PathBuf>,
+    #[arg(
+        long = "mcp-server",
+        help = "Bind this patrol to a configured MCP server (repeatable)"
+    )]
+    mcp_server: Vec<String>,
+    #[arg(long, help = "Claim and run a single task, then exit")]
+    once: bool,
+    #[arg(long, help = "Print the patrol's local heartbeat / results and exit")]
+    status: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -435,6 +556,16 @@ async fn main() -> Result<()> {
                 cli_worktree_override(cli.worktree, cli.no_worktree),
             )
             .await
+        }
+        Some(Command::Fork(args)) => run_fork_subcommand(args, cli.json).await,
+        Some(Command::Branch { task_id }) => run_branch_subcommand(task_id, cli.json).await,
+        Some(Command::Sessions { command }) => run_sessions_subcommand(command).await,
+        Some(Command::Mcp { command }) => run_mcp_subcommand(command).await,
+        Some(Command::Mayor(args)) => {
+            run_mayor_subcommand(args, matches!(cli.adapter, AdapterMode::Mock)).await
+        }
+        Some(Command::Patrol(args)) => {
+            run_patrol_subcommand(args, matches!(cli.adapter, AdapterMode::Mock)).await
         }
         None => {
             let Some(prompt) = cli.prompt else {
@@ -713,6 +844,444 @@ async fn run_template(
     }
 }
 
+/// Resolve the `ForkConfig` to use for CLI fork operations: profile-default
+/// when nerve.config.json supplies one, otherwise `CoreForkConfig::default()`.
+fn resolved_fork_config(config: &Config) -> CoreForkConfig {
+    let cfg = config.roles.fork.as_ref();
+    let copy_patch_history = cfg.map(|c| c.copy_patch_history).unwrap_or(true);
+    CoreForkConfig {
+        copy_patch_history,
+        ..CoreForkConfig::default()
+    }
+}
+
+/// `nv fork` and `nv branch` payload. Resolves the parent on disk (creating
+/// a minimal root record from the stored session report when the index is
+/// empty), then invokes [`SessionForker::fork`].
+async fn run_fork_subcommand(args: ForkArgs, json: bool) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let config = Config::load_from(&cwd)?;
+    let forker = SessionForker::new(resolved_fork_config(&config), &cwd);
+    bootstrap_root_session_if_missing(&forker, &cwd, &args.session_id).await?;
+
+    let opts = CoreForkOptions {
+        from_round: args.from_round,
+        name: args.name,
+        from_patch_sha: args.from_patch_sha,
+    };
+    let child = forker
+        .fork(&args.session_id, opts)
+        .await
+        .with_context(|| format!("fork failed for parent `{}`", args.session_id))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&child)?);
+    } else {
+        print_fork_summary(&child, &args.session_id);
+    }
+    Ok(())
+}
+
+async fn run_branch_subcommand(task_id: String, json: bool) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let config = Config::load_from(&cwd)?;
+    let forker = SessionForker::new(resolved_fork_config(&config), &cwd);
+    bootstrap_root_session_if_missing(&forker, &cwd, &task_id).await?;
+
+    // `nv branch` synthesises a child name from `ForkConfig.auto_name` so the
+    // user never has to provide one. We mint a deterministic, sanitised name
+    // (no path separators) from a short timestamp suffix.
+    let name = if config.roles.fork.as_ref().is_some_and(|f| f.auto_name) {
+        Some(format!(
+            "branch-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+        ))
+    } else {
+        None
+    };
+
+    let child = forker
+        .fork(
+            &task_id,
+            CoreForkOptions {
+                from_round: None,
+                name,
+                from_patch_sha: None,
+            },
+        )
+        .await
+        .with_context(|| format!("branch failed for parent `{task_id}`"))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&child)?);
+    } else {
+        print_fork_summary(&child, &task_id);
+    }
+    Ok(())
+}
+
+/// When the user invokes `nv fork <id>` against a session that has no entry
+/// in `.nerve/sessions/index.json` yet (because it was stored only under the
+/// v0.x `NerveStore` layout), we register a minimal root payload so the fork
+/// engine can attach to it without rewriting the legacy store.
+async fn bootstrap_root_session_if_missing(
+    forker: &SessionForker,
+    cwd: &Path,
+    session_id: &str,
+) -> Result<()> {
+    if forker.get(session_id).await?.is_some() {
+        return Ok(());
+    }
+    // Only bootstrap when the legacy store has a record for the id. We refuse
+    // to forge a brand-new parent out of thin air — that would let `nv fork
+    // <typo>` silently create an empty bucket.
+    let store = NerveStore::new(cwd);
+    if store.load_report(session_id).is_err() {
+        return Ok(());
+    }
+    let tree = SessionTree::root(session_id, None);
+    forker.persist_root(tree).await?;
+    Ok(())
+}
+
+fn print_fork_summary(child: &SessionTree, parent_id: &str) {
+    println!(
+        "Forked session {} from parent {} (round={:?}, patch_sha={:?})",
+        child.id,
+        parent_id,
+        child.branched_at_round,
+        child.branched_from_patch_sha.as_deref()
+    );
+    if let Some(name) = &child.name {
+        println!("  name: {name}");
+    }
+    println!("  rounds copied: {}", child.rounds.len());
+}
+
+async fn run_sessions_subcommand(command: SessionsCommand) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let config = Config::load_from(&cwd)?;
+    let forker = SessionForker::new(resolved_fork_config(&config), &cwd);
+    match command {
+        SessionsCommand::List { json } => {
+            let roots = forker.list_root().await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&roots)?);
+            } else if roots.is_empty() {
+                println!("No sessions registered under .nerve/sessions.");
+            } else {
+                for root in roots {
+                    println!(
+                        "{} | name={} | children={} | forked_at={}",
+                        root.id,
+                        root.name.as_deref().unwrap_or("-"),
+                        root.children.len(),
+                        root.forked_at
+                    );
+                }
+            }
+        }
+        SessionsCommand::Tree { root_id, json } => {
+            let tree = forker.tree(&root_id).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tree)?);
+            } else {
+                print_session_tree(&forker, &tree, 0).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively render the fork tree to stdout. Recursion is bounded by the
+/// on-disk session index, so a malformed parent_id loop would surface as a
+/// `ParentNotFound` error instead of stack-blowing.
+fn print_session_tree<'a>(
+    forker: &'a SessionForker,
+    tree: &'a SessionTree,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        println!(
+            "{}- {} (name={}, children={}, rounds={})",
+            "  ".repeat(depth),
+            tree.id,
+            tree.name.as_deref().unwrap_or("-"),
+            tree.children.len(),
+            tree.rounds.len(),
+        );
+        for child_id in &tree.children {
+            if let Some(child) = forker.get(child_id).await? {
+                print_session_tree(forker, &child, depth + 1).await?;
+            } else {
+                println!("{}- {} (missing payload)", "  ".repeat(depth + 1), child_id);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Resolve the active MCP config from nerve.config.json — profile-level
+/// override wins over the role-level default. Returns `None` when MCP is
+/// disabled (the default).
+fn active_mcp_config(config: &Config) -> Option<&McpConfig> {
+    if let Some(profile) = config.profiles.first()
+        && let Some(mcp) = profile.mcp.as_ref()
+    {
+        return Some(mcp);
+    }
+    config.roles.mcp.as_ref()
+}
+
+async fn run_mcp_subcommand(command: McpCommand) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let config = Config::load_from(&cwd)?;
+    let Some(mcp) = active_mcp_config(&config).cloned() else {
+        println!("mcp: no servers configured (roles.mcp / profiles[].mcp empty)");
+        return Ok(());
+    };
+
+    match command {
+        McpCommand::ListTools { json } => {
+            let mut registry = McpRegistry::new();
+            if let Err(err) = registry
+                .register_all(&mcp.servers, &mcp.write_tool_patterns)
+                .await
+            {
+                anyhow::bail!("failed to start MCP servers: {err}");
+            }
+            let mut entries: Vec<serde_json::Value> = Vec::new();
+            for (name, client) in registry.iter() {
+                let tools = client
+                    .list_tools()
+                    .await
+                    .with_context(|| format!("list_tools failed for `{name}`"))?;
+                for tool in tools {
+                    entries.push(serde_json::json!({
+                        "server": name,
+                        "name": tool.name,
+                        "description": tool.description,
+                    }));
+                }
+            }
+            registry
+                .shutdown_all()
+                .await
+                .context("mcp shutdown after list_tools failed")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if entries.is_empty() {
+                println!("mcp: no tools advertised by configured servers.");
+            } else {
+                for entry in entries {
+                    println!(
+                        "{} | {} | {}",
+                        entry["server"].as_str().unwrap_or("-"),
+                        entry["name"].as_str().unwrap_or("-"),
+                        entry["description"].as_str().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+        McpCommand::Probe { server } => {
+            let Some(spec) = mcp.servers.iter().find(|s| s.name == server).cloned() else {
+                anyhow::bail!("mcp server `{server}` not found in config");
+            };
+            let patterns = if mcp.write_tool_patterns.is_empty() {
+                default_write_tool_patterns()
+            } else {
+                mcp.write_tool_patterns.clone()
+            };
+            let client = McpClient::new(spec, patterns);
+            client
+                .start()
+                .await
+                .with_context(|| format!("mcp `{server}`: start failed"))?;
+            let tools = client.list_tools().await.unwrap_or_default();
+            println!("mcp `{server}`: handshake ok ({} tool(s))", tools.len());
+            for tool in tools {
+                println!(
+                    "  {} | {}",
+                    tool.name,
+                    tool.description.as_deref().unwrap_or("-")
+                );
+            }
+            client
+                .shutdown()
+                .await
+                .with_context(|| format!("mcp `{server}`: shutdown failed"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the workspace `MayorPatrolConfig`, applying CLI overrides on top
+/// of the configured value. We never persist the override — it stays scoped
+/// to the running process so a `--max-patrols 1` invocation doesn't bleed
+/// into a later `nv mayor` run without the flag.
+fn mayor_config_with_overrides(
+    config: &Config,
+    overrides_queue: Option<&Path>,
+    overrides_results: Option<&Path>,
+    overrides_max_patrols: Option<u32>,
+    overrides_per_patrol_budget: Option<u64>,
+) -> nerve_config::MayorPatrolConfig {
+    let mut cfg = config
+        .orchestration
+        .mayor_patrol
+        .clone()
+        .unwrap_or_default();
+    if let Some(dir) = overrides_queue {
+        cfg.queue_dir = dir.to_path_buf();
+    }
+    if let Some(dir) = overrides_results {
+        cfg.results_dir = dir.to_path_buf();
+    }
+    if let Some(max) = overrides_max_patrols {
+        cfg.max_patrols = max;
+    }
+    if let Some(budget) = overrides_per_patrol_budget {
+        cfg.per_patrol_budget_microusd = Some(budget);
+    }
+    cfg
+}
+
+async fn run_mayor_subcommand(args: MayorArgs, _mock: bool) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let config = Config::load_from(&cwd)?;
+    let mp = mayor_config_with_overrides(
+        &config,
+        args.queue_dir.as_deref(),
+        args.results_dir.as_deref(),
+        args.max_patrols,
+        args.per_patrol_budget_microusd,
+    );
+    let total = config.orchestration.budget_cost_microusd_ceiling;
+    let mayor = Mayor::new(mp, cwd.clone(), total);
+    let status = mayor.status().await.context("mayor status failed")?;
+    print_mayor_status(&status);
+    if args.status_only {
+        return Ok(());
+    }
+    // Drain the queue once. Long-lived supervisor mode is reserved for the
+    // upcoming `mayor --supervise` flag — out of scope for v1.0's CLI bring-up.
+    mayor
+        .run_until_idle()
+        .await
+        .context("mayor run_until_idle failed")?;
+    let final_status = mayor.status().await?;
+    print_mayor_status(&final_status);
+    Ok(())
+}
+
+fn print_mayor_status(status: &nerve_core::MayorStatus) {
+    println!(
+        "mayor: pending={} claimed={} done={} failed={} orphans_recovered={} active_patrols={}",
+        status.pending_count,
+        status.claimed_count,
+        status.done_count,
+        status.failed_count,
+        status.orphans_recovered,
+        status.active_patrols.len(),
+    );
+    for patrol in &status.active_patrols {
+        println!("  patrol heartbeat: {patrol}");
+    }
+}
+
+async fn run_patrol_subcommand(args: PatrolArgs, mock: bool) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let config = Config::load_from(&cwd)?;
+    let mp = config
+        .orchestration
+        .mayor_patrol
+        .clone()
+        .unwrap_or_default();
+    let patrol = Patrol::new(args.id.clone(), mp.clone(), cwd.clone());
+
+    if args.status {
+        // Print local heartbeat + any results that match this patrol id.
+        let session_meta = cwd.join(".nerve").join("session-meta");
+        let token_path = patrol_rpc_token_path(&session_meta, &args.id);
+        println!(
+            "patrol `{}`: token={} worktree={}",
+            args.id,
+            token_path.display(),
+            args.worktree
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+        if !args.mcp_server.is_empty() {
+            println!("  mcp servers: {}", args.mcp_server.join(", "));
+        }
+        return Ok(());
+    }
+
+    // Tier 3j patrol RPC token isolation: each patrol gets its own bearer
+    // token under `.nerve/session-meta/rpc-token-<id>` (0600). We materialise
+    // the bus on a temporary rpc-config so the global token is never touched.
+    let session_meta = cwd.join(".nerve").join("session-meta");
+    fs::create_dir_all(&session_meta).with_context(|| {
+        format!(
+            "failed to create RPC session-meta dir `{}`",
+            session_meta.display()
+        )
+    })?;
+    let rpc_config = patrol_rpc_config(&config, &args.id);
+    let _bus = Arc::new(
+        RpcBus::new(rpc_config, &session_meta)
+            .with_context(|| format!("rpc bus init failed for patrol `{}`", args.id))?,
+    );
+
+    if args.once {
+        // One-shot dispatch: claim a task, dispatch it through the in-process
+        // synaptic loop, and write the result.
+        let outcome = patrol
+            .run_one(|task: PatrolTask| {
+                Box::pin(
+                    async move { Ok(nerve_core::PatrolResult::success(&task.task_id, "stub", 0)) },
+                )
+            })
+            .await
+            .context("patrol run_one failed")?;
+        println!(
+            "patrol `{}`: ran task {} verdict={:?} cost={}",
+            args.id, outcome.task_id, outcome.verdict, outcome.cost_microusd
+        );
+        return Ok(());
+    }
+
+    let _ = mock; // adapter mode currently selected via config, not patrol arg
+    let (_tx, rx) = watch::channel(false);
+    patrol
+        .run_loop(
+            |task: PatrolTask| {
+                Box::pin(
+                    async move { Ok(nerve_core::PatrolResult::success(&task.task_id, "stub", 0)) },
+                )
+            },
+            rx,
+        )
+        .await
+        .context("patrol run_loop failed")?;
+    Ok(())
+}
+
+fn patrol_rpc_token_path(session_meta: &Path, id: &str) -> PathBuf {
+    session_meta.join(format!("rpc-token-{id}"))
+}
+
+/// Build an `RpcConfig` whose `token_path` is the patrol-isolated bearer
+/// token file. We clone the workspace config so token-size / queue knobs
+/// stay consistent with non-patrol callers.
+fn patrol_rpc_config(config: &Config, id: &str) -> RpcConfig {
+    let mut rpc = config.daemon.rpc.clone().unwrap_or_default();
+    // session_meta is relative-or-absolute; let RpcBus resolve against meta_dir.
+    rpc.token_path = PathBuf::from(format!("rpc-token-{id}"));
+    rpc
+}
+
 /// Run the v0.3.0 doctor surface. Loads config, runs `nerve_core::doctor_checks`
 /// for the workspace, then layers the adapter-prerequisite checks. Returns
 /// `Err` if any check is `Fail` or (for real adapters) a CLI is missing.
@@ -735,6 +1304,14 @@ fn run_doctor(mock: bool, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Res
     // protocol is `line` because operators may switch protocols at runtime.
     let rpc_config = config.daemon.rpc.clone().unwrap_or_default();
     for check in rpc_doctor_checks(&cwd, &rpc_config) {
+        render_doctor_check(&check, stdout, stderr);
+        if matches!(check.status, DoctorStatus::Fail(_)) {
+            any_fail = true;
+        }
+    }
+
+    // v1.0 Tier 3h/3i/3j doctor extensions.
+    for check in v1_doctor_checks(&config, &cwd) {
         render_doctor_check(&check, stdout, stderr);
         if matches!(check.status, DoctorStatus::Fail(_)) {
             any_fail = true;
@@ -797,6 +1374,180 @@ fn rpc_doctor_checks(cwd: &Path, rpc_config: &RpcConfig) -> Vec<DoctorCheck> {
     });
 
     checks
+}
+
+/// Tier 3h/3i/3j doctor checks. Each guard is non-fatal by default so
+/// existing operators see no new failures unless they have explicitly opted
+/// into the v1.0 features.
+fn v1_doctor_checks(config: &Config, cwd: &Path) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+
+    // 3h: validate `.nerve/sessions/index.json` is well-formed and has no
+    // dangling parent_id pointers.
+    checks.push(DoctorCheck {
+        name: "sessions_index".to_string(),
+        status: sessions_index_status(cwd),
+    });
+
+    // 3i: per-server `command[0]` must resolve on PATH.
+    if let Some(mcp) = active_mcp_config(config) {
+        for spec in &mcp.servers {
+            checks.push(DoctorCheck {
+                name: format!("mcp_server_{}", spec.name),
+                status: mcp_command_status(spec),
+            });
+        }
+    }
+
+    // 3j: writable queue/results dirs + orphan scan.
+    if let Some(mp) = config.orchestration.mayor_patrol.as_ref() {
+        let queue_root = if mp.queue_dir.is_absolute() {
+            mp.queue_dir.clone()
+        } else {
+            cwd.join(&mp.queue_dir)
+        };
+        let results_root = if mp.results_dir.is_absolute() {
+            mp.results_dir.clone()
+        } else {
+            cwd.join(&mp.results_dir)
+        };
+        checks.push(DoctorCheck {
+            name: "mayor_queue_dir".to_string(),
+            status: writable_dir_status(&queue_root),
+        });
+        checks.push(DoctorCheck {
+            name: "mayor_results_dir".to_string(),
+            status: writable_dir_status(&results_root),
+        });
+        checks.push(DoctorCheck {
+            name: "mayor_orphaned_claims".to_string(),
+            status: orphaned_claim_status(&queue_root),
+        });
+    }
+
+    checks
+}
+
+fn sessions_index_status(cwd: &Path) -> DoctorStatus {
+    let path = cwd.join(".nerve").join("sessions").join("index.json");
+    if !path.exists() {
+        return DoctorStatus::Ok;
+    }
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            return DoctorStatus::Warn(format!("could not read `{}`: {err}", path.display()));
+        }
+    };
+    if raw.trim().is_empty() {
+        return DoctorStatus::Ok;
+    }
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(err) => {
+            return DoctorStatus::Fail(format!("`{}` is not valid JSON: {err}", path.display()));
+        }
+    };
+    let Some(entries) = value.get("entries").and_then(|v| v.as_object()) else {
+        return DoctorStatus::Fail(format!("`{}` is missing the `entries` map", path.display()));
+    };
+    // Scan for dangling parent_id pointers.
+    let ids: std::collections::HashSet<&str> = entries.keys().map(String::as_str).collect();
+    for (id, entry) in entries {
+        let Some(parent) = entry.get("parent_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !ids.contains(parent) {
+            return DoctorStatus::Fail(format!(
+                "session `{id}` references missing parent `{parent}`"
+            ));
+        }
+    }
+    DoctorStatus::Ok
+}
+
+fn mcp_command_status(spec: &nerve_types::McpServerSpec) -> DoctorStatus {
+    let Some(first) = spec.command.first() else {
+        return DoctorStatus::Fail(format!("`{}`: empty command argv", spec.name));
+    };
+    // Accept absolute paths as long as they resolve. Otherwise look up on PATH.
+    let candidate = PathBuf::from(first);
+    if candidate.is_absolute() {
+        return if is_executable_file(&candidate) {
+            DoctorStatus::Ok
+        } else {
+            DoctorStatus::Fail(format!(
+                "`{}`: `{}` is not an executable file",
+                spec.name,
+                candidate.display()
+            ))
+        };
+    }
+    if find_on_path(first).is_some() {
+        DoctorStatus::Ok
+    } else {
+        DoctorStatus::Fail(format!("`{}`: `{first}` not found on PATH", spec.name))
+    }
+}
+
+fn writable_dir_status(dir: &Path) -> DoctorStatus {
+    if let Err(err) = fs::create_dir_all(dir) {
+        return DoctorStatus::Fail(format!("`{}`: create failed: {err}", dir.display()));
+    }
+    let probe = dir.join(".doctor-write-probe");
+    match fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            DoctorStatus::Ok
+        }
+        Err(err) => DoctorStatus::Fail(format!("`{}` not writable: {err}", dir.display())),
+    }
+}
+
+/// Surface orphaned `claimed/<patrol>/<task>.json` entries — defined as any
+/// directory under `claimed/` that contains JSON files. Operators can run
+/// `nv mayor` (which kicks off orphan recovery) to clean these up.
+fn orphaned_claim_status(queue_root: &Path) -> DoctorStatus {
+    let claimed = queue_root.join("claimed");
+    if !claimed.exists() {
+        return DoctorStatus::Ok;
+    }
+    let mut orphans = 0usize;
+    let mut patrols = Vec::new();
+    let read_dir = match fs::read_dir(&claimed) {
+        Ok(rd) => rd,
+        Err(err) => {
+            return DoctorStatus::Warn(format!("could not read `{}`: {err}", claimed.display()));
+        }
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let patrol_id = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Ok(sub) = fs::read_dir(&path) {
+            for child in sub.flatten() {
+                if child.path().extension().and_then(|s| s.to_str()) == Some("json") {
+                    orphans += 1;
+                    patrols.push(patrol_id.clone());
+                    break;
+                }
+            }
+        }
+    }
+    if orphans == 0 {
+        DoctorStatus::Ok
+    } else {
+        DoctorStatus::Fail(format!(
+            "{orphans} orphaned claim(s) under `{}` (patrols: {}). Run `nv mayor --status-only` to recover.",
+            claimed.display(),
+            patrols.join(", ")
+        ))
+    }
 }
 
 #[cfg(unix)]
@@ -1445,6 +2196,26 @@ const INTERACTIVE_COMMANDS: &[InteractiveCommandSpec] = &[
         description: "inspect or override session budget caps",
     },
     InteractiveCommandSpec {
+        command: "/fork",
+        args: "[--from-round N] [--name NAME]",
+        description: "branch the current session into a child fork",
+    },
+    InteractiveCommandSpec {
+        command: "/mcp",
+        args: "list | call <server> <tool> <json>",
+        description: "inspect MCP servers or dispatch a tool",
+    },
+    InteractiveCommandSpec {
+        command: "/mayor",
+        args: "status",
+        description: "show Mayor queue depths and active patrols",
+    },
+    InteractiveCommandSpec {
+        command: "/patrol",
+        args: "status",
+        description: "show local Patrol heartbeat and recent results",
+    },
+    InteractiveCommandSpec {
         command: "/help",
         args: "",
         description: "show command help",
@@ -1687,6 +2458,12 @@ struct InteractiveState {
     active_goal: Option<GoalSpec>,
     budget_override_cost_microusd: Option<u64>,
     budget_override_tokens: Option<u64>,
+    /// v1.0 Tier 3h: when set, the interactive prompt is anchored to a
+    /// non-root session id (carried verbatim from the last `/fork` invocation
+    /// or a manual session selection). The prompt suffix renders the short
+    /// 8-hex-char form so the operator never loses track of which branch is
+    /// active.
+    current_session_id: Option<String>,
 }
 
 impl InteractiveState {
@@ -1707,6 +2484,7 @@ impl InteractiveState {
             active_goal: None,
             budget_override_cost_microusd: None,
             budget_override_tokens: None,
+            current_session_id: None,
         }
     }
 
@@ -1850,11 +2628,17 @@ fn interactive_prompt(state: &InteractiveState) -> String {
     let branch_hint = git_branch_label(env::current_dir().ok().as_deref())
         .map(|branch| format!(":{branch}"))
         .unwrap_or_default();
+    let session_hint = state
+        .current_session_id
+        .as_deref()
+        .map(|id| format!(" session={}", short_id(id)))
+        .unwrap_or_default();
     format!(
-        "nerve:{}:{}{}{}> ",
+        "nerve:{}:{}{}{}{}> ",
         state.adapter_label(),
         state.apply_label(),
         branch_hint,
+        session_hint,
         patch_hint
     )
 }
@@ -1881,6 +2665,10 @@ async fn run_interactive_task(prompt: String, state: &mut InteractiveState) -> R
     .await?;
     print_interactive_result(&report, state.apply);
     state.record_report(&report);
+    // Fresh task at the prompt always resets to a root session so the prompt
+    // suffix reflects the new top-level session id rather than a previously
+    // anchored fork. `/fork` re-anchors after the fact.
+    state.current_session_id = Some(report.task.id.clone());
     state.last_report = Some(report);
     state.refresh_counts();
     print_status_bar(state);
@@ -2115,10 +2903,201 @@ async fn handle_interactive_command(command: &str, state: &mut InteractiveState)
             println!("Rolled back patch {}.", report.patch_id);
             state.refresh_counts();
         }
+        "fork" => {
+            handle_fork_slash(parts.collect::<Vec<_>>(), state, &cwd).await?;
+        }
+        "mcp" => {
+            handle_mcp_slash(command, parts.collect::<Vec<_>>(), &cwd).await?;
+        }
+        "mayor" => {
+            handle_mayor_slash(parts.collect::<Vec<_>>(), &cwd).await?;
+        }
+        "patrol" => {
+            handle_patrol_slash(parts.collect::<Vec<_>>(), &cwd).await?;
+        }
         "quit" | "exit" | "q" => return Ok(true),
         other => println!("Unknown command /{other}. Type /help for commands."),
     }
     Ok(false)
+}
+
+/// `/fork [--from-round N] [--name NAME]`. Anchors the prompt to the new
+/// child session so subsequent `/diff` / `/apply` calls operate on the
+/// branch the operator just minted.
+async fn handle_fork_slash(
+    args: Vec<&str>,
+    state: &mut InteractiveState,
+    cwd: &Path,
+) -> Result<()> {
+    let Some(parent_id) = state
+        .current_session_id
+        .clone()
+        .or_else(|| state.last_report.as_ref().map(|r| r.task.id.clone()))
+    else {
+        anyhow::bail!("/fork requires an active session (run a task or `/resume <id>` first)");
+    };
+    let mut from_round: Option<u32> = None;
+    let mut name: Option<String> = None;
+    let mut iter = args.into_iter();
+    while let Some(token) = iter.next() {
+        match token {
+            "--from-round" => {
+                let value = iter
+                    .next()
+                    .context("usage: /fork [--from-round N] [--name NAME]")?;
+                from_round = Some(value.parse::<u32>().context("--from-round must be u32")?);
+            }
+            "--name" => {
+                let value = iter
+                    .next()
+                    .context("usage: /fork [--from-round N] [--name NAME]")?;
+                name = Some(value.to_string());
+            }
+            other => anyhow::bail!("unknown flag `{other}` for /fork"),
+        }
+    }
+    let config = Config::load_from(cwd)?;
+    let forker = SessionForker::new(resolved_fork_config(&config), cwd);
+    bootstrap_root_session_if_missing(&forker, cwd, &parent_id).await?;
+    let child = forker
+        .fork(
+            &parent_id,
+            CoreForkOptions {
+                from_round,
+                name,
+                from_patch_sha: None,
+            },
+        )
+        .await?;
+    println!(
+        "Forked into child session {} (from parent {}). prompt now scoped to the branch.",
+        child.id, parent_id
+    );
+    state.current_session_id = Some(child.id);
+    Ok(())
+}
+
+async fn handle_mcp_slash(raw_command: &str, args: Vec<&str>, cwd: &Path) -> Result<()> {
+    let config = Config::load_from(cwd)?;
+    let Some(mcp) = active_mcp_config(&config).cloned() else {
+        println!("/mcp: no servers configured (roles.mcp / profiles[].mcp empty)");
+        return Ok(());
+    };
+    let mut iter = args.into_iter();
+    let action = iter.next().unwrap_or("list");
+    match action {
+        "list" => {
+            let mut registry = McpRegistry::new();
+            registry
+                .register_all(&mcp.servers, &mcp.write_tool_patterns)
+                .await
+                .context("/mcp list: failed to start configured servers")?;
+            for (name, client) in registry.iter() {
+                let tools = client.list_tools().await.unwrap_or_default();
+                println!("server `{name}` ({} tool(s))", tools.len());
+                for tool in tools {
+                    println!(
+                        "  {} | {}",
+                        tool.name,
+                        tool.description.as_deref().unwrap_or("-")
+                    );
+                }
+            }
+            registry.shutdown_all().await.ok();
+        }
+        "call" => {
+            let server = iter
+                .next()
+                .context("usage: /mcp call <server> <tool> <json>")?;
+            let tool = iter
+                .next()
+                .context("usage: /mcp call <server> <tool> <json>")?;
+            // Recover the JSON argument verbatim from the raw command so we
+            // preserve whitespace and nested objects. We slice from the
+            // position right after `mcp call <server> <tool>`.
+            let needle = format!("call {server} {tool}");
+            let json_str = raw_command
+                .strip_prefix("mcp")
+                .map(str::trim_start)
+                .and_then(|rest| rest.strip_prefix(&needle))
+                .map(str::trim)
+                .unwrap_or("");
+            let arguments: serde_json::Value = if json_str.is_empty() {
+                serde_json::Value::Object(Default::default())
+            } else {
+                serde_json::from_str(json_str)
+                    .with_context(|| format!("invalid JSON arguments: `{json_str}`"))?
+            };
+
+            let Some(spec) = mcp.servers.iter().find(|s| s.name == server).cloned() else {
+                anyhow::bail!("/mcp call: server `{server}` not configured");
+            };
+            let patterns = if mcp.write_tool_patterns.is_empty() {
+                default_write_tool_patterns()
+            } else {
+                mcp.write_tool_patterns.clone()
+            };
+            let client = McpClient::new(spec, patterns);
+            client.start().await?;
+            let result = client
+                .call_tool(McpToolCall {
+                    server: server.to_string(),
+                    tool: tool.to_string(),
+                    arguments,
+                })
+                .await;
+            client.shutdown().await.ok();
+            let result = result?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        other => anyhow::bail!("/mcp: unknown action `{other}` (expected `list` or `call`)"),
+    }
+    Ok(())
+}
+
+async fn handle_mayor_slash(args: Vec<&str>, cwd: &Path) -> Result<()> {
+    let action = args.first().copied().unwrap_or("status");
+    if action != "status" {
+        anyhow::bail!("usage: /mayor status");
+    }
+    let config = Config::load_from(cwd)?;
+    let mp = config
+        .orchestration
+        .mayor_patrol
+        .clone()
+        .unwrap_or_default();
+    let mayor = Mayor::new(mp, cwd.to_path_buf(), None);
+    let status = mayor.status().await?;
+    print_mayor_status(&status);
+    Ok(())
+}
+
+async fn handle_patrol_slash(args: Vec<&str>, cwd: &Path) -> Result<()> {
+    let action = args.first().copied().unwrap_or("status");
+    if action != "status" {
+        anyhow::bail!("usage: /patrol status");
+    }
+    let config = Config::load_from(cwd)?;
+    let mp = config
+        .orchestration
+        .mayor_patrol
+        .clone()
+        .unwrap_or_default();
+    let mayor = Mayor::new(mp, cwd.to_path_buf(), None);
+    let status = mayor.status().await?;
+    println!(
+        "patrol heartbeats: {}",
+        if status.active_patrols.is_empty() {
+            "none".to_string()
+        } else {
+            status.active_patrols.join(", ")
+        }
+    );
+    println!(
+        "queue: pending={} claimed={} done={} failed={}",
+        status.pending_count, status.claimed_count, status.done_count, status.failed_count
+    );
+    Ok(())
 }
 
 fn print_interactive_help() {
@@ -2146,6 +3125,11 @@ fn print_interactive_help() {
     println!("  /templates [query]     list or search prompt templates");
     println!("  /template <id> [args]  run a prompt template");
     println!("  /benchmark pi [n]      run the Pi workflow benchmark");
+    println!("Fork & multi-instance (v1.0):");
+    println!("  /fork [--from-round N] [--name NAME]  branch the current session");
+    println!("  /mcp list | call <s> <t> <json>      inspect or dispatch MCP tools");
+    println!("  /mayor status                        show queue depth + active patrols");
+    println!("  /patrol status                       show local heartbeat + queue");
     println!("Loop controls:");
     println!("  /plan <task>           run read-only plan analysis (never patches)");
     println!("  /goal <argv...>        register a deterministic stop check_cmd");
@@ -4332,6 +5316,153 @@ mod tests {
             let status = rpc_token_permission_status(&session_meta.join("rpc-token"));
             assert!(matches!(status, DoctorStatus::Ok));
         }
+    }
+
+    /// `nv fork`, `nv branch`, `nv mcp`, `nv mayor`, `nv patrol`, and the
+    /// `nv sessions` family must all be parsed by clap without colliding with
+    /// existing subcommands. We rely on clap's derive macro to enforce the
+    /// canonical names; a regression here would manifest as a clap error.
+    #[test]
+    fn v1_subcommands_parse_help() {
+        use clap::Parser;
+        for argv in [
+            vec!["nv", "fork", "--help"],
+            vec!["nv", "branch", "--help"],
+            vec!["nv", "sessions", "--help"],
+            vec!["nv", "sessions", "list", "--help"],
+            vec!["nv", "sessions", "tree", "--help"],
+            vec!["nv", "mcp", "--help"],
+            vec!["nv", "mcp", "list-tools", "--help"],
+            vec!["nv", "mcp", "probe", "--help"],
+            vec!["nv", "mayor", "--help"],
+            vec!["nv", "patrol", "--help"],
+        ] {
+            let err = Cli::try_parse_from(argv.clone()).unwrap_err();
+            assert!(
+                matches!(
+                    err.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ),
+                "expected --help on `{argv:?}` to surface help, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_fork_subcommand_with_round_and_name() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "nv",
+            "fork",
+            "01PARENT",
+            "--from-round",
+            "3",
+            "--name",
+            "hot-fix",
+        ])
+        .expect("clap must accept `nv fork ...`");
+        match cli.command {
+            Some(Command::Fork(args)) => {
+                assert_eq!(args.session_id, "01PARENT");
+                assert_eq!(args.from_round, Some(3));
+                assert_eq!(args.name.as_deref(), Some("hot-fix"));
+            }
+            other => panic!("expected Fork subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_branch_alias() {
+        use clap::Parser;
+        let cli =
+            Cli::try_parse_from(["nv", "branch", "01TASK"]).expect("clap must accept `nv branch`");
+        match cli.command {
+            Some(Command::Branch { task_id }) => assert_eq!(task_id, "01TASK"),
+            other => panic!("expected Branch subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_mayor_subcommand_flags() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "nv",
+            "mayor",
+            "--max-patrols",
+            "4",
+            "--per-patrol-budget-microusd",
+            "100000",
+            "--status-only",
+        ])
+        .expect("clap must accept `nv mayor ...`");
+        match cli.command {
+            Some(Command::Mayor(args)) => {
+                assert_eq!(args.max_patrols, Some(4));
+                assert_eq!(args.per_patrol_budget_microusd, Some(100_000));
+                assert!(args.status_only);
+            }
+            other => panic!("expected Mayor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_patrol_subcommand_flags() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "nv",
+            "patrol",
+            "--id",
+            "slot-1",
+            "--mcp-server",
+            "fs",
+            "--mcp-server",
+            "shell",
+            "--once",
+        ])
+        .expect("clap must accept `nv patrol ...`");
+        match cli.command {
+            Some(Command::Patrol(args)) => {
+                assert_eq!(args.id, "slot-1");
+                assert_eq!(args.mcp_server, vec!["fs".to_string(), "shell".to_string()]);
+                assert!(args.once);
+            }
+            other => panic!("expected Patrol subcommand, got {other:?}"),
+        }
+    }
+
+    /// Doctor must surface a `Fail` entry when `sessions/index.json` is
+    /// present but invalid JSON. Operators rely on this to catch corrupted
+    /// fork indexes before they cause silent fork misses.
+    #[test]
+    fn sessions_index_doctor_detects_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".nerve").join("sessions");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("index.json"), b"not-json").unwrap();
+        let status = sessions_index_status(dir.path());
+        assert!(matches!(status, DoctorStatus::Fail(_)));
+    }
+
+    /// Doctor's `sessions_index_status` must accept an empty workspace
+    /// (default `Ok`) so existing users see no new warning on v1.0 upgrade.
+    #[test]
+    fn sessions_index_doctor_accepts_missing_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = sessions_index_status(dir.path());
+        assert!(matches!(status, DoctorStatus::Ok));
+    }
+
+    /// `patrol_rpc_token_path` must namespace tokens per patrol id so two
+    /// patrols on the same host cannot read each other's bearer secrets.
+    #[test]
+    fn patrol_rpc_token_path_is_isolated_per_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join(".nerve").join("session-meta");
+        let a = patrol_rpc_token_path(&meta, "slot-1");
+        let b = patrol_rpc_token_path(&meta, "slot-2");
+        assert_ne!(a, b);
+        assert!(a.file_name().unwrap().to_string_lossy().contains("slot-1"));
+        assert!(b.file_name().unwrap().to_string_lossy().contains("slot-2"));
     }
 
     #[test]
