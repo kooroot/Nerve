@@ -394,7 +394,7 @@ where
 mod tests {
     use super::*;
     use crate::RunReport;
-    use nerve_config::{ProfileSelection, ReviewStrictness};
+    use nerve_config::{PlanStrategy, ProfileSelection, ReviewStrictness};
     use nerve_patch::{FilePatch, NvPatch};
     use nerve_types::{AgentOutput, ReviewerFeedback, Task};
 
@@ -411,6 +411,8 @@ mod tests {
                 reviewer: "reviewer".to_string(),
                 review_strictness: ReviewStrictness::Normal,
                 max_refinement_rounds: 1,
+                plan_strategy: PlanStrategy::Single,
+                plan_system_prompt_override: None,
             },
             rounds: Vec::new(),
             crossfire_feedback: Vec::new(),
@@ -452,6 +454,8 @@ mod tests {
                 reviewer: "reviewer".to_string(),
                 review_strictness: ReviewStrictness::Normal,
                 max_refinement_rounds: 1,
+                plan_strategy: PlanStrategy::Single,
+                plan_system_prompt_override: None,
             },
             rounds: Vec::new(),
             crossfire_feedback: Vec::new(),

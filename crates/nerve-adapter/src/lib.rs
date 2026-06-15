@@ -249,9 +249,18 @@ impl ModelAdapter for MockAdapter {
             .clone()
             .unwrap_or(MockOneshotResponse::Echo);
         match injected {
-            MockOneshotResponse::Echo => Ok(format!(
-                "MOCK_ONESHOT system={system_prompt} user={user_prompt}"
-            )),
+            MockOneshotResponse::Echo if system_prompt.contains("You are in PLAN mode") => {
+                Ok(format!(
+                    "## Objective\n{user_prompt}\n\n## Affected files\n- TBD\n\n## Steps\n1. Inspect the relevant code paths\n2. Implement the requested change\n3. Run targeted tests\n\n## Risks\nMock plan output is approximate\n\n## Estimated LOC\n~50 lines\n"
+                ))
+            }
+            MockOneshotResponse::Echo if system_prompt.contains("reviewing a PLAN") => Ok(
+                "Review: the plan is structured and includes objective, affected files, steps, risks, and estimated LOC."
+                    .to_string(),
+            ),
+            MockOneshotResponse::Echo => {
+                Ok(format!("MOCK_ONESHOT system={system_prompt} user={user_prompt}"))
+            }
             MockOneshotResponse::Literal(payload) => Ok(payload),
             MockOneshotResponse::Error(reason) => Err(AdapterError::OneshotFailed {
                 adapter: self.id().to_string(),
@@ -1121,6 +1130,44 @@ Lead notes before the patch.
 
         assert_eq!(adapter.timeout_secs, 7);
         assert_eq!(adapter.max_output_bytes, 11);
+    }
+
+    #[tokio::test]
+    async fn mock_oneshot_plan_prompt_returns_structured_markdown() {
+        let adapter = MockAdapter::new("mock");
+
+        let output = adapter
+            .dispatch_oneshot(
+                "You are in PLAN mode. Produce markdown only. DO NOT produce any patch, NvPatch, diff, or code modification.",
+                "audit the CLI plan path",
+            )
+            .await
+            .unwrap();
+
+        assert!(output.contains("## Objective"));
+        assert!(output.contains("## Affected files"));
+        assert!(output.contains("## Steps"));
+        assert!(!output.contains("NvPatch"));
+        assert!(!output.contains("diff --git"));
+        assert!(!output.contains("```diff"));
+    }
+
+    #[tokio::test]
+    async fn mock_oneshot_plan_review_prompt_avoids_patch_artifacts() {
+        let adapter = MockAdapter::new("mock");
+
+        let output = adapter
+            .dispatch_oneshot(
+                "You are reviewing a PLAN. DO NOT propose any patch, NvPatch, diff, or code modification.",
+                "## Objective\nCheck the plan",
+            )
+            .await
+            .unwrap();
+
+        assert!(output.contains("Review:"));
+        assert!(!output.contains("NvPatch"));
+        assert!(!output.contains("diff --git"));
+        assert!(!output.contains("```diff"));
     }
 
     #[tokio::test]

@@ -138,11 +138,15 @@ pub async fn run_plan_mode(
             )))
         })?;
 
-    let system_prompt = config
-        .roles
+    let system_prompt = selection
         .plan_system_prompt_override
         .clone()
         .unwrap_or_else(|| PLAN_ONLY_SYSTEM_PROMPT.to_string());
+    let strategy = if matches!(options.strategy, PlanStrategy::DualReview) {
+        PlanStrategy::DualReview
+    } else {
+        selection.plan_strategy.clone()
+    };
 
     let plan_markdown = lead.dispatch_oneshot(&system_prompt, &task.prompt).await?;
 
@@ -159,7 +163,7 @@ pub async fn run_plan_mode(
     let mut reviewer_feedback = String::new();
     let mut total_cost: Option<UsageStats> = None;
 
-    if matches!(options.strategy, PlanStrategy::DualReview) {
+    if matches!(strategy, PlanStrategy::DualReview) {
         let review_user_prompt = format!(
             "Task: {}\n\nPlan markdown to review:\n\n{}",
             task.prompt, plan_markdown
@@ -519,6 +523,55 @@ mod tests {
                 .contains("missing rollback strategy")
         );
         assert!(report.reviewer_feedback.contains("estimated LOC seems low"));
+    }
+
+    #[tokio::test]
+    async fn profile_plan_strategy_drives_dual_review_when_not_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("docs plan", dir.path());
+        let config = Arc::new(
+            Config::from_json_str(
+                r#"{
+                  "orchestration": {
+                    "default_strategy": "consensus",
+                    "max_refinement_rounds": 1,
+                    "conflict_policy": "lead_priority"
+                  },
+                  "roles": {
+                    "architect": "plan-lead",
+                    "reviewer": "plan-reviewer",
+                    "plan_strategy": "single"
+                  },
+                  "profiles": [
+                    {
+                      "id": "docs",
+                      "match_rules": ["docs"],
+                      "lead": "plan-lead",
+                      "reviewer": "plan-reviewer",
+                      "plan_strategy": "dual_review"
+                    }
+                  ]
+                }"#,
+            )
+            .unwrap(),
+        );
+
+        let lead = MockAdapter::new("plan-lead");
+        lead.set_oneshot_response(STRUCTURED_PLAN);
+        let reviewer = MockAdapter::new("plan-reviewer");
+        reviewer.set_oneshot_response("Profile reviewer was invoked.");
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![Box::new(lead), Box::new(reviewer)];
+
+        let report = run_plan_mode(
+            task,
+            config,
+            adapters,
+            PlanRunOptions::new(PlanStrategy::Single),
+        )
+        .await
+        .expect("profile dual_review should run");
+
+        assert!(report.reviewer_feedback.contains("Profile reviewer"));
     }
 
     #[tokio::test]

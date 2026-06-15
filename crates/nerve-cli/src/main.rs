@@ -494,13 +494,20 @@ async fn main() -> Result<()> {
                     matches!(cli.adapter, AdapterMode::Mock),
                     once,
                     print_token,
+                    cli_worktree_override(cli.worktree, cli.no_worktree),
                 )
                 .await
             } else {
                 if print_token {
                     anyhow::bail!("--print-token requires --rpc (or daemon.protocol=rpc)");
                 }
-                run_daemon(cli.apply, matches!(cli.adapter, AdapterMode::Mock), once).await
+                run_daemon(
+                    cli.apply,
+                    matches!(cli.adapter, AdapterMode::Mock),
+                    once,
+                    cli_worktree_override(cli.worktree, cli.no_worktree),
+                )
+                .await
             }
         }
         Some(Command::Rpc { command }) => run_rpc_subcommand(command),
@@ -1828,19 +1835,20 @@ async fn run_plan_subcommand(args: PlanArgs, mock: bool, json: bool) -> Result<(
         None => env::current_dir().context("failed to read current directory")?,
     };
     let config = Config::load_from(&task_cwd)?;
-    let strategy = if args.dual_review {
+    let requested_strategy = if args.dual_review {
         PlanStrategy::DualReview
     } else {
-        config.roles.plan_strategy.clone()
+        PlanStrategy::Single
     };
 
-    let task = Task::new(args.task, &task_cwd);
+    let mut task = Task::new(args.task, &task_cwd);
+    task.context_paths = collect_context_paths(&task.prompt, &task_cwd);
     let adapters = adapters_for_config(mock, &config);
     let report = run_plan_mode(
         task,
         Arc::new(config),
         adapters,
-        PlanRunOptions::new(strategy),
+        PlanRunOptions::new(requested_strategy),
     )
     .await
     .map_err(plan_error_to_anyhow)?;
@@ -1906,19 +1914,21 @@ fn rpc_rotate_token() -> Result<()> {
     })?;
     let config = Config::load_from(&cwd)?;
     let rpc_config = config.daemon.rpc.clone().unwrap_or_default();
-    let bus = RpcBus::new(rpc_config, &session_meta)
+    let token_path = if rpc_config.token_path.is_absolute() {
+        rpc_config.token_path.clone()
+    } else {
+        cwd.join(&rpc_config.token_path)
+    };
+    let bus = RpcBus::new(rpc_config, &cwd)
         .with_context(|| "failed to open RPC bus for token rotation")?;
     let new_token = bus
-        .rotate_token(&session_meta)
+        .rotate_token(&cwd)
         .with_context(|| "failed to rotate RPC bearer token")?;
     println!(
         "rotated rpc bearer token (32 bytes / {} hex chars)",
         new_token.len()
     );
-    println!(
-        "token written to {}",
-        session_meta.join("rpc-token").display()
-    );
+    println!("token written to {}", token_path.display());
     Ok(())
 }
 
@@ -1930,14 +1940,14 @@ fn rpc_rotate_token() -> Result<()> {
 async fn run_interactive_plan(prompt: String, state: &InteractiveState) -> Result<()> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let config = Config::load_from(&cwd)?;
-    let task = Task::new(prompt, &cwd);
+    let mut task = Task::new(prompt, &cwd);
+    task.context_paths = collect_context_paths(&task.prompt, &cwd);
     let adapters = adapters_for_config(state.mock, &config);
-    let strategy = config.roles.plan_strategy.clone();
     let report = run_plan_mode(
         task,
         Arc::new(config),
         adapters,
-        PlanRunOptions::new(strategy),
+        PlanRunOptions::new(PlanStrategy::Single),
     )
     .await
     .map_err(plan_error_to_anyhow)?;
@@ -3931,7 +3941,12 @@ fn confirm_raise_interactive(label: &str) -> Result<bool> {
     Ok(matches!(answer.as_str(), "y" | "yes"))
 }
 
-async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
+async fn run_daemon(
+    apply: bool,
+    mock: bool,
+    once: bool,
+    worktree_override: Option<bool>,
+) -> Result<()> {
     let _echo_guard = disable_stdin_echo_if_terminal()?;
     let stdin = io::BufReader::new(io::stdin());
     let mut lines = stdin.lines();
@@ -3942,7 +3957,7 @@ async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
             continue;
         }
 
-        let report = run_report(prompt.to_string(), apply, mock, None).await?;
+        let report = run_report(prompt.to_string(), apply, mock, worktree_override).await?;
         println!("{}", serde_json::to_string(&report)?);
 
         if once {
@@ -3953,7 +3968,13 @@ async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_rpc_daemon(apply: bool, mock: bool, once: bool, print_token: bool) -> Result<()> {
+async fn run_rpc_daemon(
+    apply: bool,
+    mock: bool,
+    once: bool,
+    print_token: bool,
+    worktree_override: Option<bool>,
+) -> Result<()> {
     let _echo_guard = disable_stdin_echo_if_terminal()?;
 
     // Tier 2e (sec-4 #4): bring up the per-session RPC bus before processing
@@ -3972,7 +3993,7 @@ async fn run_rpc_daemon(apply: bool, mock: bool, once: bool, print_token: bool) 
     let rpc_config = config_for_rpc.daemon.rpc.clone().unwrap_or_default();
     let print_token = print_token || rpc_config.print_token;
     let bus = Arc::new(
-        RpcBus::new(rpc_config, &session_meta)
+        RpcBus::new(rpc_config, &cwd)
             .with_context(|| "failed to open RPC bus for daemon startup")?,
     );
 
@@ -3980,7 +4001,7 @@ async fn run_rpc_daemon(apply: bool, mock: bool, once: bool, print_token: bool) 
         // Token surfaces as a typed envelope on stdout (not the bearer text
         // alone) so editors / shell wrappers can pull it out of the same JSONL
         // stream that carries lifecycle events.
-        let envelope = RpcEnvelope::new(
+        let envelope = rpc_envelope(
             "rpc.token",
             serde_json::json!({ "bearer": bus.bearer_token() }),
         );
@@ -4013,7 +4034,9 @@ async fn run_rpc_daemon(apply: bool, mock: bool, once: bool, print_token: bool) 
             }
         };
 
-        if let Err(error) = handle_rpc_command(value, apply, mock, bus.clone()).await {
+        if let Err(error) =
+            handle_rpc_command(value, apply, mock, bus.clone(), worktree_override).await
+        {
             println!(
                 "{}",
                 serde_json::json!({
@@ -4048,6 +4071,10 @@ fn emit_envelope_line(envelope: &RpcEnvelope) {
     }
 }
 
+fn rpc_envelope(kind: &str, payload: serde_json::Value) -> RpcEnvelope {
+    RpcEnvelope::new(kind, payload).with_fresh_metadata()
+}
+
 /// Convert an [`AgentEvent`] into the Tier 2e envelope kinds expected by
 /// subscribers (lead / reviewer stdout chunks). Returns `None` when the
 /// event has no envelope representation (e.g. terminal `Done`).
@@ -4073,7 +4100,7 @@ fn agent_event_to_envelopes(event: &AgentEvent, lead_id: &str) -> Vec<RpcEnvelop
     } else {
         rpc_kinds::REVIEWER_STDOUT
     };
-    vec![RpcEnvelope::new(
+    vec![rpc_envelope(
         kind,
         serde_json::json!({ "agent_id": agent_id, "chunk": line }),
     )]
@@ -4084,6 +4111,7 @@ async fn handle_rpc_command(
     apply: bool,
     mock: bool,
     bus: Arc<RpcBus>,
+    worktree_override: Option<bool>,
 ) -> Result<()> {
     use nerve_types::rpc_kinds;
 
@@ -4097,12 +4125,12 @@ async fn handle_rpc_command(
                 .get("prompt")
                 .and_then(serde_json::Value::as_str)
                 .context("missing string field `prompt`")?;
-            let report = run_report(prompt.to_string(), apply, mock, None).await?;
+            let report = run_report(prompt.to_string(), apply, mock, worktree_override).await?;
             emit_report_events(&report)?;
             // Tier 2e (v0.5.0) lifecycle envelopes: emit through the bus and
             // also stream them as newline-delimited JSON on stdout so consumers
             // that don't subscribe to the broadcast channel still observe them.
-            let session_started = RpcEnvelope::new(
+            let session_started = rpc_envelope(
                 rpc_kinds::SESSION_STARTED,
                 serde_json::json!({
                     "session_id": report.task.id,
@@ -4125,7 +4153,7 @@ async fn handle_rpc_command(
             // per-iter timings from `RunReport` (one-shot RPC) so the envelope
             // carries the round index only.
             for round in &report.rounds {
-                let round_started = RpcEnvelope::new(
+                let round_started = rpc_envelope(
                     rpc_kinds::ROUND_STARTED,
                     serde_json::json!({
                         "session_id": report.task.id,
@@ -4135,7 +4163,7 @@ async fn handle_rpc_command(
                 emit_envelope_line(&round_started);
                 let _ = bus.emit(rpc_kinds::ROUND_STARTED, round_started.payload.clone());
 
-                let round_ended = RpcEnvelope::new(
+                let round_ended = rpc_envelope(
                     rpc_kinds::ROUND_ENDED,
                     serde_json::json!({
                         "session_id": report.task.id,
@@ -4149,7 +4177,7 @@ async fn handle_rpc_command(
             }
 
             // Budget envelope: cumulative usage at the end of the session.
-            let budget_envelope = RpcEnvelope::new(
+            let budget_envelope = rpc_envelope(
                 rpc_kinds::BUDGET_CHANGED,
                 serde_json::json!({
                     "session_id": report.task.id,
@@ -4169,7 +4197,7 @@ async fn handle_rpc_command(
                 } else {
                     rpc_kinds::PATCH_DISCARDED
                 };
-                let patch_envelope = RpcEnvelope::new(
+                let patch_envelope = rpc_envelope(
                     kind,
                     serde_json::json!({
                         "session_id": report.task.id,
@@ -4182,7 +4210,7 @@ async fn handle_rpc_command(
                 let _ = bus.emit(kind, patch_envelope.payload.clone());
             }
 
-            let session_ended = RpcEnvelope::new(
+            let session_ended = rpc_envelope(
                 rpc_kinds::SESSION_ENDED,
                 serde_json::json!({
                     "session_id": report.task.id,
@@ -4222,22 +4250,23 @@ async fn handle_rpc_command(
                 .unwrap_or(false);
             let cwd = env::current_dir().context("failed to read current directory")?;
             let config = Config::load_from(&cwd)?;
-            let strategy = if dual_review {
+            let requested_strategy = if dual_review {
                 PlanStrategy::DualReview
             } else {
-                config.roles.plan_strategy.clone()
+                PlanStrategy::Single
             };
-            let task = Task::new(prompt.to_string(), &cwd);
+            let mut task = Task::new(prompt.to_string(), &cwd);
+            task.context_paths = collect_context_paths(&task.prompt, &cwd);
             let adapters = adapters_for_config(mock, &config);
             let report = run_plan_mode(
                 task,
                 Arc::new(config),
                 adapters,
-                PlanRunOptions::new(strategy),
+                PlanRunOptions::new(requested_strategy),
             )
             .await
             .map_err(plan_error_to_anyhow)?;
-            let envelope = RpcEnvelope::new(
+            let envelope = rpc_envelope(
                 rpc_kinds::PLAN_PROPOSED,
                 serde_json::json!({
                     "task_id": report.task_id,
@@ -4500,6 +4529,11 @@ async fn run_report_with_overrides(
     if let Some(spec) = goal {
         options = options.with_goal(spec);
     }
+    if let Some(spec) = config.orchestration.check_ulimit.as_ref()
+        && !spec.is_empty()
+    {
+        options = options.with_ulimit(core_ulimit_from_config(spec));
+    }
     if let Some(on) = worktree_override {
         options = options.with_worktree(on);
     }
@@ -4514,6 +4548,15 @@ fn adapters_for_config(mock: bool, config: &Config) -> Vec<Box<dyn ModelAdapter>
         config.orchestration.adapter_timeout_secs,
         config.orchestration.adapter_max_output_bytes,
     )
+}
+
+fn core_ulimit_from_config(spec: &nerve_config::CheckUlimit) -> nerve_core::ulimit::CheckUlimit {
+    nerve_core::ulimit::CheckUlimit {
+        nproc: spec.nproc,
+        address_space_bytes: spec.memory_bytes,
+        file_size_bytes: spec.file_size_bytes,
+        cpu_secs: spec.cpu_secs,
+    }
 }
 
 fn emit_report_events(report: &RunReport) -> Result<()> {
@@ -5186,6 +5229,23 @@ mod tests {
     }
 
     #[test]
+    fn config_check_ulimit_maps_to_core_runtime_spec() {
+        let spec = nerve_config::CheckUlimit {
+            nproc: Some(32),
+            memory_bytes: Some(2_147_483_648),
+            file_size_bytes: Some(104_857_600),
+            cpu_secs: Some(60),
+        };
+
+        let mapped = core_ulimit_from_config(&spec);
+
+        assert_eq!(mapped.nproc, Some(32));
+        assert_eq!(mapped.address_space_bytes, Some(2_147_483_648));
+        assert_eq!(mapped.file_size_bytes, Some(104_857_600));
+        assert_eq!(mapped.cpu_secs, Some(60));
+    }
+
+    #[test]
     fn template_query_matches_substring_case_insensitive() {
         let template = nerve_config::PromptTemplate {
             id: "security-audit".to_string(),
@@ -5300,9 +5360,9 @@ mod tests {
             ..Default::default()
         };
 
-        let bus = RpcBus::new(rpc_config, &session_meta).expect("rpc bus init");
+        let bus = RpcBus::new(rpc_config, dir.path()).expect("rpc bus init");
         let before = bus.bearer_token();
-        let after = bus.rotate_token(&session_meta).expect("rotate token");
+        let after = bus.rotate_token(dir.path()).expect("rotate token");
 
         assert_ne!(before, after, "rotated token must differ from previous");
         let on_disk =

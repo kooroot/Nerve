@@ -96,9 +96,8 @@ pub struct RunOptions {
     /// reviewer verdict per §3 Tier 1b ma-2 / ma-6 decision table.
     pub goal: Option<GoalSpec>,
     /// sec-gap-5: optional parent-level resource limits applied via
-    /// setrlimit(2) before the `/goal check_cmd` child execs. CLI populates
-    /// from `Orchestration.check_ulimit` once nerve-config publishes that
-    /// field; until then the field defaults to `None` (no limits).
+    /// setrlimit(2) before the `/goal check_cmd` child execs. CLI populates this
+    /// from `Orchestration.check_ulimit`; `None` leaves child limits unchanged.
     pub ulimit: Option<ulimit::CheckUlimit>,
     /// Tier 2d (v0.3.0): per-run override for worktree-isolated `/apply`.
     /// `None` defers to `Config.orchestration.worktree_apply`. `Some(true)`
@@ -542,9 +541,6 @@ fn build_goal_evaluator(
         return Ok(None);
     };
     let cwd = spec.cwd.clone().unwrap_or_else(|| task.cwd.clone());
-    // sec-gap-5: CLI plumbs `check_ulimit` through `RunOptions::ulimit`
-    // (added separately when nerve-config publishes the `Orchestration`
-    // field). Until then, fall back to the default no-op constructor.
     let evaluator = GoalEvaluator::with_ulimit(
         spec,
         orchestration.check_env.clone(),

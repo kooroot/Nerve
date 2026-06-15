@@ -77,9 +77,9 @@ impl GoalIntentConverter {
         self.adapter.id()
     }
 
-    /// Convert `free_form` into a vetted `GoalIntent`. `cwd` is recorded on
-    /// the proposed GoalSpec when the model omits one, so the orchestrator
-    /// freezes the workspace root from the call site (sec-1 #2).
+    /// Convert `free_form` into a vetted `GoalIntent`. `cwd` is always recorded
+    /// from the call site so the orchestrator freezes the workspace root instead
+    /// of trusting model-proposed paths (sec-1 #2).
     pub async fn convert(
         &self,
         free_form: &str,
@@ -126,7 +126,15 @@ impl GoalIntentConverter {
             None => 60,
         };
 
-        let resolved_cwd = parsed.cwd.clone().unwrap_or_else(|| cwd.to_path_buf());
+        if let Some(proposed_cwd) = parsed.cwd.as_ref()
+            && proposed_cwd != cwd
+        {
+            return Err(GoalIntentError::InvalidProposal {
+                reason: "cwd field is controlled by caller".into(),
+            });
+        }
+
+        let resolved_cwd = cwd.to_path_buf();
         let spec = GoalSpec {
             id: Uuid::new_v4().to_string(),
             check_cmd: parsed.check_cmd,
@@ -308,6 +316,27 @@ mod tests {
             err,
             GoalIntentError::ValidationFailed(ConfigError::InvalidCheckCmdProgram(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn convert_rejects_model_controlled_cwd() {
+        let mock = MockAdapter::new("mock-cwd");
+        mock.set_oneshot_response(
+            r#"{"check_cmd":["cargo","test"],"timeout_secs":60,"cwd":"/tmp/elsewhere","rationale":"runs tests"}"#,
+        );
+        let converter = GoalIntentConverter::new(Arc::new(mock));
+
+        let err = converter
+            .convert("run tests", &cwd())
+            .await
+            .expect_err("model must not move the goal cwd");
+
+        match err {
+            GoalIntentError::InvalidProposal { reason } => {
+                assert!(reason.contains("cwd"));
+            }
+            other => panic!("expected InvalidProposal, got {other:?}"),
+        }
     }
 
     #[tokio::test]

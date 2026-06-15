@@ -229,6 +229,12 @@ impl RpcEnvelope {
         self.emitted_at = Some(ts);
         self
     }
+
+    /// Attach fresh runtime metadata for a newly emitted envelope.
+    pub fn with_fresh_metadata(self) -> Self {
+        self.with_envelope_id(ulid::Ulid::new().to_string())
+            .with_emitted_at(Utc::now())
+    }
 }
 
 /// Stable catalog of RPC event kinds emitted by the core runtime.
@@ -534,6 +540,14 @@ mod tests {
         assert_eq!(decoded.schema_version, RPC_SCHEMA_VERSION);
         assert_eq!(decoded.kind, rpc_kinds::LEAD_STDOUT);
         assert_eq!(decoded.envelope_id.as_deref(), Some("evt-1"));
+    }
+
+    #[test]
+    fn envelope_fresh_metadata_sets_id_and_timestamp() {
+        let env = RpcEnvelope::new(rpc_kinds::SESSION_STARTED, json!({})).with_fresh_metadata();
+
+        assert!(env.envelope_id.is_some());
+        assert!(env.emitted_at.is_some());
     }
 
     #[test]
