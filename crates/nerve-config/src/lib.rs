@@ -7,7 +7,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub mod goal;
+pub mod goal_intent;
 pub use goal::{ConfigError, GoalSpec};
+pub use goal_intent::GoalIntent;
 
 const DEFAULT_CONFIG: &str = include_str!("../../../nerve.config.json");
 
@@ -55,6 +57,56 @@ pub struct Orchestration {
     pub budget_cost_microusd_ceiling: Option<u64>,
     #[serde(default)]
     pub budget_tokens_ceiling: Option<u64>,
+    // sec-gap-5: optional parent-level resource limits applied before spawning
+    // /goal check_cmd children. Linux honours all fields; macOS supports
+    // RLIMIT_AS / RLIMIT_FSIZE / RLIMIT_CPU; nproc is best-effort.
+    #[serde(default)]
+    pub check_ulimit: Option<CheckUlimit>,
+    // Tier 2d (v0.3.0): opt-in worktree-isolated /apply path.
+    #[serde(default)]
+    pub worktree_apply: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CheckUlimit {
+    /// RLIMIT_NPROC — max user processes (Linux primary, macOS best-effort).
+    #[serde(default)]
+    pub nproc: Option<u64>,
+    /// RLIMIT_AS — max virtual address space, bytes.
+    #[serde(default)]
+    pub memory_bytes: Option<u64>,
+    /// RLIMIT_FSIZE — max file size the process can create, bytes.
+    #[serde(default)]
+    pub file_size_bytes: Option<u64>,
+    /// RLIMIT_CPU — max CPU seconds.
+    #[serde(default)]
+    pub cpu_secs: Option<u64>,
+}
+
+impl CheckUlimit {
+    pub fn is_empty(&self) -> bool {
+        self.nproc.is_none()
+            && self.memory_bytes.is_none()
+            && self.file_size_bytes.is_none()
+            && self.cpu_secs.is_none()
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.nproc == Some(0) {
+            return Err(ConfigError::InvalidUlimitValue("nproc"));
+        }
+        if self.memory_bytes == Some(0) {
+            return Err(ConfigError::InvalidUlimitValue("memory_bytes"));
+        }
+        if self.file_size_bytes == Some(0) {
+            return Err(ConfigError::InvalidUlimitValue("file_size_bytes"));
+        }
+        if self.cpu_secs == Some(0) {
+            return Err(ConfigError::InvalidUlimitValue("cpu_secs"));
+        }
+        Ok(())
+    }
 }
 
 impl Orchestration {
@@ -259,6 +311,16 @@ impl Config {
         }
         if self.orchestration.adapter_max_output_bytes == Some(0) {
             anyhow::bail!("orchestration.adapter_max_output_bytes must be greater than 0 when set");
+        }
+        if let Some(ulimit) = &self.orchestration.check_ulimit {
+            ulimit
+                .validate()
+                .map_err(|e| anyhow::anyhow!("orchestration.check_ulimit invalid: {e}"))?;
+        }
+        if self.orchestration.worktree_apply {
+            eprintln!(
+                "[nerve-config] orchestration.worktree_apply is enabled; run `nv doctor` to verify git worktree readiness."
+            );
         }
         if self.roles.architect.trim().is_empty() {
             anyhow::bail!("roles.architect must not be empty");
@@ -576,5 +638,84 @@ mod tests {
             config.templates[0].description.as_deref(),
             Some("Audit a target")
         );
+    }
+
+    #[test]
+    fn goal_intent_validate_round_trip() {
+        use chrono::Utc;
+        let intent = GoalIntent {
+            free_form: "run cargo tests until they pass".into(),
+            proposed_spec: GoalSpec {
+                id: "intent-1".into(),
+                check_cmd: vec!["cargo".into(), "test".into()],
+                timeout_secs: 60,
+                cwd: None,
+                env: Default::default(),
+                no_progress_max: None,
+            },
+            rationale: "user asked for cargo test gate".into(),
+            source_adapter: "claude-code".into(),
+            created_at: Utc::now(),
+        };
+        intent.validate().unwrap();
+
+        let json = serde_json::to_string(&intent).unwrap();
+        let back: GoalIntent = serde_json::from_str(&json).unwrap();
+        assert_eq!(intent, back);
+        back.validate().unwrap();
+    }
+
+    #[test]
+    fn check_ulimit_rejects_zero() {
+        let zero_nproc = CheckUlimit {
+            nproc: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            zero_nproc.validate(),
+            Err(ConfigError::InvalidUlimitValue("nproc"))
+        );
+
+        let zero_mem = CheckUlimit {
+            memory_bytes: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            zero_mem.validate(),
+            Err(ConfigError::InvalidUlimitValue("memory_bytes"))
+        );
+
+        let zero_fsize = CheckUlimit {
+            file_size_bytes: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            zero_fsize.validate(),
+            Err(ConfigError::InvalidUlimitValue("file_size_bytes"))
+        );
+
+        let zero_cpu = CheckUlimit {
+            cpu_secs: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            zero_cpu.validate(),
+            Err(ConfigError::InvalidUlimitValue("cpu_secs"))
+        );
+
+        let ok = CheckUlimit {
+            nproc: Some(64),
+            memory_bytes: Some(2_147_483_648),
+            file_size_bytes: Some(104_857_600),
+            cpu_secs: Some(300),
+        };
+        ok.validate().unwrap();
+    }
+
+    #[test]
+    fn orchestration_worktree_default_false() {
+        let config = Config::from_json_str(DEFAULT_CONFIG).unwrap();
+        assert!(!config.orchestration.worktree_apply);
+        assert!(config.orchestration.check_ulimit.is_none());
     }
 }

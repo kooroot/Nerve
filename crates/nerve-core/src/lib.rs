@@ -21,10 +21,19 @@ use tokio::time::{Duration, sleep};
 
 pub mod budget_audit;
 pub mod goal;
+pub mod goal_intent;
 pub mod store;
+pub mod ulimit;
+pub mod worktree;
 
-pub use budget_audit::{BudgetAuditEntry, BudgetSnapshot, append_budget_audit_entry};
+pub use budget_audit::{
+    AuditChainState, AuditError, BudgetAuditEntry, BudgetSnapshot, ChainStatus,
+    append_budget_audit_entry, format_chain_broken,
+};
 pub use goal::{GoalError, GoalEvaluator};
+pub use goal_intent::{GOAL_INTENT_SYSTEM_PROMPT, GoalIntentConverter, GoalIntentError};
+pub use ulimit::{UlimitError, apply_ulimit};
+pub use worktree::{IsolatedRound, OrphanManifestEntry, WorktreeError, WorktreeIsolator};
 
 #[derive(Debug, Clone)]
 pub struct Synapse {
@@ -71,17 +80,52 @@ pub struct RunOptions {
     /// Optional deterministic check_cmd evaluated each round. AND-combined with
     /// reviewer verdict per §3 Tier 1b ma-2 / ma-6 decision table.
     pub goal: Option<GoalSpec>,
+    /// sec-gap-5: optional parent-level resource limits applied via
+    /// setrlimit(2) before the `/goal check_cmd` child execs. CLI populates
+    /// from `Orchestration.check_ulimit` once nerve-config publishes that
+    /// field; until then the field defaults to `None` (no limits).
+    pub ulimit: Option<ulimit::CheckUlimit>,
+    /// Tier 2d (v0.3.0): per-run override for worktree-isolated `/apply`.
+    /// `None` defers to `Config.orchestration.worktree_apply`. `Some(true)`
+    /// forces the worktree path; `Some(false)` forces the legacy path even if
+    /// the config has it enabled (useful for tests and recovery).
+    pub worktree: Option<bool>,
 }
 
 impl RunOptions {
     pub fn new(apply: bool) -> Self {
-        Self { apply, goal: None }
+        Self {
+            apply,
+            goal: None,
+            ulimit: None,
+            worktree: None,
+        }
     }
 
     pub fn with_goal(mut self, goal: GoalSpec) -> Self {
         self.goal = Some(goal);
         self
     }
+
+    pub fn with_ulimit(mut self, ulimit: ulimit::CheckUlimit) -> Self {
+        self.ulimit = Some(ulimit);
+        self
+    }
+
+    /// Tier 2d override. RunOptions value wins over
+    /// `Orchestration.worktree_apply` when set.
+    pub fn with_worktree(mut self, on: bool) -> Self {
+        self.worktree = Some(on);
+        self
+    }
+}
+
+/// Resolve whether to use the worktree-isolated apply path.
+///
+/// `RunOptions::worktree` takes precedence; if unset, fall back to
+/// `Config.orchestration.worktree_apply`.
+fn resolve_worktree_apply(options: &RunOptions, orchestration: &Orchestration) -> bool {
+    options.worktree.unwrap_or(orchestration.worktree_apply)
 }
 
 impl Synapse {
@@ -296,16 +340,13 @@ pub async fn run_synaptic_loop(
         || goal_check_failed
         || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
 
-    let applied = if options.apply && !blocked {
-        if let Some(patch) = &final_patch {
-            patch.apply(&task.cwd, false)?;
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let applied = apply_final_patch(
+        &task,
+        final_patch.as_ref(),
+        options.apply && !blocked,
+        resolve_worktree_apply(&options, &config.orchestration),
+    )
+    .await?;
 
     let goal_satisfied = options.goal.as_ref().map(|_| {
         matches!(
@@ -443,16 +484,13 @@ async fn run_tournament_strategy(
         || goal_check_failed
         || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
 
-    let applied = if options.apply && !blocked {
-        if let Some(patch) = &final_patch {
-            patch.apply(&task.cwd, false)?;
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let applied = apply_final_patch(
+        &task,
+        final_patch.as_ref(),
+        options.apply && !blocked,
+        resolve_worktree_apply(&options, &config.orchestration),
+    )
+    .await?;
 
     let goal_satisfied = options.goal.as_ref().map(|_| {
         matches!(check_result, CheckResult::Pass | CheckResult::Skipped)
@@ -487,11 +525,15 @@ fn build_goal_evaluator(
         return Ok(None);
     };
     let cwd = spec.cwd.clone().unwrap_or_else(|| task.cwd.clone());
-    let evaluator = GoalEvaluator::new(
+    // sec-gap-5: CLI plumbs `check_ulimit` through `RunOptions::ulimit`
+    // (added separately when nerve-config publishes the `Orchestration`
+    // field). Until then, fall back to the default no-op constructor.
+    let evaluator = GoalEvaluator::with_ulimit(
         spec,
         orchestration.check_env.clone(),
         orchestration.check_output_cap_bytes,
         cwd,
+        options.ulimit.clone(),
     )
     .map_err(|err| anyhow::anyhow!("goal evaluator setup failed: {err}"))?;
     Ok(Some(evaluator))
@@ -705,6 +747,100 @@ fn strictness_label(strictness: &ReviewStrictness) -> &'static str {
     }
 }
 
+/// Apply the final selected patch.
+///
+/// v0.3.0 Tier 2d simplification: only the *final* patch is funneled through
+/// the worktree isolator. Round-by-round isolation is deferred to v0.5.0.
+///
+/// Behaviour:
+/// - `should_apply == false` → returns `Ok(false)`; legacy.
+/// - `should_apply && patch.is_none()` → returns `Ok(false)`; nothing to do.
+/// - `should_apply && !use_worktree` → legacy in-place apply against
+///   `task.cwd`.
+/// - `should_apply && use_worktree` → prepare a worktree round, apply the
+///   patch inside, merge on success. On any worktree error, discard the
+///   round and propagate the error so the caller (`run_synaptic_loop`) can
+///   surface it.
+async fn apply_final_patch(
+    task: &Task,
+    final_patch: Option<&NvPatch>,
+    should_apply: bool,
+    use_worktree: bool,
+) -> Result<bool> {
+    if !should_apply {
+        return Ok(false);
+    }
+    let Some(patch) = final_patch else {
+        return Ok(false);
+    };
+    if !use_worktree {
+        patch.apply(&task.cwd, false)?;
+        return Ok(true);
+    }
+
+    let isolator = WorktreeIsolator::new(task.cwd.clone())
+        .map_err(|err| anyhow::anyhow!("worktree isolator setup failed: {err}"))?;
+    let round = isolator
+        .prepare_round(0)
+        .map_err(|err| anyhow::anyhow!("worktree prepare failed: {err}"))?;
+    if let Err(err) = isolator.apply_patch_in_worktree(&round, patch).await {
+        // discard returns Ok unless rewind fails catastrophically; we still
+        // surface the original apply error.
+        let _ = isolator.discard_round(round);
+        return Err(anyhow::anyhow!("worktree patch apply failed: {err}"));
+    }
+
+    // Commit the patch inside the worktree so the merge target has a tip
+    // to fast-forward onto. We use `-q` + a generated message and rely on
+    // the per-worktree HEAD; falling back gracefully if `git commit`
+    // reports "nothing to commit" (no-op patch).
+    if let Err(err) = commit_worktree_round(&round.worktree_path) {
+        let _ = isolator.discard_round(round);
+        return Err(anyhow::anyhow!("worktree commit failed: {err}"));
+    }
+
+    match isolator.merge_round(round.clone()) {
+        Ok(()) => Ok(true),
+        Err(err) => {
+            // merge_round already rewinds main; nothing else to do.
+            Err(anyhow::anyhow!("worktree merge failed: {err}"))
+        }
+    }
+}
+
+fn commit_worktree_round(worktree_path: &Path) -> Result<()> {
+    let add = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(worktree_path)
+        .output()
+        .context("failed to spawn `git add` in worktree")?;
+    if !add.status.success() {
+        anyhow::bail!(
+            "`git add` in worktree failed: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        );
+    }
+
+    let commit = Command::new("git")
+        .args([
+            "commit",
+            "-q",
+            "-m",
+            "nerve worktree round commit",
+            "--allow-empty",
+        ])
+        .current_dir(worktree_path)
+        .output()
+        .context("failed to spawn `git commit` in worktree")?;
+    if !commit.status.success() {
+        anyhow::bail!(
+            "`git commit` in worktree failed: {}",
+            String::from_utf8_lossy(&commit.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 fn select_final_patch(
     lead_output: &AgentOutput,
     feedback: &ReviewerFeedback,
@@ -831,6 +967,156 @@ fn is_blocked(feedback: &ReviewerFeedback, policy: &ConflictPolicy) -> bool {
         }
         ConflictPolicy::Manual => true,
     }
+}
+
+/// Tier 2d / sec-gap-12 readiness signal returned by [`doctor_checks`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctorCheck {
+    pub name: String,
+    pub status: DoctorStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DoctorStatus {
+    Ok,
+    Warn(String),
+    Fail(String),
+}
+
+/// Compute the v0.3.0 doctor signal set:
+///
+/// 1. `git` executable on PATH (Tier 2d guard #4)
+/// 2. statvfs of `cwd/.nerve` above 100 MiB (Tier 2d guard #6)
+/// 3. orphaned-worktrees count (sec-5 #7 quarantine bin)
+/// 4. budget-audit hash chain integrity (sec-gap-12)
+/// 5. active-goal.json validity (Phase 2 /goal)
+///
+/// The CLI doctor command is wired in a follow-up phase; this helper exists
+/// so the doctor signal set is owned by `nerve-core` and stays consistent
+/// with the runtime guards above.
+pub fn doctor_checks(_config: &Config, cwd: &Path) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+
+    // 1. git --version
+    let status = match Command::new("git").arg("--version").output() {
+        Ok(out) if out.status.success() => DoctorStatus::Ok,
+        Ok(out) => DoctorStatus::Fail(format!(
+            "`git --version` exited with status {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(err) => DoctorStatus::Fail(format!("git not found on PATH: {err}")),
+    };
+    checks.push(DoctorCheck {
+        name: "git".to_string(),
+        status,
+    });
+
+    // 2. statvfs of cwd/.nerve (100 MiB threshold = worktree default)
+    let nerve_root = cwd.join(".nerve");
+    let probe = if nerve_root.exists() {
+        nerve_root.clone()
+    } else {
+        cwd.to_path_buf()
+    };
+    let status = match worktree::available_mib_for_doctor(&probe) {
+        Ok(available) if available >= 100 => DoctorStatus::Ok,
+        Ok(available) => DoctorStatus::Warn(format!(
+            "only {available} MiB free under `{}` (threshold 100 MiB)",
+            probe.display()
+        )),
+        Err(err) => DoctorStatus::Warn(format!("statvfs failed: {err}")),
+    };
+    checks.push(DoctorCheck {
+        name: "disk_space".to_string(),
+        status,
+    });
+
+    // 3. orphaned-worktrees count
+    let orphan_dir = cwd
+        .join(".nerve")
+        .join("scratch")
+        .join("orphaned-worktrees");
+    let status = match orphan_entry_count(&orphan_dir) {
+        Ok(0) => DoctorStatus::Ok,
+        Ok(n) => DoctorStatus::Warn(format!(
+            "{n} quarantined worktree(s) under `{}`",
+            orphan_dir.display()
+        )),
+        Err(err) => DoctorStatus::Warn(format!("could not read `{}`: {err}", orphan_dir.display())),
+    };
+    checks.push(DoctorCheck {
+        name: "orphaned_worktrees".to_string(),
+        status,
+    });
+
+    // 4. budget-audit chain integrity
+    let audit_path = cwd
+        .join(".nerve")
+        .join("session-meta")
+        .join("budget-audit.json");
+    let status = match AuditChainState::verify(&audit_path) {
+        Ok(ChainStatus::Empty) => DoctorStatus::Ok,
+        Ok(ChainStatus::Intact { entries, .. }) => {
+            tracing::debug!(entries, "audit chain intact");
+            DoctorStatus::Ok
+        }
+        Ok(status @ ChainStatus::Broken { .. }) => {
+            let msg = format_chain_broken(&status).unwrap_or_else(|| "chain broken".to_string());
+            DoctorStatus::Fail(msg)
+        }
+        Err(err) => DoctorStatus::Warn(format!("failed to verify audit chain: {err}")),
+    };
+    checks.push(DoctorCheck {
+        name: "budget_audit_chain".to_string(),
+        status,
+    });
+
+    // 5. active-goal.json validity
+    let goal_path = cwd
+        .join(".nerve")
+        .join("session-meta")
+        .join("active-goal.json");
+    let status = if !goal_path.exists() {
+        DoctorStatus::Ok
+    } else {
+        match std::fs::read_to_string(&goal_path) {
+            Ok(raw) if raw.trim().is_empty() => DoctorStatus::Ok,
+            Ok(raw) => match serde_json::from_str::<GoalSpec>(&raw) {
+                Ok(spec) => match spec.validate() {
+                    Ok(()) => DoctorStatus::Ok,
+                    Err(err) => DoctorStatus::Fail(format!("invalid active goal: {err}")),
+                },
+                Err(err) => DoctorStatus::Fail(format!("active-goal.json parse error: {err}")),
+            },
+            Err(err) => {
+                DoctorStatus::Warn(format!("failed to read `{}`: {err}", goal_path.display()))
+            }
+        }
+    };
+    checks.push(DoctorCheck {
+        name: "active_goal".to_string(),
+        status,
+    });
+
+    checks
+}
+
+fn orphan_entry_count(dir: &Path) -> std::io::Result<usize> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut count = 0usize;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        // Skip the manifest.jsonl bookkeeping file itself.
+        if entry.file_name() == "manifest.jsonl" {
+            continue;
+        }
+        count += 1;
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -1620,5 +1906,178 @@ mod tests {
         for round in &report.rounds {
             assert_eq!(round.check_result.as_ref(), Some(&CheckResult::Skipped));
         }
+    }
+
+    // ----- Tier 2d (v0.3.0) worktree integration tests -----
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git invocation");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_git_main(cwd: &Path) {
+        run_git(cwd, &["init", "-q", "--initial-branch=main"]);
+        run_git(cwd, &["config", "user.email", "nerve@example.com"]);
+        run_git(cwd, &["config", "user.name", "Nerve Tester"]);
+        std::fs::write(cwd.join("seed.txt"), "seed\n").unwrap();
+        run_git(cwd, &["add", "seed.txt"]);
+        run_git(cwd, &["commit", "-q", "-m", "seed"]);
+    }
+
+    fn head_oid(cwd: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(cwd)
+            .output()
+            .expect("git rev-parse");
+        assert!(out.status.success(), "git rev-parse failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn worktree_apply_off_unchanged_behavior() {
+        // Regression: when worktree_apply is off, the legacy in-place apply
+        // path runs and a patched file appears under task.cwd as before.
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("legacy apply", dir.path());
+        let config = consensus_config();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(true))
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
+        assert!(report.applied);
+        assert!(dir.path().join("mock-output.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn worktree_apply_on_merge_on_success() {
+        // When worktree is forced on, the final patch merges back into main
+        // and main HEAD advances. The merged file lives at the original cwd.
+        let dir = tempfile::tempdir().unwrap();
+        init_git_main(dir.path());
+        let pre = head_oid(dir.path());
+
+        let task = Task::new("worktree apply", dir.path());
+        let config = consensus_config();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let report = run_synaptic_loop(
+            task,
+            &config,
+            &adapters,
+            RunOptions::new(true).with_worktree(true),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
+        assert!(report.applied);
+        let post = head_oid(dir.path());
+        assert_ne!(
+            pre, post,
+            "main HEAD should advance after a successful worktree merge"
+        );
+        assert!(dir.path().join("mock-output.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn worktree_apply_on_discard_on_failure() {
+        // With a goal check that always fails, blocked=true and the worktree
+        // path is never entered. main HEAD stays put, and no orphan worktree
+        // remains under .nerve/scratch.
+        let dir = tempfile::tempdir().unwrap();
+        init_git_main(dir.path());
+        let pre = head_oid(dir.path());
+
+        let task = Task::new("worktree discard", dir.path());
+        let config = consensus_config();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let options = RunOptions::new(true)
+            .with_worktree(true)
+            .with_goal(goal_spec(&["false"]));
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert!(report.blocked);
+        assert!(!report.applied);
+        assert_eq!(head_oid(dir.path()), pre);
+        assert!(!dir.path().join("mock-output.txt").exists());
+
+        // No orphan worktree should have been quarantined.
+        let orphan = dir
+            .path()
+            .join(".nerve")
+            .join("scratch")
+            .join("orphaned-worktrees");
+        if orphan.exists() {
+            let count = std::fs::read_dir(&orphan)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .map(|x| x.file_name() != "manifest.jsonl")
+                        .unwrap_or(false)
+                })
+                .count();
+            assert_eq!(count, 0, "no orphan worktree should be quarantined");
+        }
+    }
+
+    #[test]
+    fn doctor_checks_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = consensus_config();
+        let checks = doctor_checks(&config, dir.path());
+
+        // Five checks emitted in the documented order.
+        let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "git",
+                "disk_space",
+                "orphaned_worktrees",
+                "budget_audit_chain",
+                "active_goal",
+            ]
+        );
+
+        // git should be present in the test environment.
+        assert_eq!(
+            checks[0].status,
+            DoctorStatus::Ok,
+            "git --version must succeed: {:?}",
+            checks[0].status
+        );
+
+        // No audit log yet → empty chain reported as Ok.
+        assert_eq!(checks[3].status, DoctorStatus::Ok);
+
+        // No active-goal.json yet → Ok.
+        assert_eq!(checks[4].status, DoctorStatus::Ok);
+
+        // No orphan dir yet → Ok (count == 0).
+        assert_eq!(checks[2].status, DoctorStatus::Ok);
     }
 }

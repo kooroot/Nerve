@@ -1,3 +1,4 @@
+use crate::ulimit::{CheckUlimit, UlimitError, apply_ulimit};
 use nerve_config::GoalSpec;
 use nerve_types::CheckResult;
 use std::collections::BTreeSet;
@@ -18,6 +19,8 @@ pub enum GoalError {
     // path traversal in a follow-up. PathInjection is reserved for that surface.
     #[error("goal path injection rejected: {0}")]
     PathInjection(String),
+    #[error("check_ulimit invalid: {0}")]
+    Ulimit(#[from] UlimitError),
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +29,7 @@ pub struct GoalEvaluator {
     allowed_env: Vec<String>,
     output_cap: usize,
     cwd: PathBuf,
+    ulimit: Option<CheckUlimit>,
 }
 
 impl GoalEvaluator {
@@ -34,6 +38,16 @@ impl GoalEvaluator {
         allowed_env: Vec<String>,
         output_cap: usize,
         cwd: PathBuf,
+    ) -> Result<Self, GoalError> {
+        Self::with_ulimit(goal, allowed_env, output_cap, cwd, None)
+    }
+
+    pub fn with_ulimit(
+        goal: GoalSpec,
+        allowed_env: Vec<String>,
+        output_cap: usize,
+        cwd: PathBuf,
+        ulimit: Option<CheckUlimit>,
     ) -> Result<Self, GoalError> {
         goal.validate()
             .map_err(|e| GoalError::InvalidSpec(e.to_string()))?;
@@ -48,11 +62,15 @@ impl GoalEvaluator {
                 cwd.display()
             )));
         }
+        if let Some(spec) = &ulimit {
+            crate::ulimit::validate(spec)?;
+        }
         Ok(Self {
             goal,
             allowed_env,
             output_cap,
             cwd,
+            ulimit,
         })
     }
 
@@ -90,6 +108,23 @@ impl GoalEvaluator {
         }
         for (key, value) in &self.goal.env {
             command.env(key, value);
+        }
+
+        #[cfg(unix)]
+        if let Some(spec) = self.ulimit.clone() {
+            // SAFETY: pre_exec runs in the child after fork() and before the
+            // image is replaced. apply_ulimit only invokes setrlimit, which
+            // is async-signal-safe.
+            unsafe {
+                command.pre_exec(move || {
+                    apply_ulimit(&spec).map_err(|e| match e {
+                        UlimitError::SetRlimit { errno, .. } => {
+                            std::io::Error::from_raw_os_error(errno)
+                        }
+                        _ => std::io::Error::other(e.to_string()),
+                    })
+                });
+            }
         }
 
         let mut child = command.spawn()?;

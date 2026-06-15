@@ -537,6 +537,7 @@ name = "nerve-config"
 version = "0.1.9"
 dependencies = [
  "anyhow",
+ "chrono",
  "globset",
  "nerve-types",
  "serde",
@@ -552,16 +553,19 @@ dependencies = [
  "async-trait",
  "chrono",
  "fs2",
+ "libc",
  "nerve-adapter",
  "nerve-config",
  "nerve-patch",
  "nerve-types",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

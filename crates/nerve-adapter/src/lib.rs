@@ -28,6 +28,14 @@ pub enum AdapterError {
     Timeout { secs: u64 },
     #[error("adapter output exceeded limit of {limit_bytes} bytes")]
     OutputTooLarge { limit_bytes: usize },
+    /// Adapter does not implement the v0.3.0 one-shot dispatch surface used by
+    /// `/goal` natural-language conversion. Returned by the default trait
+    /// implementation so callers can detect adapter-side feature gaps.
+    #[error("adapter `{adapter}` does not support dispatch_oneshot")]
+    OneshotNotSupported { adapter: String },
+    /// Subprocess one-shot invocation failed before producing output.
+    #[error("dispatch_oneshot for `{adapter}` failed: {reason}")]
+    OneshotFailed { adapter: String, reason: String },
 }
 
 #[async_trait]
@@ -70,16 +78,46 @@ pub trait ModelAdapter: Send + Sync {
         let lead_output = AgentOutput::text("scratch", scratch_summary);
         self.review(task, &lead_output, cwd, strictness, tx).await
     }
+
+    /// One-shot dispatch used by §3 Tier 1b Phase 2 `/goal` natural-language
+    /// conversion. Sends `system_prompt` + `user_prompt` to the underlying
+    /// adapter and returns the raw text reply. Default impl reports the
+    /// surface as unsupported so existing mock/test adapters keep compiling.
+    async fn dispatch_oneshot(
+        &self,
+        _system_prompt: &str,
+        _user_prompt: &str,
+    ) -> Result<String, AdapterError> {
+        Err(AdapterError::OneshotNotSupported {
+            adapter: self.id().to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct MockAdapter {
     id: String,
+    oneshot_response: std::sync::Arc<std::sync::Mutex<Option<MockOneshotResponse>>>,
+}
+
+#[derive(Debug, Clone)]
+enum MockOneshotResponse {
+    /// Echo back the user prompt suffixed by the system prompt; used as the
+    /// default fixture so tests that don't care about content still resolve.
+    Echo,
+    /// Return the literal payload to the caller verbatim.
+    Literal(String),
+    /// Return the literal payload but also fail the assertion in the test
+    /// by surfacing an explicit adapter error.
+    Error(String),
 }
 
 impl MockAdapter {
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into() }
+        Self {
+            id: id.into(),
+            oneshot_response: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     pub fn lead() -> Self {
@@ -88,6 +126,25 @@ impl MockAdapter {
 
     pub fn reviewer() -> Self {
         Self::new("codex")
+    }
+
+    /// Inject a literal response that the next `dispatch_oneshot` call should
+    /// return. Used by `nerve-core::goal_intent` tests to drive the converter
+    /// without invoking real CLIs.
+    pub fn set_oneshot_response(&self, payload: impl Into<String>) {
+        *self
+            .oneshot_response
+            .lock()
+            .expect("oneshot mutex poisoned") = Some(MockOneshotResponse::Literal(payload.into()));
+    }
+
+    /// Inject a failure so the next `dispatch_oneshot` call surfaces
+    /// `AdapterError::OneshotFailed`.
+    pub fn set_oneshot_error(&self, reason: impl Into<String>) {
+        *self
+            .oneshot_response
+            .lock()
+            .expect("oneshot mutex poisoned") = Some(MockOneshotResponse::Error(reason.into()));
     }
 }
 
@@ -168,6 +225,29 @@ impl ModelAdapter for MockAdapter {
             "Refined mock implementation",
             patch,
         ))
+    }
+
+    async fn dispatch_oneshot(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<String, AdapterError> {
+        let injected = self
+            .oneshot_response
+            .lock()
+            .expect("oneshot mutex poisoned")
+            .clone()
+            .unwrap_or(MockOneshotResponse::Echo);
+        match injected {
+            MockOneshotResponse::Echo => Ok(format!(
+                "MOCK_ONESHOT system={system_prompt} user={user_prompt}"
+            )),
+            MockOneshotResponse::Literal(payload) => Ok(payload),
+            MockOneshotResponse::Error(reason) => Err(AdapterError::OneshotFailed {
+                adapter: self.id().to_string(),
+                reason,
+            }),
+        }
     }
 }
 
@@ -454,6 +534,68 @@ impl ModelAdapter for SubprocessAdapter {
         let raw = self.run_prompt(prompt, cwd, &tx).await?;
         output_from_raw_text(self.id(), cwd, raw)
     }
+
+    async fn dispatch_oneshot(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<String, AdapterError> {
+        let merged = build_oneshot_prompt(system_prompt, user_prompt);
+        // Discard the event stream — `/goal` natural-language conversion is a
+        // single short hop; the existing run_prompt drainage gives us timeout
+        // + output-cap guards for free without introducing a side channel.
+        let (tx, mut rx) = mpsc::channel(8);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let raw_result = self.run_prompt(merged, &cwd, &tx).await;
+        drop(tx);
+        let _ = drain.await;
+        match raw_result {
+            Ok(text) => Ok(text),
+            Err(err) => {
+                if let Some(adapter_err) = err.downcast_ref::<AdapterError>() {
+                    match adapter_err {
+                        AdapterError::Timeout { secs } => {
+                            Err(AdapterError::Timeout { secs: *secs })
+                        }
+                        AdapterError::OutputTooLarge { limit_bytes } => {
+                            Err(AdapterError::OutputTooLarge {
+                                limit_bytes: *limit_bytes,
+                            })
+                        }
+                        AdapterError::OneshotNotSupported { adapter } => {
+                            Err(AdapterError::OneshotNotSupported {
+                                adapter: adapter.clone(),
+                            })
+                        }
+                        AdapterError::OneshotFailed { adapter, reason } => {
+                            Err(AdapterError::OneshotFailed {
+                                adapter: adapter.clone(),
+                                reason: reason.clone(),
+                            })
+                        }
+                    }
+                } else {
+                    Err(AdapterError::OneshotFailed {
+                        adapter: self.id.clone(),
+                        reason: err.to_string(),
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Compose a deterministic prompt the existing `run_prompt` machinery can feed
+/// to either Claude or Codex without touching their CLIs' system-prompt flags.
+/// We prefix the system intent and clearly delimit the user payload so the
+/// adapter still returns a single text body we can JSON-extract upstream.
+fn build_oneshot_prompt(system_prompt: &str, user_prompt: &str) -> String {
+    format!(
+        "SYSTEM:\n{}\n\nUSER:\n{}\n\nRespond with ONLY the requested JSON object. Do not wrap in prose.",
+        system_prompt.trim(),
+        user_prompt.trim()
+    )
 }
 
 pub fn default_adapters(mock: bool) -> Vec<Box<dyn ModelAdapter>> {
