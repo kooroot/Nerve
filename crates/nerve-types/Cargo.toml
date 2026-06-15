@@ -8,5 +8,9 @@ version.workspace = true
 chrono.workspace = true
 nerve-patch = { path = "../nerve-patch" }
 serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true

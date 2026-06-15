@@ -22,6 +22,8 @@ use tokio::time::{Duration, sleep};
 pub mod budget_audit;
 pub mod goal;
 pub mod goal_intent;
+pub mod plan;
+pub mod rpc;
 pub mod store;
 pub mod ulimit;
 pub mod worktree;
@@ -32,6 +34,11 @@ pub use budget_audit::{
 };
 pub use goal::{GoalError, GoalEvaluator};
 pub use goal_intent::{GOAL_INTENT_SYSTEM_PROMPT, GoalIntentConverter, GoalIntentError};
+pub use plan::{
+    PLAN_ONLY_SYSTEM_PROMPT, PLAN_REVIEW_SYSTEM_PROMPT, PlanError, PlanRunOptions, PlanSections,
+    run_plan_mode, validate_plan_markdown,
+};
+pub use rpc::{EmitError, EmitOutcome, RpcBus, RpcError};
 pub use ulimit::{UlimitError, apply_ulimit};
 pub use worktree::{IsolatedRound, OrphanManifestEntry, WorktreeError, WorktreeIsolator};
 
@@ -266,6 +273,7 @@ pub async fn run_synaptic_loop(
             reviewer: feedback.clone(),
             check_result: Some(check_result.clone()),
             patch_sha: patch_sha.clone(),
+            envelope_id: None,
         };
         synapse.record_round(round).await;
         final_feedback = feedback;
@@ -467,6 +475,7 @@ async fn run_tournament_strategy(
         reviewer: final_feedback.clone(),
         check_result: Some(check_result.clone()),
         patch_sha,
+        envelope_id: None,
     };
     synapse.record_round(round).await;
 

@@ -26,6 +26,9 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub daemon: DaemonConfig,
+    // Tier 3g (v0.5.0): ratatui-based 3-pane TUI configuration.
+    #[serde(default)]
+    pub tui: TuiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +123,12 @@ impl Orchestration {
 pub struct Roles {
     pub architect: String,
     pub reviewer: String,
+    // Tier 2f (v0.5.0): default plan strategy for `/plan` when no profile matches.
+    #[serde(default)]
+    pub plan_strategy: PlanStrategy,
+    // Tier 2f (v0.5.0): optional override for the plan-only system prompt.
+    #[serde(default)]
+    pub plan_system_prompt_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -134,6 +143,12 @@ pub struct Profile {
     pub review_strictness: ReviewStrictness,
     #[serde(default)]
     pub max_refinement_rounds: Option<u8>,
+    // Tier 2f (v0.5.0): per-profile plan strategy override (defaults to PlanStrategy::Single).
+    #[serde(default)]
+    pub plan_strategy: PlanStrategy,
+    // Tier 2f (v0.5.0): per-profile override of the plan-only system prompt.
+    #[serde(default)]
+    pub plan_system_prompt_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -172,12 +187,18 @@ pub enum UiMode {
 pub struct DaemonConfig {
     #[serde(default = "default_daemon_protocol")]
     pub protocol: DaemonProtocol,
+    // Tier 2e (v0.5.0): RPC envelope/backpressure/token knobs. None falls back
+    // to RpcConfig::default(); preserved as Option to keep existing serialized
+    // daemon blobs round-trippable without injecting an `rpc` key.
+    #[serde(default)]
+    pub rpc: Option<RpcConfig>,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             protocol: default_daemon_protocol(),
+            rpc: None,
         }
     }
 }
@@ -189,6 +210,83 @@ pub enum DaemonProtocol {
     Rpc,
 }
 
+// Tier 3g (v0.5.0): ratatui 3-pane TUI runtime configuration.
+//
+// All knobs default to the values described in nerve-terminal-upgrade-proposal.md
+// §3 Tier 3g. Honoured by the `nerve-tui` crate; ignored otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TuiConfig {
+    #[serde(default = "default_tui_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_tui_auto_in_cmux")]
+    pub auto_in_cmux: bool,
+    #[serde(default = "default_tui_refresh_ms")]
+    pub refresh_ms: u64,
+    #[serde(default = "default_tui_log_height_pct")]
+    pub log_height_pct: u8,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_tui_enabled(),
+            auto_in_cmux: default_tui_auto_in_cmux(),
+            refresh_ms: default_tui_refresh_ms(),
+            log_height_pct: default_tui_log_height_pct(),
+        }
+    }
+}
+
+// Tier 2e (v0.5.0): RPC envelope / backpressure / token lifecycle knobs.
+//
+// Defaults match nerve-terminal-upgrade-proposal.md §3 Tier 2e sec-4 (per-consumer
+// bounded channel 1024, 64 KiB payload cap, 32B bearer token stored 0600).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RpcConfig {
+    #[serde(default = "default_rpc_per_consumer_queue")]
+    pub per_consumer_queue: usize,
+    #[serde(default = "default_rpc_payload_cap_kib")]
+    pub payload_cap_kib: usize,
+    #[serde(default = "default_rpc_token_path")]
+    pub token_path: PathBuf,
+    #[serde(default = "default_rpc_token_size_bytes")]
+    pub token_size_bytes: usize,
+    #[serde(default)]
+    pub print_token: bool,
+    #[serde(default = "default_rpc_envelope_version")]
+    pub envelope_version: String,
+}
+
+impl Default for RpcConfig {
+    fn default() -> Self {
+        Self {
+            per_consumer_queue: default_rpc_per_consumer_queue(),
+            payload_cap_kib: default_rpc_payload_cap_kib(),
+            token_path: default_rpc_token_path(),
+            token_size_bytes: default_rpc_token_size_bytes(),
+            print_token: false,
+            envelope_version: default_rpc_envelope_version(),
+        }
+    }
+}
+
+impl RpcConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.per_consumer_queue == 0 {
+            return Err(ConfigError::InvalidRpcValue("per_consumer_queue"));
+        }
+        if self.payload_cap_kib == 0 {
+            return Err(ConfigError::InvalidRpcValue("payload_cap_kib"));
+        }
+        if self.token_size_bytes == 0 {
+            return Err(ConfigError::InvalidRpcValue("token_size_bytes"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProfileSelection {
     pub id: Option<String>,
@@ -196,6 +294,10 @@ pub struct ProfileSelection {
     pub reviewer: String,
     pub review_strictness: ReviewStrictness,
     pub max_refinement_rounds: u8,
+    #[serde(default)]
+    pub plan_strategy: PlanStrategy,
+    #[serde(default)]
+    pub plan_system_prompt_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -231,6 +333,19 @@ pub enum Strategy {
     Consensus,
     Pipeline,
     Tournament,
+}
+
+// Tier 2f (v0.5.0): /plan execution strategy.
+//
+// `Single` runs the lead adapter in plan-only mode (default). `DualReview`
+// additionally pipes the lead's plan markdown to the reviewer for a structural
+// review pass, without ever permitting patches.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStrategy {
+    #[default]
+    Single,
+    DualReview,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -322,6 +437,16 @@ impl Config {
                 "[nerve-config] orchestration.worktree_apply is enabled; run `nv doctor` to verify git worktree readiness."
             );
         }
+        if let Some(rpc) = &self.daemon.rpc {
+            rpc.validate()
+                .map_err(|e| anyhow::anyhow!("daemon.rpc invalid: {e}"))?;
+        }
+        if self.tui.refresh_ms == 0 {
+            anyhow::bail!("tui.refresh_ms must be greater than 0");
+        }
+        if self.tui.log_height_pct == 0 || self.tui.log_height_pct > 100 {
+            anyhow::bail!("tui.log_height_pct must be in (0, 100]");
+        }
         if self.roles.architect.trim().is_empty() {
             anyhow::bail!("roles.architect must not be empty");
         }
@@ -370,6 +495,11 @@ impl Config {
                     max_refinement_rounds: profile
                         .max_refinement_rounds
                         .unwrap_or(self.orchestration.max_refinement_rounds),
+                    plan_strategy: profile.plan_strategy.clone(),
+                    plan_system_prompt_override: profile
+                        .plan_system_prompt_override
+                        .clone()
+                        .or_else(|| self.roles.plan_system_prompt_override.clone()),
                 });
             }
         }
@@ -380,6 +510,8 @@ impl Config {
             reviewer: self.roles.reviewer.clone(),
             review_strictness: ReviewStrictness::Normal,
             max_refinement_rounds: self.orchestration.max_refinement_rounds,
+            plan_strategy: self.roles.plan_strategy.clone(),
+            plan_system_prompt_override: self.roles.plan_system_prompt_override.clone(),
         })
     }
 }
@@ -461,6 +593,42 @@ fn default_ui_mode() -> UiMode {
 
 fn default_daemon_protocol() -> DaemonProtocol {
     DaemonProtocol::Line
+}
+
+fn default_tui_enabled() -> bool {
+    true
+}
+
+fn default_tui_auto_in_cmux() -> bool {
+    true
+}
+
+fn default_tui_refresh_ms() -> u64 {
+    100
+}
+
+fn default_tui_log_height_pct() -> u8 {
+    60
+}
+
+fn default_rpc_per_consumer_queue() -> usize {
+    1024
+}
+
+fn default_rpc_payload_cap_kib() -> usize {
+    64
+}
+
+fn default_rpc_token_path() -> PathBuf {
+    PathBuf::from(".nerve/session-meta/rpc-token")
+}
+
+fn default_rpc_token_size_bytes() -> usize {
+    32
+}
+
+fn default_rpc_envelope_version() -> String {
+    "1.0.0".to_string()
 }
 
 #[cfg(test)]
@@ -717,5 +885,197 @@ mod tests {
         let config = Config::from_json_str(DEFAULT_CONFIG).unwrap();
         assert!(!config.orchestration.worktree_apply);
         assert!(config.orchestration.check_ulimit.is_none());
+    }
+
+    #[test]
+    fn plan_strategy_default_single() {
+        // Defaulted enum.
+        assert_eq!(PlanStrategy::default(), PlanStrategy::Single);
+
+        // Embedded default config has no `plan_strategy` keys; field must default
+        // to Single on both Roles and every Profile.
+        let config = Config::from_json_str(DEFAULT_CONFIG).unwrap();
+        assert_eq!(config.roles.plan_strategy, PlanStrategy::Single);
+        assert!(config.roles.plan_system_prompt_override.is_none());
+        for profile in &config.profiles {
+            assert_eq!(
+                profile.plan_strategy,
+                PlanStrategy::Single,
+                "profile `{}` should default to PlanStrategy::Single",
+                profile.id
+            );
+            assert!(profile.plan_system_prompt_override.is_none());
+        }
+
+        // Snake-case serde round-trip for DualReview.
+        let json = serde_json::to_string(&PlanStrategy::DualReview).unwrap();
+        assert_eq!(json, "\"dual_review\"");
+        let back: PlanStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, PlanStrategy::DualReview);
+    }
+
+    #[test]
+    fn select_profile_carries_plan_settings() {
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": {
+                "architect": "default-lead",
+                "reviewer": "default-reviewer",
+                "plan_strategy": "dual_review",
+                "plan_system_prompt_override": "role prompt"
+              },
+              "profiles": [
+                {
+                  "id": "docs",
+                  "match_rules": ["docs"],
+                  "lead": "profile-lead",
+                  "reviewer": "profile-reviewer",
+                  "plan_strategy": "single",
+                  "plan_system_prompt_override": "profile prompt"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let selected = config
+            .select_profile(&Task::new("update docs", "."))
+            .expect("profile selection");
+        assert_eq!(selected.id.as_deref(), Some("docs"));
+        assert_eq!(selected.plan_strategy, PlanStrategy::Single);
+        assert_eq!(
+            selected.plan_system_prompt_override.as_deref(),
+            Some("profile prompt")
+        );
+
+        let fallback = config
+            .select_profile(&Task::new("update unrelated code", "."))
+            .expect("default selection");
+        assert_eq!(fallback.id, None);
+        assert_eq!(fallback.plan_strategy, PlanStrategy::DualReview);
+        assert_eq!(
+            fallback.plan_system_prompt_override.as_deref(),
+            Some("role prompt")
+        );
+    }
+
+    #[test]
+    fn tui_config_default_values() {
+        let tui = TuiConfig::default();
+        assert!(tui.enabled);
+        assert!(tui.auto_in_cmux);
+        assert_eq!(tui.refresh_ms, 100);
+        assert_eq!(tui.log_height_pct, 60);
+
+        // Embedded default config omits the `tui` key, so the Config-level
+        // `#[serde(default)]` must materialise the same defaults.
+        let config = Config::from_json_str(DEFAULT_CONFIG).unwrap();
+        assert_eq!(config.tui, TuiConfig::default());
+    }
+
+    #[test]
+    fn rpc_config_default_values() {
+        let rpc = RpcConfig::default();
+        assert_eq!(rpc.per_consumer_queue, 1024);
+        assert_eq!(rpc.payload_cap_kib, 64);
+        assert_eq!(
+            rpc.token_path,
+            PathBuf::from(".nerve/session-meta/rpc-token")
+        );
+        assert_eq!(rpc.token_size_bytes, 32);
+        assert!(!rpc.print_token);
+        assert_eq!(rpc.envelope_version, "1.0.0");
+
+        // DaemonConfig leaves `rpc` as None to preserve legacy serialized blobs.
+        let daemon = DaemonConfig::default();
+        assert!(daemon.rpc.is_none());
+
+        // Default Config keeps daemon.rpc unset.
+        let config = Config::from_json_str(DEFAULT_CONFIG).unwrap();
+        assert!(config.daemon.rpc.is_none());
+
+        // Explicit empty RPC block round-trips into defaults.
+        let with_rpc = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": {
+                "architect": "claude-code",
+                "reviewer": "codex"
+              },
+              "daemon": {
+                "protocol": "rpc",
+                "rpc": {}
+              }
+            }"#,
+        )
+        .unwrap();
+        let materialised = with_rpc.daemon.rpc.expect("rpc block was provided");
+        assert_eq!(materialised, RpcConfig::default());
+    }
+
+    #[test]
+    fn rpc_config_validates_nonzero_payload_cap() {
+        let zero_payload = RpcConfig {
+            payload_cap_kib: 0,
+            ..RpcConfig::default()
+        };
+        assert_eq!(
+            zero_payload.validate(),
+            Err(ConfigError::InvalidRpcValue("payload_cap_kib"))
+        );
+
+        let zero_queue = RpcConfig {
+            per_consumer_queue: 0,
+            ..RpcConfig::default()
+        };
+        assert_eq!(
+            zero_queue.validate(),
+            Err(ConfigError::InvalidRpcValue("per_consumer_queue"))
+        );
+
+        let zero_token = RpcConfig {
+            token_size_bytes: 0,
+            ..RpcConfig::default()
+        };
+        assert_eq!(
+            zero_token.validate(),
+            Err(ConfigError::InvalidRpcValue("token_size_bytes"))
+        );
+
+        RpcConfig::default().validate().unwrap();
+
+        // Surfaces through Config::validate as well.
+        let bad_config_err = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": {
+                "architect": "claude-code",
+                "reviewer": "codex"
+              },
+              "daemon": {
+                "protocol": "rpc",
+                "rpc": { "payload_cap_kib": 0 }
+              }
+            }"#,
+        )
+        .unwrap_err();
+        let msg = format!("{bad_config_err:#}");
+        assert!(
+            msg.contains("payload_cap_kib"),
+            "expected error to mention payload_cap_kib, got: {msg}"
+        );
     }
 }

@@ -39,6 +39,9 @@ pub enum ConfigError {
     EmptyGoalIntentSourceAdapter,
     #[error("check_ulimit field `{0}` must be greater than 0 when set")]
     InvalidUlimitValue(&'static str),
+    // Tier 2e (v0.5.0): rpc.* knobs must be non-zero when set.
+    #[error("daemon.rpc.{0} must be greater than 0")]
+    InvalidRpcValue(&'static str),
 }
 
 impl GoalSpec {
