@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use nerve_adapter::default_adapters;
+use nerve_adapter::{ModelAdapter, default_adapters_with_limits};
 use nerve_config::{Config, DaemonProtocol, GoalSpec};
 use nerve_core::store::NerveStore;
 use nerve_core::{
@@ -441,7 +441,7 @@ async fn run_pi_benchmark(iterations: u16, live: bool, mock: bool) -> Result<PiB
         ),
     ));
 
-    let adapters = default_adapters(adapter_mock);
+    let adapters = adapters_for_config(adapter_mock, &config);
     for iteration in 1..=iterations {
         let task = Task::new(
             format!("Pi benchmark iteration {iteration}: produce a reviewed patch artifact"),
@@ -666,6 +666,10 @@ fn run_provider_login(provider: LoginProvider) -> Result<()> {
 async fn run_interactive(apply: bool, mock: bool) -> Result<()> {
     let mut state = InteractiveState::new(apply, mock);
     state.refresh_counts();
+    refresh_active_goal(
+        &mut state,
+        &env::current_dir().context("failed to read current directory")?,
+    );
     print_interactive_banner(&state);
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         run_interactive_terminal(&mut state).await
@@ -1411,6 +1415,7 @@ async fn handle_interactive_command(command: &str, state: &mut InteractiveState)
             env::set_current_dir(&next)
                 .with_context(|| format!("failed to change directory to {}", next.display()))?;
             state.refresh_counts();
+            refresh_active_goal(state, &next);
             print_interactive_status(state);
         }
         "clear" => {
@@ -1795,6 +1800,33 @@ fn active_goal_path(cwd: &Path) -> PathBuf {
         .join("active-goal.json")
 }
 
+fn load_active_goal(cwd: &Path) -> Result<Option<GoalSpec>> {
+    let path = active_goal_path(cwd);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read `{}`", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let spec: GoalSpec = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid active goal JSON in `{}`", path.display()))?;
+    spec.validate()
+        .with_context(|| format!("invalid active goal in `{}`", path.display()))?;
+    Ok(Some(spec))
+}
+
+fn refresh_active_goal(state: &mut InteractiveState, cwd: &Path) {
+    match load_active_goal(cwd) {
+        Ok(goal) => state.active_goal = goal,
+        Err(err) => {
+            eprintln!("warning: active goal not loaded: {err:#}");
+            state.active_goal = None;
+        }
+    }
+}
+
 fn handle_goal_command(args: Vec<&str>, state: &mut InteractiveState, cwd: &Path) -> Result<()> {
     let action = parse_goal_argv(&args).map_err(|err| anyhow::anyhow!("{err}"))?;
     match action {
@@ -2019,7 +2051,7 @@ async fn handle_budget_command(
             let mut new_tokens = state
                 .budget_override_tokens
                 .or(config.orchestration.max_total_tokens);
-            let mut user_confirmed = !force;
+            let mut user_confirmed = false;
 
             if let Some(requested_cost) = cost_microusd {
                 if let Some(ceiling) = config.orchestration.budget_cost_microusd_ceiling
@@ -2032,8 +2064,7 @@ async fn handle_budget_command(
                         ceiling
                     );
                 }
-                let is_raise = new_cost.map(|c| requested_cost > c).unwrap_or(true);
-                if is_raise {
+                if requires_budget_raise_confirmation(new_cost, requested_cost, force) {
                     if !confirm_raise_interactive("cost")? {
                         anyhow::bail!("budget raise cancelled");
                     }
@@ -2052,8 +2083,7 @@ async fn handle_budget_command(
                         ceiling
                     );
                 }
-                let is_raise = new_tokens.map(|t| requested_tokens > t).unwrap_or(true);
-                if is_raise {
+                if requires_budget_raise_confirmation(new_tokens, requested_tokens, force) {
                     if !confirm_raise_interactive("tokens")? {
                         anyhow::bail!("budget raise cancelled");
                     }
@@ -2127,6 +2157,10 @@ fn print_budget_show(state: &InteractiveState, config: &Config) {
     if let Some(ceiling) = config.orchestration.budget_tokens_ceiling {
         println!("budget: global token ceiling={ceiling}");
     }
+}
+
+fn requires_budget_raise_confirmation(current: Option<u64>, requested: u64, force: bool) -> bool {
+    !force && current.map(|value| requested > value).unwrap_or(true)
 }
 
 fn confirm_raise_interactive(label: &str) -> Result<bool> {
@@ -2476,7 +2510,7 @@ async fn run_report_with_overrides(
     }
     let mut task = Task::new(prompt, &cwd);
     task.context_paths = collect_context_paths(&task.prompt, &cwd);
-    let adapters = default_adapters(mock);
+    let adapters = adapters_for_config(mock, &config);
     let mut options = RunOptions::new(apply);
     if let Some(spec) = goal {
         options = options.with_goal(spec);
@@ -2484,6 +2518,14 @@ async fn run_report_with_overrides(
     let report = run_synaptic_loop(task, &config, &adapters, options).await?;
     NerveStore::new(&cwd).save_report(&report)?;
     Ok(report)
+}
+
+fn adapters_for_config(mock: bool, config: &Config) -> Vec<Box<dyn ModelAdapter>> {
+    default_adapters_with_limits(
+        mock,
+        config.orchestration.adapter_timeout_secs,
+        config.orchestration.adapter_max_output_bytes,
+    )
 }
 
 fn emit_report_events(report: &RunReport) -> Result<()> {
@@ -2965,6 +3007,14 @@ mod tests {
     }
 
     #[test]
+    fn budget_force_skips_raise_confirmation_requirement() {
+        assert!(requires_budget_raise_confirmation(Some(100), 200, false));
+        assert!(!requires_budget_raise_confirmation(Some(100), 200, true));
+        assert!(!requires_budget_raise_confirmation(Some(200), 100, false));
+        assert!(requires_budget_raise_confirmation(None, 100, false));
+    }
+
+    #[test]
     fn goal_argv_parse_strips_flags() {
         let action = parse_goal_argv(&["--timeout", "30", "cargo", "test"]).unwrap();
         match action {
@@ -2992,6 +3042,24 @@ mod tests {
     fn goal_argv_rejects_empty() {
         let err = parse_goal_argv(&[]).unwrap_err();
         assert!(matches!(err, GoalParseError::Empty));
+    }
+
+    #[test]
+    fn active_goal_loads_from_session_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = GoalSpec {
+            id: "goal-test".to_string(),
+            check_cmd: vec!["cargo".to_string(), "test".to_string()],
+            timeout_secs: 30,
+            cwd: Some(dir.path().to_path_buf()),
+            env: BTreeMap::new(),
+            no_progress_max: Some(2),
+        };
+        write_json_atomic(&active_goal_path(dir.path()), &spec).unwrap();
+
+        let loaded = load_active_goal(dir.path()).unwrap().unwrap();
+
+        assert_eq!(loaded, spec);
     }
 
     #[test]

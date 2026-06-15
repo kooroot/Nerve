@@ -290,8 +290,10 @@ pub async fn run_synaptic_loop(
         &final_feedback,
         &config.orchestration.conflict_policy,
     )?;
+    let goal_check_failed = goal_check_failed(&options.goal, last_check.as_ref());
     let blocked = budget_exceeded
         || no_progress_exceeded
+        || goal_check_failed
         || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
 
     let applied = if options.apply && !blocked {
@@ -436,8 +438,10 @@ async fn run_tournament_strategy(
         &final_feedback,
         &config.orchestration.conflict_policy,
     )?;
-    let blocked =
-        budget_exceeded || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
+    let goal_check_failed = goal_check_failed(&options.goal, Some(&check_result));
+    let blocked = budget_exceeded
+        || goal_check_failed
+        || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
 
     let applied = if options.apply && !blocked {
         if let Some(patch) = &final_patch {
@@ -498,6 +502,10 @@ async fn run_goal_check(evaluator: Option<&GoalEvaluator>) -> CheckResult {
         Some(eval) => eval.evaluate().await,
         None => CheckResult::Skipped,
     }
+}
+
+fn goal_check_failed(goal: &Option<GoalSpec>, check_result: Option<&CheckResult>) -> bool {
+    goal.is_some() && !matches!(check_result, Some(CheckResult::Pass | CheckResult::Skipped))
 }
 
 fn no_progress_feedback(reviewer_id: &str, count: u8) -> ReviewerFeedback {
@@ -1571,6 +1579,27 @@ mod tests {
             Some(CheckResult::Fail { .. }) => {}
             other => panic!("expected last round check to be Fail, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_blocks_apply_when_goal_check_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("check blocks apply", dir.path());
+        let config = consensus_config();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let options = RunOptions::new(true).with_goal(goal_spec(&["false"]));
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert_eq!(report.goal_satisfied, Some(false));
+        assert!(report.blocked);
+        assert!(!report.applied);
+        assert!(!dir.path().join("mock-output.txt").exists());
     }
 
     #[tokio::test]

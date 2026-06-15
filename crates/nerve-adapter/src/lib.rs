@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -335,12 +335,11 @@ enum StreamKind {
     Stderr,
 }
 
-/// Read a child stream line-by-line, forwarding each line to the event channel
-/// while enforcing `max_bytes`. Returns the buffered text. If the cap is
-/// exceeded, surfaces `AdapterError::OutputTooLarge`; the caller is responsible
-/// for killing the child after this future resolves with an error.
+/// Read a child stream, forwarding complete lines to the event channel while
+/// enforcing `max_bytes`. The cap is checked on raw chunks, not line boundaries,
+/// so a single unterminated line cannot grow without bound.
 async fn drain_stream<R>(
-    reader: R,
+    mut reader: R,
     agent_id: String,
     max_bytes: usize,
     tx: mpsc::Sender<AgentEvent>,
@@ -349,31 +348,59 @@ async fn drain_stream<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut buffered = String::new();
-    let mut lines = BufReader::new(reader).lines();
+    let mut buffered = Vec::new();
+    let mut pending_line = Vec::new();
+    let mut chunk = [0_u8; 8192];
 
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .with_context(|| format!("failed to read {:?} from `{}` adapter", kind, agent_id))?
-    {
-        // +1 accounts for the trailing newline the BufReader stripped.
-        if buffered.len().saturating_add(line.len()).saturating_add(1) > max_bytes {
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .await
+            .with_context(|| format!("failed to read {:?} from `{}` adapter", kind, agent_id))?;
+        if n == 0 {
+            break;
+        }
+        if buffered.len().saturating_add(n) > max_bytes {
             return Err(AdapterError::OutputTooLarge {
                 limit_bytes: max_bytes,
             }
             .into());
         }
-        buffered.push_str(&line);
-        buffered.push('\n');
+        buffered.extend_from_slice(&chunk[..n]);
 
-        match kind {
-            StreamKind::Stdout => send_stdout(&tx, &agent_id, &line).await,
-            StreamKind::Stderr => send_stderr(&tx, &agent_id, &line).await,
+        for byte in &chunk[..n] {
+            if *byte == b'\n' {
+                emit_stream_line(&tx, &agent_id, kind, &pending_line).await;
+                pending_line.clear();
+            } else {
+                pending_line.push(*byte);
+            }
         }
     }
 
-    Ok(buffered)
+    if !pending_line.is_empty() {
+        emit_stream_line(&tx, &agent_id, kind, &pending_line).await;
+    }
+
+    Ok(String::from_utf8_lossy(&buffered).into_owned())
+}
+
+async fn emit_stream_line(
+    tx: &mpsc::Sender<AgentEvent>,
+    agent_id: &str,
+    kind: StreamKind,
+    raw_line: &[u8],
+) {
+    let line = if raw_line.ends_with(b"\r") {
+        &raw_line[..raw_line.len().saturating_sub(1)]
+    } else {
+        raw_line
+    };
+    let line = String::from_utf8_lossy(line);
+    match kind {
+        StreamKind::Stdout => send_stdout(tx, agent_id, &line).await,
+        StreamKind::Stderr => send_stderr(tx, agent_id, &line).await,
+    }
 }
 
 #[async_trait]
@@ -430,6 +457,14 @@ impl ModelAdapter for SubprocessAdapter {
 }
 
 pub fn default_adapters(mock: bool) -> Vec<Box<dyn ModelAdapter>> {
+    default_adapters_with_limits(mock, None, None)
+}
+
+pub fn default_adapters_with_limits(
+    mock: bool,
+    timeout_secs: Option<u64>,
+    max_output_bytes: Option<usize>,
+) -> Vec<Box<dyn ModelAdapter>> {
     if mock {
         vec![
             Box::new(MockAdapter::lead()),
@@ -437,10 +472,32 @@ pub fn default_adapters(mock: bool) -> Vec<Box<dyn ModelAdapter>> {
         ]
     } else {
         vec![
-            Box::new(SubprocessAdapter::claude_code()),
-            Box::new(SubprocessAdapter::codex()),
+            Box::new(apply_adapter_limits(
+                SubprocessAdapter::claude_code(),
+                timeout_secs,
+                max_output_bytes,
+            )),
+            Box::new(apply_adapter_limits(
+                SubprocessAdapter::codex(),
+                timeout_secs,
+                max_output_bytes,
+            )),
         ]
     }
+}
+
+fn apply_adapter_limits(
+    mut adapter: SubprocessAdapter,
+    timeout_secs: Option<u64>,
+    max_output_bytes: Option<usize>,
+) -> SubprocessAdapter {
+    if let Some(secs) = timeout_secs {
+        adapter = adapter.with_timeout_secs(secs);
+    }
+    if let Some(bytes) = max_output_bytes {
+        adapter = adapter.with_max_output_bytes(bytes);
+    }
+    adapter
 }
 
 fn feedback_from_text(reviewer_id: &str, raw_text: String) -> ReviewerFeedback {
@@ -904,6 +961,35 @@ Lead notes before the patch.
 
         assert!(adapter.args.contains(&"--skip-git-repo-check".to_string()));
         assert!(adapter.args.contains(&"--json".to_string()));
+    }
+
+    #[test]
+    fn adapter_limits_are_applied_to_real_adapters() {
+        let adapter = apply_adapter_limits(SubprocessAdapter::codex(), Some(7), Some(11));
+
+        assert_eq!(adapter.timeout_secs, 7);
+        assert_eq!(adapter.max_output_bytes, 11);
+    }
+
+    #[tokio::test]
+    async fn drain_stream_caps_unterminated_lines() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (tx, _rx) = mpsc::channel(4);
+        let drain = tokio::spawn(drain_stream(
+            reader,
+            "fixture".to_string(),
+            8,
+            tx,
+            StreamKind::Stdout,
+        ));
+
+        writer.write_all(b"0123456789").await.unwrap();
+        drop(writer);
+
+        let err = drain.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("exceeded"));
     }
 
     #[test]
