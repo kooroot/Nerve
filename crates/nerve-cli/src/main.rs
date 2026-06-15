@@ -1,12 +1,17 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerve_adapter::default_adapters;
-use nerve_config::{Config, DaemonProtocol};
+use nerve_config::{Config, DaemonProtocol, GoalSpec};
 use nerve_core::store::NerveStore;
-use nerve_core::{RunOptions, RunReport, run_synaptic_loop};
+use nerve_core::{
+    BudgetAuditEntry, BudgetSnapshot, RunOptions, RunReport, append_budget_audit_entry,
+    run_synaptic_loop,
+};
 use nerve_types::{AgentEvent, Task, Verdict};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::env;
+use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
@@ -443,8 +448,7 @@ async fn run_pi_benchmark(iterations: u16, live: bool, mock: bool) -> Result<PiB
             cwd,
         );
         let run_started = Instant::now();
-        let report =
-            run_synaptic_loop(task, &config, &adapters, RunOptions { apply: false }).await?;
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false)).await?;
         store.save_report(&report)?;
         let patch_id = report.final_patch.as_ref().map(|patch| patch.id.clone());
         let loop_ok = report.final_feedback.verdict == Verdict::Lgtm
@@ -883,6 +887,16 @@ const INTERACTIVE_COMMANDS: &[InteractiveCommandSpec] = &[
         description: "run the Pi workflow benchmark",
     },
     InteractiveCommandSpec {
+        command: "/goal",
+        args: "<argv | clear | show>",
+        description: "register a deterministic stop condition",
+    },
+    InteractiveCommandSpec {
+        command: "/budget",
+        args: "<show | cost=$X | tokens=N>",
+        description: "inspect or override session budget caps",
+    },
+    InteractiveCommandSpec {
         command: "/help",
         args: "",
         description: "show command help",
@@ -1113,6 +1127,15 @@ struct InteractiveState {
     last_report: Option<RunReport>,
     session_count: usize,
     patch_count: usize,
+    cumulative_input_tokens: u64,
+    cumulative_output_tokens: u64,
+    cumulative_cost_microusd: u64,
+    no_progress_counter: u32,
+    last_round_count: usize,
+    last_max_rounds: u8,
+    active_goal: Option<GoalSpec>,
+    budget_override_cost_microusd: Option<u64>,
+    budget_override_tokens: Option<u64>,
 }
 
 impl InteractiveState {
@@ -1123,6 +1146,15 @@ impl InteractiveState {
             last_report: None,
             session_count: 0,
             patch_count: 0,
+            cumulative_input_tokens: 0,
+            cumulative_output_tokens: 0,
+            cumulative_cost_microusd: 0,
+            no_progress_counter: 0,
+            last_round_count: 0,
+            last_max_rounds: 0,
+            active_goal: None,
+            budget_override_cost_microusd: None,
+            budget_override_tokens: None,
         }
     }
 
@@ -1149,6 +1181,42 @@ impl InteractiveState {
             .and_then(|report| report.final_patch.as_ref())
             .map(|patch| patch.id.as_str())
     }
+
+    fn last_verdict_label(&self) -> &'static str {
+        let Some(report) = self.last_report.as_ref() else {
+            return "-";
+        };
+        match report.final_feedback.verdict {
+            Verdict::Lgtm => "lgtm",
+            Verdict::RequestChanges => "changes",
+            Verdict::Block => {
+                if report.budget_exceeded {
+                    "block(budget)"
+                } else if report.no_progress_exceeded {
+                    "block(no-progress)"
+                } else {
+                    "block"
+                }
+            }
+        }
+    }
+
+    fn record_report(&mut self, report: &RunReport) {
+        self.cumulative_input_tokens = self
+            .cumulative_input_tokens
+            .saturating_add(report.usage.input_tokens);
+        self.cumulative_output_tokens = self
+            .cumulative_output_tokens
+            .saturating_add(report.usage.output_tokens);
+        if let Some(cost) = report.usage.estimated_cost_microusd {
+            self.cumulative_cost_microusd = self.cumulative_cost_microusd.saturating_add(cost);
+        }
+        if report.no_progress_exceeded {
+            self.no_progress_counter = self.no_progress_counter.saturating_add(1);
+        }
+        self.last_round_count = report.rounds.len();
+        self.last_max_rounds = report.selection.max_refinement_rounds;
+    }
 }
 
 fn print_interactive_banner(state: &InteractiveState) {
@@ -1173,6 +1241,53 @@ fn print_interactive_status(state: &InteractiveState) {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| "?".to_string())
     );
+    print_status_bar(state);
+}
+
+fn print_status_bar(state: &InteractiveState) {
+    // Tier 1a status bar: render on a single line. We save+hide cursor before
+    // updating to avoid raw-mode flicker, then restore. The interactive caller
+    // is responsible for not being in the middle of a paste sequence.
+    let bar = render_status_bar(state);
+    if std::io::stdout().is_terminal() {
+        print!("\x1b[s\x1b[?25l");
+        println!("{bar}");
+        print!("\x1b[u\x1b[?25h");
+    } else {
+        println!("{bar}");
+    }
+    let _ = std::io::stdout().flush();
+}
+
+fn render_status_bar(state: &InteractiveState) -> String {
+    let round_label = if state.last_max_rounds == 0 {
+        "round -/-".to_string()
+    } else {
+        format!("round {}/{}", state.last_round_count, state.last_max_rounds)
+    };
+    let verdict_label = format!("verdict={}", state.last_verdict_label());
+    let total_tokens = state
+        .cumulative_input_tokens
+        .saturating_add(state.cumulative_output_tokens);
+    let cost_label = format_cost_microusd(state.cumulative_cost_microusd);
+    let goal_label = match state.active_goal.as_ref() {
+        Some(spec) => format!("goal={}", spec.id),
+        None => "goal=-".to_string(),
+    };
+    format!(
+        "[status] {} | {} | cost={} | tokens={} | {} | no-progress={}",
+        round_label, verdict_label, cost_label, total_tokens, goal_label, state.no_progress_counter
+    )
+}
+
+fn format_cost_microusd(microusd: u64) -> String {
+    // microusd is integer micro-dollars; format two decimals from the
+    // higher cent precision (4 fractional digits) for status bar density.
+    let dollars = microusd / 1_000_000;
+    let fractional = microusd % 1_000_000;
+    // 4-digit fractional gives <0.0001 resolution which is plenty for token cost.
+    let four = fractional / 100;
+    format!("${dollars}.{:04}", four)
 }
 
 fn interactive_prompt(state: &InteractiveState) -> String {
@@ -1202,10 +1317,20 @@ fn print_interactive_error(error: &anyhow::Error) {
 async fn run_interactive_task(prompt: String, state: &mut InteractiveState) -> Result<()> {
     println!("▶ task: {prompt}");
     println!("  lead/reviewer loop running...");
-    let report = run_report(prompt, state.apply, state.mock).await?;
+    let report = run_report_with_overrides(
+        prompt,
+        state.apply,
+        state.mock,
+        state.active_goal.clone(),
+        state.budget_override_cost_microusd,
+        state.budget_override_tokens,
+    )
+    .await?;
     print_interactive_result(&report, state.apply);
+    state.record_report(&report);
     state.last_report = Some(report);
     state.refresh_counts();
+    print_status_bar(state);
     Ok(())
 }
 
@@ -1332,19 +1457,47 @@ async fn handle_interactive_command(command: &str, state: &mut InteractiveState)
                 };
                 let args = parts.collect::<Vec<_>>().join(" ");
                 let prompt = template.prompt.replace("{{args}}", &args);
+                let template_id_owned = template.id.clone();
+                if let Err(err) = bump_template_usage(&cwd, &template_id_owned) {
+                    eprintln!("warning: template usage counter not persisted: {err:#}");
+                }
                 run_interactive_task(prompt, state).await?;
             } else {
-                if config.templates.is_empty() {
-                    println!("No prompt templates configured.");
+                let query = parts.collect::<Vec<_>>().join(" ");
+                let usage = load_template_usage(&cwd).unwrap_or_default();
+                let mut filtered: Vec<_> = config
+                    .templates
+                    .iter()
+                    .filter(|template| matches_template_query(template, &query))
+                    .collect();
+                filtered.sort_by(|a, b| {
+                    let count_a = usage.get(&a.id).copied().unwrap_or(0);
+                    let count_b = usage.get(&b.id).copied().unwrap_or(0);
+                    count_b.cmp(&count_a).then_with(|| a.id.cmp(&b.id))
+                });
+                if filtered.is_empty() {
+                    if config.templates.is_empty() {
+                        println!("No prompt templates configured.");
+                    } else {
+                        println!("No prompt templates matched `{query}`.");
+                    }
                 }
-                for template in config.templates {
+                for template in filtered {
+                    let count = usage.get(&template.id).copied().unwrap_or(0);
                     println!(
-                        "{} | {}",
+                        "{} | uses={} | {}",
                         template.id,
+                        count,
                         template.description.as_deref().unwrap_or("-")
                     );
                 }
             }
+        }
+        "goal" => {
+            handle_goal_command(parts.collect::<Vec<_>>(), state, &cwd)?;
+        }
+        "budget" => {
+            handle_budget_command(parts.collect::<Vec<_>>(), state, &cwd).await?;
         }
         "benchmark" => {
             let target = parts.next().context("usage: /benchmark pi [iterations]")?;
@@ -1417,9 +1570,15 @@ fn print_interactive_help() {
     println!("Setup:");
     println!("  /login                 start provider login flows");
     println!("  /doctor                inspect config, adapters, and auth");
-    println!("  /templates             list configured prompt templates");
+    println!("  /templates [query]     list or search prompt templates");
     println!("  /template <id> [args]  run a prompt template");
     println!("  /benchmark pi [n]      run the Pi workflow benchmark");
+    println!("Loop controls:");
+    println!("  /goal <argv...>        register a deterministic stop check_cmd");
+    println!("  /goal show | clear     inspect or remove the active goal");
+    println!("  /budget show           show current cap, cumulative, and remaining");
+    println!("  /budget cost=$X        cap session cost (microusd-aware)");
+    println!("  /budget tokens=N       cap session total tokens");
     println!("  /quit                  exit");
     println!("Tips:");
     println!("  type / to open the command palette");
@@ -1498,6 +1657,491 @@ fn run_interactive_shell(command: &str) -> Result<()> {
     } else {
         anyhow::bail!("shell command exited with status {status}");
     }
+}
+
+fn matches_template_query(template: &nerve_config::PromptTemplate, query: &str) -> bool {
+    if query.trim().is_empty() {
+        return true;
+    }
+    let haystack = format!(
+        "{} {} {}",
+        template.id,
+        template.description.as_deref().unwrap_or(""),
+        template.prompt
+    )
+    .to_ascii_lowercase();
+    query
+        .split_whitespace()
+        .all(|term| haystack.contains(&term.to_ascii_lowercase()))
+}
+
+fn template_usage_path(cwd: &Path) -> PathBuf {
+    cwd.join(".nerve")
+        .join("session-meta")
+        .join("template-usage.json")
+}
+
+fn load_template_usage(cwd: &Path) -> Result<BTreeMap<String, u64>> {
+    let path = template_usage_path(cwd);
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read `{}`", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    serde_json::from_str(&raw)
+        .with_context(|| format!("invalid template usage JSON in `{}`", path.display()))
+}
+
+fn bump_template_usage(cwd: &Path, template_id: &str) -> Result<()> {
+    let mut usage = load_template_usage(cwd).unwrap_or_default();
+    let entry = usage.entry(template_id.to_string()).or_insert(0);
+    *entry = entry.saturating_add(1);
+    let path = template_usage_path(cwd);
+    write_json_atomic(&path, &usage)
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create `{}`", parent.display()))?;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let raw = serde_json::to_vec_pretty(value)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create temp file in `{}`", parent.display()))?;
+    tmp.write_all(&raw)
+        .with_context(|| format!("failed to write temp JSON for `{}`", path.display()))?;
+    tmp.persist(path)
+        .map_err(|err| err.error)
+        .with_context(|| format!("failed to move temp JSON to `{}`", path.display()))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GoalAction {
+    Show,
+    Clear,
+    Register {
+        argv: Vec<String>,
+        timeout_secs: Option<u64>,
+    },
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum GoalParseError {
+    #[error("usage: /goal <argv> | /goal show | /goal clear | /goal --timeout N <argv>")]
+    Empty,
+    #[error("/goal --timeout requires a positive number")]
+    BadTimeout,
+    #[error(
+        "Phase 2 natural-language goals are deferred to v0.3.0. \
+         Use argv form: /goal <program> [args...]"
+    )]
+    NaturalLanguage,
+}
+
+fn parse_goal_argv(tokens: &[&str]) -> Result<GoalAction, GoalParseError> {
+    let mut iter = tokens.iter().map(|s| s.to_string()).peekable();
+    let Some(first) = iter.peek().cloned() else {
+        return Err(GoalParseError::Empty);
+    };
+    if tokens.len() == 1 {
+        match first.as_str() {
+            "show" => return Ok(GoalAction::Show),
+            "clear" => return Ok(GoalAction::Clear),
+            _ => {}
+        }
+    }
+
+    let mut timeout_secs: Option<u64> = None;
+    let mut argv: Vec<String> = Vec::new();
+    while let Some(token) = iter.next() {
+        match token.as_str() {
+            "--timeout" => {
+                let value = iter.next().ok_or(GoalParseError::BadTimeout)?;
+                let parsed: u64 = value.parse().map_err(|_| GoalParseError::BadTimeout)?;
+                if parsed == 0 {
+                    return Err(GoalParseError::BadTimeout);
+                }
+                timeout_secs = Some(parsed);
+            }
+            _ => argv.push(token),
+        }
+    }
+
+    if argv.is_empty() {
+        return Err(GoalParseError::Empty);
+    }
+
+    // sec-1 #6 deferred: reject natural-language forms (heuristic — `&&`, `||`,
+    // `;`, `|` are shell-meta or English-conjunction signals — until v0.3.0
+    // Phase 2 lands the user-confirmation flow.
+    if argv
+        .iter()
+        .any(|tok| matches!(tok.as_str(), "&&" | "||" | ";" | "|"))
+    {
+        return Err(GoalParseError::NaturalLanguage);
+    }
+
+    Ok(GoalAction::Register { argv, timeout_secs })
+}
+
+fn active_goal_path(cwd: &Path) -> PathBuf {
+    cwd.join(".nerve")
+        .join("session-meta")
+        .join("active-goal.json")
+}
+
+fn handle_goal_command(args: Vec<&str>, state: &mut InteractiveState, cwd: &Path) -> Result<()> {
+    let action = parse_goal_argv(&args).map_err(|err| anyhow::anyhow!("{err}"))?;
+    match action {
+        GoalAction::Show => match state.active_goal.as_ref() {
+            Some(spec) => {
+                println!(
+                    "goal id={} timeout={}s cmd={:?}",
+                    spec.id, spec.timeout_secs, spec.check_cmd
+                );
+            }
+            None => println!("No active goal."),
+        },
+        GoalAction::Clear => {
+            state.active_goal = None;
+            let path = active_goal_path(cwd);
+            if path.exists() {
+                let _ = fs::remove_file(&path);
+            }
+            println!("Cleared active goal.");
+        }
+        GoalAction::Register { argv, timeout_secs } => {
+            let id = format!("goal-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
+            let spec = GoalSpec {
+                id,
+                check_cmd: argv,
+                timeout_secs: timeout_secs.unwrap_or(300),
+                cwd: Some(cwd.to_path_buf()),
+                env: BTreeMap::new(),
+                no_progress_max: None,
+            };
+            spec.validate()
+                .with_context(|| "goal spec validation failed")?;
+            // sec-1 #5: prevent path traversal from cwd by writing relative to
+            // the freeze-locked workspace root only.
+            let target = active_goal_path(cwd);
+            write_json_atomic(&target, &spec)?;
+            println!(
+                "Registered goal `{}`: {} ({}s timeout)",
+                spec.id,
+                spec.check_cmd.join(" "),
+                spec.timeout_secs
+            );
+            state.active_goal = Some(spec);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BudgetAction {
+    Show,
+    Set {
+        cost_microusd: Option<u64>,
+        tokens: Option<u64>,
+        force: bool,
+    },
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum BudgetParseError {
+    #[error("usage: /budget show | /budget cost=$X | /budget tokens=N [--force]")]
+    Empty,
+    #[error("/budget value must not be empty")]
+    EmptyValue,
+    #[error("/budget value must specify a unit: $ prefix for cost, `tokens` suffix for tokens")]
+    UnitMissing,
+    #[error("/budget value `{0}` is not a positive number")]
+    InvalidValue(String),
+}
+
+fn parse_budget_args(tokens: &[&str]) -> Result<BudgetAction, BudgetParseError> {
+    if tokens.is_empty() {
+        return Err(BudgetParseError::Empty);
+    }
+    if tokens.len() == 1 && tokens[0] == "show" {
+        return Ok(BudgetAction::Show);
+    }
+    let mut cost: Option<u64> = None;
+    let mut toks: Option<u64> = None;
+    let mut force = false;
+    for token in tokens {
+        if *token == "--force" {
+            force = true;
+            continue;
+        }
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return Err(BudgetParseError::EmptyValue);
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let value_after_eq = trimmed.split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
+        if lower.starts_with("cost=") {
+            if value_after_eq.is_empty() {
+                return Err(BudgetParseError::EmptyValue);
+            }
+            cost = Some(parse_cost_value(value_after_eq)?);
+        } else if lower.starts_with("tokens=") {
+            if value_after_eq.is_empty() {
+                return Err(BudgetParseError::EmptyValue);
+            }
+            toks = Some(parse_tokens_value(value_after_eq)?);
+        } else {
+            return Err(BudgetParseError::UnitMissing);
+        }
+    }
+    if cost.is_none() && toks.is_none() {
+        return Err(BudgetParseError::Empty);
+    }
+    Ok(BudgetAction::Set {
+        cost_microusd: cost,
+        tokens: toks,
+        force,
+    })
+}
+
+fn parse_cost_value(raw: &str) -> Result<u64, BudgetParseError> {
+    // sec-3 #5: require `$` prefix for cost, reject bare numbers / negatives /
+    // NaN. Decimal `$5.00` becomes microusd.
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(BudgetParseError::EmptyValue);
+    }
+    let Some(rest) = trimmed.strip_prefix('$') else {
+        return Err(BudgetParseError::UnitMissing);
+    };
+    if rest.is_empty() {
+        return Err(BudgetParseError::EmptyValue);
+    }
+    if rest.contains('-') || rest.contains('+') || rest.starts_with('.') {
+        return Err(BudgetParseError::InvalidValue(raw.to_string()));
+    }
+    let (dollars_str, fractional_str) = match rest.split_once('.') {
+        Some((d, f)) => (d, f),
+        None => (rest, ""),
+    };
+    if dollars_str.is_empty() || !dollars_str.chars().all(|c| c.is_ascii_digit()) {
+        return Err(BudgetParseError::InvalidValue(raw.to_string()));
+    }
+    if !fractional_str.chars().all(|c| c.is_ascii_digit()) {
+        return Err(BudgetParseError::InvalidValue(raw.to_string()));
+    }
+    let dollars: u64 = dollars_str
+        .parse()
+        .map_err(|_| BudgetParseError::InvalidValue(raw.to_string()))?;
+    let padded = format!("{:0<6}", fractional_str);
+    let truncated = &padded[..6.min(padded.len())];
+    let micros: u64 = if truncated.is_empty() {
+        0
+    } else {
+        truncated
+            .parse()
+            .map_err(|_| BudgetParseError::InvalidValue(raw.to_string()))?
+    };
+    let total = dollars
+        .checked_mul(1_000_000)
+        .and_then(|v| v.checked_add(micros))
+        .ok_or_else(|| BudgetParseError::InvalidValue(raw.to_string()))?;
+    if total == 0 {
+        return Err(BudgetParseError::InvalidValue(raw.to_string()));
+    }
+    Ok(total)
+}
+
+fn parse_tokens_value(raw: &str) -> Result<u64, BudgetParseError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(BudgetParseError::EmptyValue);
+    }
+    if trimmed.starts_with('-') || trimmed.starts_with('+') {
+        return Err(BudgetParseError::InvalidValue(raw.to_string()));
+    }
+    if !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return Err(BudgetParseError::InvalidValue(raw.to_string()));
+    }
+    let parsed: u64 = trimmed
+        .parse()
+        .map_err(|_| BudgetParseError::InvalidValue(raw.to_string()))?;
+    if parsed == 0 {
+        return Err(BudgetParseError::InvalidValue(raw.to_string()));
+    }
+    Ok(parsed)
+}
+
+fn budget_audit_path(cwd: &Path) -> PathBuf {
+    cwd.join(".nerve")
+        .join("session-meta")
+        .join("budget-audit.json")
+}
+
+async fn handle_budget_command(
+    args: Vec<&str>,
+    state: &mut InteractiveState,
+    cwd: &Path,
+) -> Result<()> {
+    if args.is_empty() {
+        anyhow::bail!("usage: /budget show | /budget cost=$X | /budget tokens=N [--force]");
+    }
+    let action = parse_budget_args(&args).map_err(|err| anyhow::anyhow!("{err}"))?;
+    let config = Config::load_from(cwd)?;
+    match action {
+        BudgetAction::Show => {
+            print_budget_show(state, &config);
+            return Ok(());
+        }
+        BudgetAction::Set {
+            cost_microusd,
+            tokens,
+            force,
+        } => {
+            let prev = BudgetSnapshot {
+                max_total_tokens: state
+                    .budget_override_tokens
+                    .or(config.orchestration.max_total_tokens),
+                max_estimated_cost_microusd: state
+                    .budget_override_cost_microusd
+                    .or(config.orchestration.max_estimated_cost_microusd),
+            };
+
+            let mut new_cost = state
+                .budget_override_cost_microusd
+                .or(config.orchestration.max_estimated_cost_microusd);
+            let mut new_tokens = state
+                .budget_override_tokens
+                .or(config.orchestration.max_total_tokens);
+            let mut user_confirmed = !force;
+
+            if let Some(requested_cost) = cost_microusd {
+                if let Some(ceiling) = config.orchestration.budget_cost_microusd_ceiling
+                    && requested_cost > ceiling
+                {
+                    anyhow::bail!(
+                        "/budget cost cap {} exceeds global ceiling {} (microusd). \
+                         --force cannot bypass the ceiling.",
+                        requested_cost,
+                        ceiling
+                    );
+                }
+                let is_raise = new_cost.map(|c| requested_cost > c).unwrap_or(true);
+                if is_raise {
+                    if !confirm_raise_interactive("cost")? {
+                        anyhow::bail!("budget raise cancelled");
+                    }
+                    user_confirmed = true;
+                }
+                new_cost = Some(requested_cost);
+            }
+            if let Some(requested_tokens) = tokens {
+                if let Some(ceiling) = config.orchestration.budget_tokens_ceiling
+                    && requested_tokens > ceiling
+                {
+                    anyhow::bail!(
+                        "/budget tokens cap {} exceeds global ceiling {}. \
+                         --force cannot bypass the ceiling.",
+                        requested_tokens,
+                        ceiling
+                    );
+                }
+                let is_raise = new_tokens.map(|t| requested_tokens > t).unwrap_or(true);
+                if is_raise {
+                    if !confirm_raise_interactive("tokens")? {
+                        anyhow::bail!("budget raise cancelled");
+                    }
+                    user_confirmed = true;
+                }
+                new_tokens = Some(requested_tokens);
+            }
+
+            let next = BudgetSnapshot {
+                max_total_tokens: new_tokens,
+                max_estimated_cost_microusd: new_cost,
+            };
+            let entry = BudgetAuditEntry {
+                ts: chrono::Utc::now(),
+                prev,
+                next: next.clone(),
+                source: "slash".to_string(),
+                user_confirmed,
+            };
+            append_budget_audit_entry(&budget_audit_path(cwd), entry)
+                .with_context(|| "failed to append budget audit entry")?;
+
+            state.budget_override_cost_microusd = next.max_estimated_cost_microusd;
+            state.budget_override_tokens = next.max_total_tokens;
+            print_budget_show(state, &config);
+            print_status_bar(state);
+        }
+    }
+    Ok(())
+}
+
+fn print_budget_show(state: &InteractiveState, config: &Config) {
+    let cost_cap = state
+        .budget_override_cost_microusd
+        .or(config.orchestration.max_estimated_cost_microusd);
+    let token_cap = state
+        .budget_override_tokens
+        .or(config.orchestration.max_total_tokens);
+    let total_tokens = state
+        .cumulative_input_tokens
+        .saturating_add(state.cumulative_output_tokens);
+    let cost_used = state.cumulative_cost_microusd;
+    let cost_remaining = cost_cap.map(|c| c.saturating_sub(cost_used));
+    let tokens_remaining = token_cap.map(|t| t.saturating_sub(total_tokens));
+    println!(
+        "budget: cost cap={} used={} remaining={}",
+        cost_cap
+            .map(format_cost_microusd)
+            .unwrap_or_else(|| "-".to_string()),
+        format_cost_microusd(cost_used),
+        cost_remaining
+            .map(format_cost_microusd)
+            .unwrap_or_else(|| "-".to_string()),
+    );
+    println!(
+        "budget: token cap={} used={} remaining={}",
+        token_cap
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        total_tokens,
+        tokens_remaining
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+    );
+    if let Some(ceiling) = config.orchestration.budget_cost_microusd_ceiling {
+        println!(
+            "budget: global cost ceiling={}",
+            format_cost_microusd(ceiling)
+        );
+    }
+    if let Some(ceiling) = config.orchestration.budget_tokens_ceiling {
+        println!("budget: global token ceiling={ceiling}");
+    }
+}
+
+fn confirm_raise_interactive(label: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "/budget {label} raise requires interactive confirmation; \
+             non-interactive sessions are rejected"
+        );
+    }
+    print!("Raising {label} budget. Continue? [y/N]: ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).ok();
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(matches!(answer.as_str(), "y" | "yes"))
 }
 
 async fn run_daemon(apply: bool, mock: bool, once: bool) -> Result<()> {
@@ -1811,12 +2455,33 @@ fn disable_stdin_echo_if_terminal() -> Result<Option<()>> {
 }
 
 async fn run_report(prompt: String, apply: bool, mock: bool) -> Result<RunReport> {
+    run_report_with_overrides(prompt, apply, mock, None, None, None).await
+}
+
+async fn run_report_with_overrides(
+    prompt: String,
+    apply: bool,
+    mock: bool,
+    goal: Option<GoalSpec>,
+    budget_cost_override: Option<u64>,
+    budget_tokens_override: Option<u64>,
+) -> Result<RunReport> {
     let cwd = env::current_dir().context("failed to read current directory")?;
-    let config = Config::load_from(&cwd)?;
+    let mut config = Config::load_from(&cwd)?;
+    if let Some(cost) = budget_cost_override {
+        config.orchestration.max_estimated_cost_microusd = Some(cost);
+    }
+    if let Some(tokens) = budget_tokens_override {
+        config.orchestration.max_total_tokens = Some(tokens);
+    }
     let mut task = Task::new(prompt, &cwd);
     task.context_paths = collect_context_paths(&task.prompt, &cwd);
     let adapters = default_adapters(mock);
-    let report = run_synaptic_loop(task, &config, &adapters, RunOptions { apply }).await?;
+    let mut options = RunOptions::new(apply);
+    if let Some(spec) = goal {
+        options = options.with_goal(spec);
+    }
+    let report = run_synaptic_loop(task, &config, &adapters, options).await?;
     NerveStore::new(&cwd).save_report(&report)?;
     Ok(report)
 }
@@ -2233,5 +2898,119 @@ mod tests {
     fn slash_command_suggestions_ignore_task_text_and_arguments() {
         assert!(command_suggestions("fix /doctor output").is_empty());
         assert!(command_suggestions("/mode dry-run").is_empty());
+    }
+
+    #[test]
+    fn budget_parse_rejects_negative() {
+        let err = parse_budget_args(&["cost=$-5"]).unwrap_err();
+        assert!(matches!(err, BudgetParseError::InvalidValue(_)));
+        let err = parse_budget_args(&["tokens=-100"]).unwrap_err();
+        assert!(matches!(err, BudgetParseError::InvalidValue(_)));
+    }
+
+    #[test]
+    fn budget_parse_rejects_unit_missing() {
+        let err = parse_budget_args(&["5"]).unwrap_err();
+        assert!(matches!(err, BudgetParseError::UnitMissing));
+        let err = parse_budget_args(&["foo=10"]).unwrap_err();
+        assert!(matches!(err, BudgetParseError::UnitMissing));
+    }
+
+    #[test]
+    fn budget_parse_rejects_zero_and_empty() {
+        let err = parse_budget_args(&["cost=$0"]).unwrap_err();
+        assert!(matches!(err, BudgetParseError::InvalidValue(_)));
+        let err = parse_budget_args(&["tokens=0"]).unwrap_err();
+        assert!(matches!(err, BudgetParseError::InvalidValue(_)));
+        let err = parse_budget_args(&["cost="]).unwrap_err();
+        assert!(matches!(err, BudgetParseError::EmptyValue));
+        let err = parse_budget_args(&[]).unwrap_err();
+        assert!(matches!(err, BudgetParseError::Empty));
+    }
+
+    #[test]
+    fn budget_decimal_to_microusd() {
+        assert_eq!(parse_cost_value("$5.00").unwrap(), 5_000_000);
+        assert_eq!(parse_cost_value("$0.01").unwrap(), 10_000);
+        assert_eq!(parse_cost_value("$1.234567").unwrap(), 1_234_567);
+        assert_eq!(parse_cost_value("$2").unwrap(), 2_000_000);
+    }
+
+    #[test]
+    fn budget_show_action_parses() {
+        let action = parse_budget_args(&["show"]).unwrap();
+        assert_eq!(action, BudgetAction::Show);
+    }
+
+    #[test]
+    fn budget_set_tokens_and_cost() {
+        let action = parse_budget_args(&["cost=$1.00", "tokens=50000"]).unwrap();
+        assert_eq!(
+            action,
+            BudgetAction::Set {
+                cost_microusd: Some(1_000_000),
+                tokens: Some(50_000),
+                force: false,
+            }
+        );
+        let action = parse_budget_args(&["cost=$10", "--force"]).unwrap();
+        assert!(matches!(
+            action,
+            BudgetAction::Set {
+                force: true,
+                cost_microusd: Some(10_000_000),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn goal_argv_parse_strips_flags() {
+        let action = parse_goal_argv(&["--timeout", "30", "cargo", "test"]).unwrap();
+        match action {
+            GoalAction::Register { argv, timeout_secs } => {
+                assert_eq!(argv, vec!["cargo".to_string(), "test".to_string()]);
+                assert_eq!(timeout_secs, Some(30));
+            }
+            other => panic!("expected register, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn goal_argv_recognizes_show_and_clear() {
+        assert_eq!(parse_goal_argv(&["show"]).unwrap(), GoalAction::Show);
+        assert_eq!(parse_goal_argv(&["clear"]).unwrap(), GoalAction::Clear);
+    }
+
+    #[test]
+    fn goal_argv_rejects_natural_language() {
+        let err = parse_goal_argv(&["tests", "pass", "&&", "diff", "applied"]).unwrap_err();
+        assert!(matches!(err, GoalParseError::NaturalLanguage));
+    }
+
+    #[test]
+    fn goal_argv_rejects_empty() {
+        let err = parse_goal_argv(&[]).unwrap_err();
+        assert!(matches!(err, GoalParseError::Empty));
+    }
+
+    #[test]
+    fn cost_format_two_decimals_and_four_fraction() {
+        assert_eq!(format_cost_microusd(0), "$0.0000");
+        assert_eq!(format_cost_microusd(123_456), "$0.1234");
+        assert_eq!(format_cost_microusd(5_000_000), "$5.0000");
+    }
+
+    #[test]
+    fn template_query_matches_substring_case_insensitive() {
+        let template = nerve_config::PromptTemplate {
+            id: "security-audit".to_string(),
+            prompt: "Run a security review".to_string(),
+            description: Some("Audit dependencies for CVEs".to_string()),
+        };
+        assert!(matches_template_query(&template, "security"));
+        assert!(matches_template_query(&template, "CVE"));
+        assert!(matches_template_query(&template, ""));
+        assert!(!matches_template_query(&template, "performance"));
     }
 }

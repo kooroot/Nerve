@@ -10,6 +10,7 @@ async-trait.workspace = true
 nerve-patch = { path = "../nerve-patch" }
 nerve-types = { path = "../nerve-types" }
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

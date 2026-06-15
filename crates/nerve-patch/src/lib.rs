@@ -25,6 +25,8 @@ pub enum PatchError {
     InvalidUnifiedDiff { message: String },
     #[error("unsafe patch path `{path}`: {reason}")]
     UnsafePath { path: PathBuf, reason: String },
+    #[error("forbidden patch path `{path}`: writes into `{prefix}` are not allowed")]
+    ForbiddenPath { path: PathBuf, prefix: String },
     #[error("unsupported patch operation: {message}")]
     Unsupported { message: String },
     #[error("invalid patch state for `{path}`: {message}")]
@@ -170,6 +172,46 @@ impl NvPatch {
             changed_files: self.changed_files(),
             dry_run,
         })
+    }
+
+    /// Deterministic SHA-256 fingerprint of the patch payload.
+    ///
+    /// Sorts files by path, normalises CRLF→LF, and excludes metadata
+    /// (id, base_commit, timestamps) so equivalent patches hash equal
+    /// regardless of construction order or line-ending quirks.
+    pub fn canonical_hash(&self) -> String {
+        let mut entries: Vec<&FilePatch> = self.files.iter().collect();
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let mut hasher = Sha256::new();
+        for file in entries {
+            let path = file.path.to_string_lossy();
+            hasher.update(path.as_bytes());
+            hasher.update(b"\0");
+            match &file.operation {
+                FileOperation::Modify => hasher.update(b"modify\0"),
+                FileOperation::Create => hasher.update(b"create\0"),
+                FileOperation::Delete => hasher.update(b"delete\0"),
+                FileOperation::Rename { from } => {
+                    hasher.update(b"rename\0");
+                    hasher.update(from.to_string_lossy().as_bytes());
+                    hasher.update(b"\0");
+                }
+            }
+            let original = file.original.replace("\r\n", "\n");
+            let modified = file.modified.replace("\r\n", "\n");
+            hasher.update(original.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(modified.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        let digest = hasher.finalize();
+        let mut out = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            let _ = write!(&mut out, "{byte:02x}");
+        }
+        out
     }
 
     fn changed_files(&self) -> Vec<PathBuf> {
@@ -961,6 +1003,20 @@ fn ensure_safe_relative_path(cwd: &Path, relative: &Path) -> Result<()> {
         }
     }
 
+    let first_normal = relative.components().find_map(|component| match component {
+        Component::Normal(value) => Some(value),
+        _ => None,
+    });
+    if let Some(first) = first_normal {
+        let first_str = first.to_string_lossy();
+        if first_str == ".git" || first_str == ".nerve" {
+            return Err(PatchError::ForbiddenPath {
+                path: relative.to_path_buf(),
+                prefix: format!("{first_str}/"),
+            });
+        }
+    }
+
     let cwd = cwd.canonicalize().map_err(|source| PatchError::Io {
         path: cwd.to_path_buf(),
         source,
@@ -1276,6 +1332,66 @@ rename to new.txt
         assert!(matches!(err, PatchError::Io { .. }));
         assert!(!blocking_path.exists());
         assert!(!nested_path.exists());
+    }
+
+    #[test]
+    fn canonical_hash_idempotent() {
+        let patch = NvPatch::new(vec![
+            FilePatch::new("src/a.rs", "old\n", "new\n"),
+            FilePatch::new("src/b.rs", "x\n", "y\n"),
+        ]);
+        assert_eq!(patch.canonical_hash(), patch.canonical_hash());
+    }
+
+    #[test]
+    fn canonical_hash_normalizes_crlf() {
+        let lf = NvPatch::new(vec![FilePatch::new("src/a.rs", "a\nb\n", "c\nd\n")]);
+        let crlf = NvPatch::new(vec![FilePatch::new("src/a.rs", "a\r\nb\r\n", "c\r\nd\r\n")]);
+        assert_eq!(lf.canonical_hash(), crlf.canonical_hash());
+    }
+
+    #[test]
+    fn canonical_hash_path_order_invariant() {
+        let a = NvPatch::new(vec![
+            FilePatch::new("src/a.rs", "1\n", "2\n"),
+            FilePatch::new("src/b.rs", "3\n", "4\n"),
+        ]);
+        let b = NvPatch::new(vec![
+            FilePatch::new("src/b.rs", "3\n", "4\n"),
+            FilePatch::new("src/a.rs", "1\n", "2\n"),
+        ]);
+        assert_eq!(a.canonical_hash(), b.canonical_hash());
+    }
+
+    #[test]
+    fn canonical_hash_ignores_metadata_fields() {
+        let mut a = NvPatch::new(vec![FilePatch::new("src/a.rs", "1\n", "2\n")]);
+        let mut b = NvPatch::new(vec![FilePatch::new("src/a.rs", "1\n", "2\n")]);
+        a.id = "id-one".to_string();
+        b.id = "id-two".to_string();
+        a.base_commit = Some("aaa".to_string());
+        b.base_commit = Some("bbb".to_string());
+        assert_eq!(a.canonical_hash(), b.canonical_hash());
+    }
+
+    #[test]
+    fn rejects_git_meta_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = NvPatch::new(vec![FilePatch::create(".git/config", "evil\n")]);
+
+        let err = patch.apply(dir.path(), true).unwrap_err();
+
+        assert!(matches!(err, PatchError::ForbiddenPath { .. }));
+    }
+
+    #[test]
+    fn rejects_nerve_meta_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = NvPatch::new(vec![FilePatch::create(".nerve/sessions/x.json", "evil\n")]);
+
+        let err = patch.apply(dir.path(), true).unwrap_err();
+
+        assert!(matches!(err, PatchError::ForbiddenPath { .. }));
     }
 
     fn assert_no_staged_write_temps(path: &Path) {

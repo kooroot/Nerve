@@ -155,8 +155,26 @@ pub enum AgentEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckResult {
+    Pass,
+    Fail { reason: String },
+    Skipped,
+}
+
+impl CheckResult {
+    pub fn is_pass(&self) -> bool {
+        matches!(self, Self::Pass)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RoundRecord {
     pub round: u8,
     pub lead: AgentOutput,
     pub reviewer: ReviewerFeedback,
+    #[serde(default)]
+    pub check_result: Option<CheckResult>,
+    #[serde(default)]
+    pub patch_sha: Option<String>,
 }

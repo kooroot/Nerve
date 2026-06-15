@@ -6,6 +6,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod goal;
+pub use goal::{ConfigError, GoalSpec};
+
 const DEFAULT_CONFIG: &str = include_str!("../../../nerve.config.json");
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,6 +39,28 @@ pub struct Orchestration {
     pub max_total_tokens: Option<u64>,
     #[serde(default)]
     pub max_estimated_cost_microusd: Option<u64>,
+    // sec-1 #3: /goal evaluator env whitelist (names only; value "" = inherit from parent).
+    #[serde(default)]
+    pub check_env: Vec<String>,
+    // sec-1 #7: streaming output cap for /goal check_cmd stdout/stderr.
+    #[serde(default = "Orchestration::default_check_output_cap_bytes")]
+    pub check_output_cap_bytes: usize,
+    // Adapter spawn guard knobs; None falls back to nerve-adapter defaults.
+    #[serde(default)]
+    pub adapter_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub adapter_max_output_bytes: Option<usize>,
+    // sec-3 #1: hard ceiling that user `/budget raising` cannot exceed.
+    #[serde(default)]
+    pub budget_cost_microusd_ceiling: Option<u64>,
+    #[serde(default)]
+    pub budget_tokens_ceiling: Option<u64>,
+}
+
+impl Orchestration {
+    pub fn default_check_output_cap_bytes() -> usize {
+        1_048_576
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -220,6 +245,20 @@ impl Config {
             anyhow::bail!(
                 "orchestration.max_estimated_cost_microusd must be greater than 0 when set"
             );
+        }
+        if self.orchestration.budget_cost_microusd_ceiling == Some(0) {
+            anyhow::bail!(
+                "orchestration.budget_cost_microusd_ceiling must be greater than 0 when set"
+            );
+        }
+        if self.orchestration.budget_tokens_ceiling == Some(0) {
+            anyhow::bail!("orchestration.budget_tokens_ceiling must be greater than 0 when set");
+        }
+        if self.orchestration.adapter_timeout_secs == Some(0) {
+            anyhow::bail!("orchestration.adapter_timeout_secs must be greater than 0 when set");
+        }
+        if self.orchestration.adapter_max_output_bytes == Some(0) {
+            anyhow::bail!("orchestration.adapter_max_output_bytes must be greater than 0 when set");
         }
         if self.roles.architect.trim().is_empty() {
             anyhow::bail!("roles.architect must not be empty");
@@ -431,6 +470,81 @@ mod tests {
         let selected = config.select_profile(&task).unwrap();
 
         assert_eq!(selected.id.as_deref(), Some("contract_audit"));
+    }
+
+    #[test]
+    fn goal_spec_validate_rejects_empty_cmd() {
+        let spec = GoalSpec {
+            id: "g1".into(),
+            check_cmd: Vec::new(),
+            timeout_secs: 60,
+            cwd: None,
+            env: Default::default(),
+            no_progress_max: None,
+        };
+        assert_eq!(spec.validate(), Err(ConfigError::EmptyCheckCmd));
+    }
+
+    #[test]
+    fn goal_spec_validate_rejects_relative_path_with_dotdot() {
+        let spec = GoalSpec {
+            id: "g1".into(),
+            check_cmd: vec!["../evil".into()],
+            timeout_secs: 60,
+            cwd: None,
+            env: Default::default(),
+            no_progress_max: None,
+        };
+        assert!(matches!(
+            spec.validate(),
+            Err(ConfigError::InvalidCheckCmdProgram(_))
+        ));
+
+        let abs = GoalSpec {
+            id: "g2".into(),
+            check_cmd: vec!["/bin/sh".into()],
+            timeout_secs: 60,
+            cwd: None,
+            env: Default::default(),
+            no_progress_max: None,
+        };
+        assert!(matches!(
+            abs.validate(),
+            Err(ConfigError::InvalidCheckCmdProgram(_))
+        ));
+    }
+
+    #[test]
+    fn goal_spec_serde_round_trip() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("PATH".to_string(), String::new());
+        env.insert("NERVE_RUN".to_string(), "1".to_string());
+        let spec = GoalSpec {
+            id: "g1".into(),
+            check_cmd: vec!["cargo".into(), "test".into()],
+            timeout_secs: 120,
+            cwd: Some(PathBuf::from("/tmp/work")),
+            env,
+            no_progress_max: Some(3),
+        };
+        spec.validate().unwrap();
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: GoalSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(spec, back);
+    }
+
+    #[test]
+    fn orchestration_check_env_default_empty() {
+        let config = Config::from_json_str(DEFAULT_CONFIG).unwrap();
+        assert!(config.orchestration.check_env.is_empty());
+        assert_eq!(
+            config.orchestration.check_output_cap_bytes,
+            Orchestration::default_check_output_cap_bytes()
+        );
+        assert!(config.orchestration.adapter_timeout_secs.is_none());
+        assert!(config.orchestration.adapter_max_output_bytes.is_none());
+        assert!(config.orchestration.budget_cost_microusd_ceiling.is_none());
+        assert!(config.orchestration.budget_tokens_ceiling.is_none());
     }
 
     #[test]
