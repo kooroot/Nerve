@@ -14,6 +14,23 @@ pub use goal_intent::GoalIntent;
 
 const DEFAULT_CONFIG: &str = include_str!("../../../nerve.config.json");
 
+/// Where an active [`Config`] was loaded from. Used to decide whether config
+/// that enables an *executing* built-in verifier (S4 `Auto`/`Command` mode) is
+/// operator-controlled (trusted) or project-controlled — a cloned repo could
+/// ship `./nerve.config.json` to opt itself into running code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfigSource {
+    /// Repo-local `./nerve.config.json` — authored by whoever controls the
+    /// working tree, not necessarily the operator. Untrusted for code execution.
+    Project,
+    /// Operator's `~/.config/nerve/config.json`. Trusted (operator-controlled).
+    User,
+    /// Embedded built-in default or in-memory construction (`from_json_str`).
+    /// Trusted (the shipped default keeps the verifier `Off`).
+    #[default]
+    Default,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -30,6 +47,11 @@ pub struct Config {
     // Tier 3g (v0.5.0): ratatui-based 3-pane TUI configuration.
     #[serde(default)]
     pub tui: TuiConfig,
+    /// Provenance of this config (S4 trust boundary). Never serialized; defaults
+    /// to [`ConfigSource::Default`] for in-memory construction and is stamped by
+    /// [`Config::load_from`] based on which file supplied the config.
+    #[serde(skip)]
+    source: ConfigSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +100,98 @@ pub struct Orchestration {
     // legacy byte-identical orchestration serialization.
     #[serde(default)]
     pub mayor_patrol: Option<MayorPatrolConfig>,
+    // S4: built-in verification gate. When no explicit `/goal` is set, an
+    // opted-in `auto`/`command` mode supplies the project's test/build command
+    // as the deterministic check so acceptance never rests on reviewer opinion
+    // alone. Defaults to `off` (never executes repo code without consent).
+    #[serde(default)]
+    pub builtin_verifier: BuiltinVerifierConfig,
+}
+
+/// S4: how the built-in verifier behaves when a run has no explicit `/goal`
+/// deterministic check.
+///
+/// Defaults to [`Off`](BuiltinVerifierMode::Off): running a project's test/build
+/// command executes project-controlled code (Cargo build scripts, `package.json`
+/// scripts, …), and the existing guards (env whitelist, timeout, output cap,
+/// optional ulimit) are *resource* limits, not filesystem/network isolation.
+/// Until the OS execution sandbox (roadmap S5, S4's documented safety
+/// dependency) lands, executing repo code is an explicit operator opt-in, never
+/// a default (roadmap anti-pattern #1: risky auto-execution must be loud and
+/// opt-in). The CLI loudly warns whenever no gate is active so acceptance is
+/// never *silently* reduced to reviewer opinion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltinVerifierMode {
+    /// Disable the built-in verifier; absent a `/goal`, the deterministic check
+    /// is `Skipped` (acceptance = reviewer verdict only — surfaced loudly by the
+    /// CLI). The default: Nerve never executes repo code without explicit
+    /// consent.
+    #[default]
+    Off,
+    /// Opt in to detecting the project's test/build command from marker files
+    /// (Cargo.toml, go.mod, package.json) and running it as the deterministic
+    /// gate. Executes project-controlled code — enable only when you trust the
+    /// tree (or once S5's OS sandbox isolates it).
+    Auto,
+    /// Use the operator-supplied `command` verbatim as the gate. Like `Auto`,
+    /// this executes code; the operator names the exact argv they consent to.
+    Command,
+}
+
+/// S4: configuration for the always-on built-in verifier.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BuiltinVerifierConfig {
+    #[serde(default)]
+    pub mode: BuiltinVerifierMode,
+    /// Explicit argv used when `mode == Command`. `command[0]` must be a
+    /// PATH-searchable program name (same rule as `/goal check_cmd`).
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Wall-clock timeout for one verifier invocation. Build/test commands are
+    /// slower than a typical `/goal`, so this defaults higher.
+    #[serde(default = "default_builtin_verifier_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for BuiltinVerifierConfig {
+    fn default() -> Self {
+        Self {
+            mode: BuiltinVerifierMode::default(),
+            command: Vec::new(),
+            timeout_secs: default_builtin_verifier_timeout_secs(),
+        }
+    }
+}
+
+impl BuiltinVerifierConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.timeout_secs == 0 {
+            anyhow::bail!("timeout_secs must be greater than 0");
+        }
+        if matches!(self.mode, BuiltinVerifierMode::Command) {
+            let Some(program) = self.command.first() else {
+                anyhow::bail!("command must be a non-empty argv when mode = command");
+            };
+            // Same PATH-safety rule as GoalSpec::check_cmd[0] (sec-1 #1: argv
+            // only, no shell, PATH lookup only — no `/`, `\`, or `..`).
+            if program.is_empty()
+                || program.contains('/')
+                || program.contains('\\')
+                || program.contains("..")
+            {
+                anyhow::bail!(
+                    "command[0] `{program}` must be a PATH-searchable program name (no `/`, `\\`, or `..`)"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_builtin_verifier_timeout_secs() -> u64 {
+    600
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -557,17 +671,45 @@ impl Config {
     pub fn load_from(cwd: impl AsRef<Path>) -> Result<Self> {
         let cwd_config = cwd.as_ref().join("nerve.config.json");
         if cwd_config.exists() {
-            return Self::from_path(&cwd_config);
+            let mut config = Self::from_path(&cwd_config)?;
+            // Repo-local: untrusted for enabling an executing built-in verifier.
+            config.source = ConfigSource::Project;
+            return Ok(config);
         }
 
         if let Some(home) = env::var_os("HOME") {
             let user_config = PathBuf::from(home).join(".config/nerve/config.json");
             if user_config.exists() {
-                return Self::from_path(&user_config);
+                let mut config = Self::from_path(&user_config)?;
+                config.source = ConfigSource::User;
+                return Ok(config);
             }
         }
 
-        Self::from_json_str(DEFAULT_CONFIG).context("embedded default config is invalid")
+        let mut config =
+            Self::from_json_str(DEFAULT_CONFIG).context("embedded default config is invalid")?;
+        config.source = ConfigSource::Default;
+        Ok(config)
+    }
+
+    /// Provenance of this config — see [`ConfigSource`]. The S4 trust boundary
+    /// uses this to keep a project-local `nerve.config.json` from silently
+    /// enabling code execution.
+    pub fn source(&self) -> ConfigSource {
+        self.source
+    }
+
+    /// Whether config that enables an *executing* built-in verifier (S4 `Auto`
+    /// or `Command`) is trusted to run repo code. Operator-controlled sources
+    /// ([`ConfigSource::User`]/[`Default`](ConfigSource::Default)) are trusted;
+    /// a project-local config is NOT — a cloned repo could ship it — unless the
+    /// operator passes explicit out-of-band consent (`operator_consent`, e.g. an
+    /// env var or CLI flag a repo cannot forge).
+    pub fn builtin_verifier_exec_trusted(&self, operator_consent: bool) -> bool {
+        match self.source {
+            ConfigSource::User | ConfigSource::Default => true,
+            ConfigSource::Project => operator_consent,
+        }
     }
 
     pub fn from_path(path: &Path) -> Result<Self> {
@@ -632,6 +774,10 @@ impl Config {
             mp.validate()
                 .map_err(|e| anyhow::anyhow!("orchestration.mayor_patrol invalid: {e}"))?;
         }
+        self.orchestration
+            .builtin_verifier
+            .validate()
+            .map_err(|e| anyhow::anyhow!("orchestration.builtin_verifier invalid: {e}"))?;
         if self.roles.architect.trim().is_empty() {
             anyhow::bail!("roles.architect must not be empty");
         }
@@ -1715,5 +1861,127 @@ mod tests {
         assert!(ReviewStrictness::Low.permits_nits());
         assert!(ReviewStrictness::Normal.permits_nits());
         assert!(!ReviewStrictness::High.permits_nits());
+    }
+
+    #[test]
+    fn builtin_verifier_defaults_to_off_with_generous_timeout() {
+        // Safe by default: Nerve must not execute project-controlled code
+        // (cargo/npm test) without an explicit operator opt-in (S5 OS sandbox
+        // is S4's not-yet-built safety dependency).
+        let cfg = BuiltinVerifierConfig::default();
+        assert_eq!(cfg.mode, BuiltinVerifierMode::Off);
+        assert!(cfg.command.is_empty());
+        assert_eq!(cfg.timeout_secs, 600);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn default_config_leaves_builtin_verifier_off() {
+        // The shipped default config opts nobody into repo-code execution.
+        let config = Config::from_json_str(DEFAULT_CONFIG).unwrap();
+        assert_eq!(
+            config.orchestration.builtin_verifier.mode,
+            BuiltinVerifierMode::Off
+        );
+    }
+
+    const MINIMAL_CONFIG_JSON: &str = r#"{
+      "orchestration": {
+        "default_strategy": "consensus",
+        "max_refinement_rounds": 2,
+        "conflict_policy": "lead_priority",
+        "builtin_verifier": { "mode": "auto" }
+      },
+      "roles": { "architect": "claude-code", "reviewer": "codex" },
+      "profiles": []
+    }"#;
+
+    #[test]
+    fn in_memory_config_source_is_default_and_trusted() {
+        // from_json_str / embedded default are operator-controlled (the shipped
+        // default keeps the verifier Off), so they are trusted.
+        let config = Config::from_json_str(DEFAULT_CONFIG).unwrap();
+        assert_eq!(config.source(), ConfigSource::Default);
+        assert!(config.builtin_verifier_exec_trusted(false));
+    }
+
+    #[test]
+    fn load_from_stamps_repo_local_config_as_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nerve.config.json"), MINIMAL_CONFIG_JSON).unwrap();
+        let config = Config::load_from(dir.path()).unwrap();
+        assert_eq!(config.source(), ConfigSource::Project);
+    }
+
+    #[test]
+    fn project_config_is_untrusted_for_exec_without_consent() {
+        // The codex BLOCK: a cloned repo's nerve.config.json enabling `auto`
+        // must NOT be trusted to run code unless the operator consents
+        // out-of-band (a signal the repo cannot forge).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nerve.config.json"), MINIMAL_CONFIG_JSON).unwrap();
+        let project = Config::load_from(dir.path()).unwrap();
+
+        assert_eq!(project.source(), ConfigSource::Project);
+        assert!(!project.builtin_verifier_exec_trusted(false));
+        assert!(project.builtin_verifier_exec_trusted(true));
+    }
+
+    #[test]
+    fn builtin_verifier_command_mode_requires_nonempty_safe_argv() {
+        // Empty argv in command mode is rejected.
+        let cfg = BuiltinVerifierConfig {
+            mode: BuiltinVerifierMode::Command,
+            command: Vec::new(),
+            timeout_secs: 60,
+        };
+        assert!(cfg.validate().is_err());
+
+        // A `/`-bearing program is rejected (no shell, PATH lookup only).
+        let cfg = BuiltinVerifierConfig {
+            mode: BuiltinVerifierMode::Command,
+            command: vec!["./run.sh".into()],
+            timeout_secs: 60,
+        };
+        assert!(cfg.validate().is_err());
+
+        // A bare program name is accepted.
+        let cfg = BuiltinVerifierConfig {
+            mode: BuiltinVerifierMode::Command,
+            command: vec!["make".into(), "test".into()],
+            timeout_secs: 60,
+        };
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn builtin_verifier_zero_timeout_rejected() {
+        let cfg = BuiltinVerifierConfig {
+            mode: BuiltinVerifierMode::Auto,
+            command: Vec::new(),
+            timeout_secs: 0,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn builtin_verifier_round_trips_through_config_json() {
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority",
+                "builtin_verifier": { "mode": "command", "command": ["make", "ci"], "timeout_secs": 90 }
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        let bv = &config.orchestration.builtin_verifier;
+        assert_eq!(bv.mode, BuiltinVerifierMode::Command);
+        assert_eq!(bv.command, vec!["make", "ci"]);
+        assert_eq!(bv.timeout_secs, 90);
     }
 }

@@ -5,15 +5,17 @@ use nerve_adapter::{
     default_adapters_with_limits, default_write_tool_patterns, scope_mcp_spec_to_allowlist,
 };
 use nerve_config::{
-    Config, DaemonProtocol, GoalIntent, GoalSpec, McpConfig, PlanStrategy, RpcConfig,
+    BuiltinVerifierMode, Config, DaemonProtocol, GoalIntent, GoalSpec, McpConfig, PlanStrategy,
+    RpcConfig,
 };
 use nerve_core::session_fork::{ForkOptions as CoreForkOptions, SessionTree};
 use nerve_core::store::NerveStore;
 use nerve_core::{
     AuditChainState, BudgetAuditEntry, BudgetSnapshot, ChainStatus, DoctorCheck, DoctorStatus,
     ForkConfig as CoreForkConfig, GoalIntentConverter, Mayor, Patrol, PatrolTask, PlanError,
-    PlanRunOptions, RpcBus, RunOptions, RunReport, SessionForker, append_budget_audit_entry,
-    doctor_checks, format_chain_broken, run_plan_mode, run_synaptic_loop,
+    PROJECT_VERIFIER_CONSENT_ENV, PlanRunOptions, RpcBus, RunOptions, RunReport, SessionForker,
+    append_budget_audit_entry, doctor_checks, format_chain_broken,
+    project_verifier_consent_from_env, resolve_builtin_verifier, run_plan_mode, run_synaptic_loop,
 };
 use nerve_tui::{TuiApp, TuiAppOptions, TuiState};
 use nerve_types::{
@@ -4848,6 +4850,10 @@ async fn run_report_with_overrides(
     let mut options = RunOptions::new(apply);
     if let Some(spec) = goal {
         options = options.with_goal(spec);
+    } else {
+        // S4: surface which deterministic gate will run when no explicit /goal
+        // is set, so acceptance is never silently reduced to reviewer opinion.
+        announce_builtin_verifier(&config, &cwd);
     }
     if let Some(spec) = config.orchestration.check_ulimit.as_ref()
         && !spec.is_empty()
@@ -4860,6 +4866,53 @@ async fn run_report_with_overrides(
     let report = run_synaptic_loop(task, &config, &adapters, options).await?;
     NerveStore::new(&cwd).save_report(&report)?;
     Ok(report)
+}
+
+/// S4: print which deterministic gate will run when a `nv run` has no explicit
+/// `/goal`. Loud by design — the dangerous case (no verifier AND no goal, so
+/// acceptance rests on the reviewer verdict alone) is always a warning, never
+/// silence, even when the built-in verifier is `off` (the safe default).
+fn announce_builtin_verifier(config: &Config, cwd: &Path) {
+    // S4 trust boundary: a project-local `nerve.config.json` cannot enable the
+    // executing Auto/Command modes without out-of-band operator consent.
+    let consent = project_verifier_consent_from_env();
+    let exec_trusted = config.builtin_verifier_exec_trusted(consent);
+    let mode = &config.orchestration.builtin_verifier.mode;
+    match resolve_builtin_verifier(&config.orchestration, cwd, exec_trusted) {
+        // Operator opted in (auto/command) from a trusted source and a gate
+        // resolved: it WILL execute repo code. Muted info — the consented case.
+        Some(resolved) => {
+            eprintln!(
+                "{}",
+                muted(format!(
+                    "verifier: {} (built-in; no /goal set — override with --goal or orchestration.builtin_verifier)",
+                    resolved.label
+                ))
+            );
+        }
+        // No deterministic gate. Acceptance would rest on the reviewer verdict
+        // alone — the exact gap S4 closes — so warn loudly and show how to opt
+        // in. `off` is the default (Nerve never executes repo code without
+        // consent), so this fires for most fresh runs by design.
+        None => {
+            let hint: String = if !exec_trusted && !matches!(mode, BuiltinVerifierMode::Off) {
+                // Project config asked for an executing verifier; refused.
+                format!(
+                    "this project's nerve.config.json requested it but repo config cannot run code without consent — move the setting to ~/.config/nerve/config.json or set {PROJECT_VERIFIER_CONSENT_ENV}=1, or pass --goal"
+                )
+            } else if matches!(mode, BuiltinVerifierMode::Off) {
+                "set orchestration.builtin_verifier.mode = \"auto\" (runs your project's tests) or \"command\", or pass --goal".to_string()
+            } else {
+                "no test/build markers detected; set orchestration.builtin_verifier.command or pass --goal".to_string()
+            };
+            eprintln!(
+                "{}",
+                warn(format!(
+                    "⚠ no deterministic verifier and no /goal — acceptance rests on the reviewer verdict alone; {hint}"
+                ))
+            );
+        }
+    }
 }
 
 fn adapters_for_config(mock: bool, config: &Config) -> Vec<Box<dyn ModelAdapter>> {

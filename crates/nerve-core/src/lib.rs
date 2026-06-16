@@ -28,6 +28,7 @@ pub mod rpc;
 pub mod session_fork;
 pub mod store;
 pub mod ulimit;
+pub mod verifier;
 pub mod worktree;
 
 pub use budget_audit::{
@@ -48,6 +49,10 @@ pub use session_fork::{
     ForkConfig, ForkError, ForkOptions, SessionForker, SessionIndexEntry, SessionTree,
 };
 pub use ulimit::{UlimitError, apply_ulimit};
+pub use verifier::{
+    BUILTIN_VERIFIER_GOAL_ID, DetectedVerifier, PROJECT_VERIFIER_CONSENT_ENV, ResolvedVerifier,
+    detect_builtin_verifier, project_verifier_consent_from_env, resolve_builtin_verifier,
+};
 pub use worktree::{IsolatedRound, OrphanManifestEntry, WorktreeError, WorktreeIsolator};
 
 #[derive(Debug, Clone)]
@@ -195,8 +200,14 @@ pub async fn run_synaptic_loop(
     task: Task,
     config: &Config,
     adapters: &[Box<dyn ModelAdapter>],
-    options: RunOptions,
+    mut options: RunOptions,
 ) -> Result<RunReport> {
+    // S4: when no explicit `/goal` is set, activate the opted-in built-in
+    // verifier so the deterministic gate produces a real Pass/Fail instead of
+    // Skipped. Done before the strategy branch so consensus and tournament both
+    // inherit it, and before any goal is read downstream.
+    apply_builtin_verifier(&mut options, &task, config);
+
     let selection = config.select_profile(&task)?;
     let lead = find_adapter(adapters, &selection.lead)?;
     let reviewer = find_adapter(adapters, &selection.reviewer)?;
@@ -568,6 +579,49 @@ async fn run_tournament_strategy(
         applied,
         blocked,
     })
+}
+
+/// S4: if no explicit `/goal` is configured, resolve the always-on built-in
+/// verifier and install it as `options.goal` so every downstream gate
+/// (`build_goal_evaluator`, `goal_check_failed`, `goal_satisfied`,
+/// no-progress) treats it as a first-class deterministic check. An explicit
+/// user `/goal` always wins and is left untouched.
+fn apply_builtin_verifier(options: &mut RunOptions, task: &Task, config: &Config) {
+    if options.goal.is_some() {
+        return;
+    }
+    // S4 trust boundary (codex BLOCK): a project-local `nerve.config.json` must
+    // not silently opt the operator into running repo code. Only operator-
+    // controlled config — or explicit out-of-band consent — may enable the
+    // executing Auto/Command modes.
+    let consent = verifier::project_verifier_consent_from_env();
+    let exec_trusted = config.builtin_verifier_exec_trusted(consent);
+    let orchestration = &config.orchestration;
+    match verifier::resolve_builtin_verifier(orchestration, &task.cwd, exec_trusted) {
+        Some(resolved) => {
+            tracing::info!(
+                verifier = %resolved.label,
+                "no /goal set; activating built-in verification gate"
+            );
+            options.goal = Some(resolved.spec);
+        }
+        None if !exec_trusted
+            && !matches!(
+                orchestration.builtin_verifier.mode,
+                nerve_config::BuiltinVerifierMode::Off
+            ) =>
+        {
+            // Project config asked for an executing verifier but the operator
+            // has not consented — refuse and say so loudly (never silent).
+            tracing::warn!(
+                "project nerve.config.json requested an executing built-in verifier; \
+                 ignored without operator consent (set {} or move the setting to the \
+                 user config) — acceptance rests on the reviewer verdict alone",
+                verifier::PROJECT_VERIFIER_CONSENT_ENV
+            );
+        }
+        None => {}
+    }
 }
 
 fn build_goal_evaluator(
@@ -2478,5 +2532,118 @@ mod tests {
         assert!(!report.blocked);
         assert!(report.applied);
         assert!(dir.path().join("nits-output.txt").exists());
+    }
+
+    // ----- S4: always-on built-in verifier gate -----
+
+    use nerve_config::{BuiltinVerifierConfig, BuiltinVerifierMode};
+
+    /// consensus config whose built-in verifier runs `cmd` in `Command` mode
+    /// (fast, deterministic — avoids invoking a real toolchain in tests).
+    fn builtin_verifier_config(cmd: &[&str]) -> Config {
+        let mut config = consensus_config();
+        config.orchestration.builtin_verifier = BuiltinVerifierConfig {
+            mode: BuiltinVerifierMode::Command,
+            command: cmd.iter().map(|s| (*s).to_string()).collect(),
+            timeout_secs: 5,
+        };
+        config
+    }
+
+    #[tokio::test]
+    async fn builtin_verifier_supplies_real_pass_without_explicit_goal() {
+        // The whole point of S4: with NO `/goal` the deterministic check is a
+        // real Pass (never Skipped), so acceptance is verification-gated.
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("add a health endpoint", dir.path());
+        let config = builtin_verifier_config(&["true"]);
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false))
+            .await
+            .unwrap();
+
+        assert_eq!(report.goal_satisfied, Some(true));
+        assert!(!report.rounds.is_empty());
+        for round in &report.rounds {
+            assert_eq!(round.check_result.as_ref(), Some(&CheckResult::Pass));
+        }
+    }
+
+    #[tokio::test]
+    async fn builtin_verifier_fail_blocks_apply_without_explicit_goal() {
+        // A failing built-in verifier must block apply even on reviewer LGTM —
+        // this is the gap S1 noted, now closed: acceptance can't rest on the
+        // reviewer's opinion alone.
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("add a health endpoint", dir.path());
+        let config = builtin_verifier_config(&["false"]);
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(true))
+            .await
+            .unwrap();
+
+        assert_eq!(report.goal_satisfied, Some(false));
+        assert!(report.blocked);
+        assert!(!report.applied);
+        assert!(!dir.path().join("mock-output.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn builtin_verifier_off_preserves_skipped_check() {
+        // Opt-out: with mode=off and no `/goal`, the check stays Skipped and
+        // goal_satisfied is None (legacy behavior, reviewer verdict only).
+        let dir = tempfile::tempdir().unwrap();
+        // A Cargo.toml marker is present, proving Off wins over auto-detection.
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let task = Task::new("add a health endpoint", dir.path());
+        let mut config = consensus_config();
+        config.orchestration.builtin_verifier = BuiltinVerifierConfig {
+            mode: BuiltinVerifierMode::Off,
+            ..Default::default()
+        };
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false))
+            .await
+            .unwrap();
+
+        assert_eq!(report.goal_satisfied, None);
+        for round in &report.rounds {
+            assert_eq!(round.check_result.as_ref(), Some(&CheckResult::Skipped));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_goal_wins_over_builtin_verifier() {
+        // An explicit `/goal` (here, a failing one) must take precedence over
+        // the built-in verifier (here, a passing one) — the user is in control.
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("add a health endpoint", dir.path());
+        let config = builtin_verifier_config(&["true"]);
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let options = RunOptions::new(true).with_goal(goal_spec(&["false"]));
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        // The user's failing goal ran (not the passing built-in) → blocked.
+        assert_eq!(report.goal_satisfied, Some(false));
+        assert!(report.blocked);
+        assert!(!report.applied);
     }
 }

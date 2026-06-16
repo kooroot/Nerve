@@ -52,7 +52,7 @@ Claude Code와 Codex의 changelog를 벤치마킹해 Nerve의 loop/goal 방향�
 ### 🌊 Wave 1 — 검증-게이트 코어 (north star)
 | Step | 항목 | effort | 상태 |
 |---|---|---|---|
-| **S4** | 상시 빌트인 Verifier 게이트 (test/build/lint/patch-applies) | M | ⬜ |
+| **S4** | 상시 빌트인 Verifier 게이트 (test/build/lint/patch-applies) | M | ✅ **DONE** (codex-verified) |
 | S5 | OS 실행 샌드박스 (Seatbelt / bwrap+seccomp+Landlock) — S4 안전 의존성 | M~L | ⬜ |
 | S6 | 스키마 강제 verdict 객체 (free-text LGTM 파싱 폐기) | M | ⬜ |
 | S7 | distance-to-goal 진행 신호 (CheckResult에 score) | M | ⬜ |
@@ -121,3 +121,28 @@ ENOENT/EACCES(바이너리 부재·권한)는 **fail-fast** — 깨진 어댑터
 - **오탐 방지**: `/` 없는 점-토큰(`v1.0.0`, 단독 `config.json`)은 경고 안 함 — 명시적 경로 참조만. git-derived 경로는 best-effort(경고 안 함).
 - 기존 동작 보존: missing 경로도 `paths`에는 그대로 포함(프로필 glob 매칭 불변), 경고만 추가.
 - 검증: `cargo test -p nerve-cli` green (+회귀 4개: missing/existing/오탐/절대경로), `clippy -D warnings` clean.
+
+### S4 — 상시 빌트인 Verifier 게이트 (✅ DONE, 2026-06-16)
+
+`/goal`이 없을 때 acceptance가 reviewer 단독 의견으로 붕괴(S1이 지적한 공백)하던 것을 닫는다.
+빌트인 verifier가 프로젝트의 관용적 테스트/빌드 커맨드(Cargo/Go/npm) 또는 운영자 지정 argv를 `GoalSpec`으로
+합성해, **기존 샌드박스 `GoalEvaluator`**(env_clear 화이트리스트·timeout·output cap·optional ulimit)를 그대로 재사용해
+결정론적 `Pass`/`Fail`을 공급한다. 단일 funnel `run_synaptic_loop`의 맨 위에서 적용 → consensus/tournament 공통 상속.
+
+- `nerve-core/src/verifier.rs`(신규): `detect_builtin_verifier`(Cargo.toml→`cargo test --quiet`, go.mod→`go test ./...`,
+  package.json+test script→`npm test`; **no-test에 exit 0인 생태계만** 자동탐지해 spurious Fail 방지),
+  `resolve_builtin_verifier(orch, cwd, exec_trusted)`, `project_verifier_consent_from_env()`.
+- 설정: `orchestration.builtin_verifier { mode: off|auto|command, command, timeout_secs }`.
+- **codex 이중 검증이 BLOCKING 2건을 연쇄 적발 (cargo-green + 메인 리뷰 통과 후)**:
+  (1) **기본 `auto`가 동의 없이 repo 코드 실행** — `cargo test`는 build script를, `npm test`는 임의 스크립트를 돈다.
+  env/timeout/ulimit 가드는 *자원* 제한이지 FS/네트워크 격리가 아님(OS 샌드박스는 S5, 미구현). → 기본값을 **`off`**로 바꿔
+  명시적 opt-in이 아니면 절대 코드 실행 안 함(anti-pattern #1 준수). gate 없으면 CLI가 큰소리 경고(절대 침묵 아님).
+  (2) **config provenance** — repo-local `./nerve.config.json`이 `auto`/`command`를 켜면 *프로젝트 작성자*가
+  운영자 동의 없이 코드 실행을 opt-in 시킬 수 있음. → `ConfigSource{Project,User,Default}`로 출처를 추적,
+  `load_from`이 스탬프. `Project` 출처의 실행 모드는 **out-of-band 운영자 동의**(`NERVE_TRUST_PROJECT_VERIFIER`, repo가 위조 불가)
+  없이는 거부. User/Default(운영자 제어)만 신뢰. codex R-final: **LGTM, no new regression**.
+- 안전 설계: `check_cmd[0]` PATH-safe(`/`,`\`,`..` 금지, no shell). 명시적 `/goal`은 항상 우선(빌트인 미적용).
+  기존 core 테스트는 `task.cwd`에 마커 없으면 `Skipped` 유지 → 레거시 동작 불변.
+- 검증: `cargo test --workspace` green (config 42, core 128, cli 49+16+4, adapter 40), `clippy -D warnings` clean.
+  S4 회귀: 빌트인 resolve(off/auto/command/untrusted-project), provenance 스탬프/trust, CLI announce 3-way 스모크(off→warn / auto→notice / project-no-consent→refuse+warn / project+consent→run).
+- ⚠️ S5(OS 실행 샌드박스)가 S4의 안전 의존성 — 그때까지 코드 실행은 운영자 명시 opt-in으로만.
