@@ -15,8 +15,9 @@ use nerve_core::{
     DoctorStatus, ForkConfig as CoreForkConfig, GoalIntentConverter, Mayor,
     PROJECT_VERIFIER_CONSENT_ENV, Patrol, PatrolTask, PlanError, PlanRunOptions, RpcBus,
     RunOptions, RunReport, SessionForker, append_budget_audit_entry, doctor_checks,
-    format_chain_broken, project_verifier_consent_from_env, resolve_builtin_verifier,
-    run_plan_mode, run_synaptic_loop, run_synaptic_loop_streaming,
+    format_chain_broken, is_valid_queue_id, parse_plan_steps_from_markdown,
+    plan_step_to_patrol_task, project_verifier_consent_from_env, resolve_builtin_verifier,
+    run_plan_mode, run_synaptic_loop, run_synaptic_loop_streaming, validate_plan_markdown,
 };
 use nerve_tui::{TuiApp, TuiAppOptions, TuiState};
 use nerve_types::{
@@ -36,6 +37,11 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
 const SURFACE_WIDTH: usize = 78;
+
+/// S13 RPC event kind emitted when a plan's steps are enqueued for the loop.
+/// Defined locally because the `nerve_types::rpc_kinds` catalog does not (yet)
+/// own this name — mirrors `mayor_patrol`'s local `RPC_MAYOR_ORPHAN_RECOVERED`.
+const RPC_PLAN_DISPATCHED: &str = "plan.dispatched";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -223,6 +229,11 @@ enum Command {
     /// v1.0 Tier 3j: Patrol worker bound to a slot id.
     #[command(about = "Run a Patrol worker (Tier 3j)")]
     Patrol(PatrolArgs),
+    /// S13: hand a stored plan's steps off to the loop as queued PatrolTasks.
+    #[command(
+        about = "Enqueue a stored plan's steps as Patrol tasks (S13; dry-run, never auto-applies)"
+    )]
+    DispatchPlan(DispatchPlanArgs),
 }
 
 /// Tier 3h `nv fork` arguments. Defaults preserve byte-identical legacy
@@ -329,6 +340,23 @@ struct PlanArgs {
         long,
         help = "Override the workspace directory for plan-mode (defaults to cwd)"
     )]
+    cwd: Option<PathBuf>,
+}
+
+/// S13 `nv dispatch-plan` arguments. Loads a stored [`PlanReport`], parses its
+/// `## Steps` deterministically, and enqueues one [`PatrolTask`] per step on the
+/// Mayor queue. Enqueue only — it never runs a loop and never applies; Patrol
+/// workers execute the queued tasks in dry-run mode (the full verification gate
+/// stays intact; apply remains the per-run S11 consent decision).
+#[derive(Debug, clap::Args)]
+struct DispatchPlanArgs {
+    #[arg(help = "Stored plan id (the plan/task id printed by `nv plan`)")]
+    plan_id: String,
+    #[arg(long, help = "Per-task budget ceiling in micro-USD")]
+    budget_microusd: Option<u64>,
+    #[arg(long, help = "Enqueue at most this many steps (default: all)")]
+    max_steps: Option<usize>,
+    #[arg(long, help = "Override the workspace directory (defaults to cwd)")]
     cwd: Option<PathBuf>,
 }
 
@@ -580,6 +608,7 @@ async fn main() -> Result<()> {
         Some(Command::Patrol(args)) => {
             run_patrol_subcommand(args, matches!(cli.adapter, AdapterMode::Mock)).await
         }
+        Some(Command::DispatchPlan(args)) => run_dispatch_plan_subcommand(args).await,
         None => {
             let Some(prompt) = cli.prompt else {
                 if std::io::stdin().is_terminal() {
@@ -1220,6 +1249,137 @@ fn print_mayor_status(status: &nerve_core::MayorStatus) {
     }
 }
 
+/// S13 shared core for `nv dispatch-plan` and the `dispatch_plan` RPC. Loads the
+/// stored plan, parses its `## Steps` deterministically, converts each step to a
+/// [`PatrolTask`], and enqueues them on the Mayor queue. Returns the enqueued
+/// task ids.
+///
+/// **ENQUEUE ONLY (north star):** it never runs a loop and never applies. Patrol
+/// workers later execute the queued tasks in dry-run mode with the full
+/// verification gate intact; apply remains the per-run S11 consent decision, so
+/// the handoff can never auto-apply. **Fails closed:** a plan with no parseable
+/// steps is rejected rather than silently enqueuing nothing.
+async fn dispatch_plan_steps(
+    cwd: &Path,
+    config: &Config,
+    plan_id: &str,
+    max_steps: Option<usize>,
+    budget_microusd: Option<u64>,
+) -> Result<Vec<String>> {
+    let store = NerveStore::new(cwd);
+    let report = store
+        .load_plan(plan_id)
+        .with_context(|| format!("failed to load plan `{plan_id}` (run `nv plan` first)"))?;
+
+    let mut steps = parse_plan_steps_from_markdown(&report.plan_markdown);
+    if steps.is_empty() {
+        anyhow::bail!(
+            "plan `{plan_id}` has no parseable steps in its `## Steps` section; nothing to dispatch"
+        );
+    }
+    if let Some(limit) = max_steps {
+        // `--max-steps 0` is a degenerate cap: the plan HAS steps but the
+        // operator asked for none. Fail closed with a precise error rather than
+        // silently returning a zero-step "success" (which would read as
+        // "dispatched" while enqueuing nothing). A plan with no parseable steps
+        // is the distinct error reported above.
+        if limit == 0 {
+            anyhow::bail!(
+                "--max-steps must be >= 1; 0 would dispatch nothing for plan `{plan_id}`"
+            );
+        }
+        steps.truncate(limit);
+    }
+
+    // Objective gives each dispatched step the overall goal; affected files scope
+    // its context. If the stored markdown no longer validates, the objective
+    // falls back to empty — the parsed steps are what drive dispatch.
+    let objective = validate_plan_markdown(&report.plan_markdown)
+        .map(|sections| sections.objective)
+        .unwrap_or_default();
+
+    let mp = mayor_config_with_overrides(config, None, None, None, None);
+    let total = config.orchestration.budget_cost_microusd_ceiling;
+    let mayor = Mayor::new(mp, cwd.to_path_buf(), total);
+
+    // Default per-task budget: the configured per-patrol ceiling, else the total
+    // ceiling, else 0 (unbudgeted). An explicit --budget overrides.
+    let default_budget = config
+        .orchestration
+        .mayor_patrol
+        .as_ref()
+        .and_then(|m| m.per_patrol_budget_microusd)
+        .or(total)
+        .unwrap_or(0);
+    let budget = budget_microusd.unwrap_or(default_budget);
+
+    // Build every PatrolTask first, then fail closed BEFORE enqueuing any of
+    // them. The derived task id `<plan_id>-step-NN` must satisfy the SAME
+    // queue-component rule `Mayor::enqueue` enforces (1..=128 bytes of
+    // [A-Za-z0-9_-]). A `plan_id` near the 128-byte store limit, or a plan with
+    // enough steps to widen the `-step-NN` suffix, derives an over-long task id;
+    // catching that here — atomically, before the first enqueue — both gives the
+    // operator an actionable error and avoids a partial dispatch that would have
+    // left earlier steps queued before Mayor rejected a later one with an opaque
+    // `InvalidIdentifier`. `plan_id`'s charset is already constrained by
+    // `load_plan`'s `validate_store_id`, so only length can overflow here.
+    let tasks: Vec<_> = steps
+        .iter()
+        .map(|step| {
+            plan_step_to_patrol_task(plan_id, &objective, step, &report.estimated_files, budget)
+        })
+        .collect();
+    for task in &tasks {
+        if !is_valid_queue_id(&task.task_id) {
+            anyhow::bail!(
+                "plan `{plan_id}` ({} bytes) derives queue task id `{}` ({} bytes), which exceeds \
+                 the 128-byte queue-component limit; shorten the plan id before dispatching",
+                plan_id.len(),
+                task.task_id,
+                task.task_id.len(),
+            );
+        }
+    }
+
+    let mut enqueued = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let task_id = task.task_id.clone();
+        mayor
+            .enqueue(task)
+            .await
+            .with_context(|| format!("failed to enqueue plan step `{task_id}`"))?;
+        enqueued.push(task_id);
+    }
+    Ok(enqueued)
+}
+
+/// S13 `nv dispatch-plan` — enqueue a stored plan's steps for the loop.
+async fn run_dispatch_plan_subcommand(args: DispatchPlanArgs) -> Result<()> {
+    let cwd = match args.cwd {
+        Some(path) => path,
+        None => env::current_dir().context("failed to read current directory")?,
+    };
+    let config = Config::load_from(&cwd)?;
+    let enqueued = dispatch_plan_steps(
+        &cwd,
+        &config,
+        &args.plan_id,
+        args.max_steps,
+        args.budget_microusd,
+    )
+    .await?;
+    println!(
+        "dispatched plan `{}`: {} step(s) enqueued (dry-run; patrols run them, apply stays opt-in)",
+        args.plan_id,
+        enqueued.len()
+    );
+    for id in &enqueued {
+        println!("  queued: {id}");
+    }
+    println!("run `nv patrol --id <slot>` to execute the queued steps.");
+    Ok(())
+}
+
 async fn run_patrol_subcommand(args: PatrolArgs, mock: bool) -> Result<()> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let config = Config::load_from(&cwd)?;
@@ -1265,13 +1425,25 @@ async fn run_patrol_subcommand(args: PatrolArgs, mock: bool) -> Result<()> {
             .with_context(|| format!("rpc bus init failed for patrol `{}`", args.id))?,
     );
 
+    // S13: real dispatch — each claimed task runs the synaptic loop in DRY-RUN
+    // (the full verification gate stays intact; the loop never applies). Own the
+    // config + adapters in `Arc`s so the `'static` `DispatchFuture` can borrow
+    // them; clone the handles per task (cheap).
+    let adapters = Arc::new(adapters_for_config(mock, &config));
+    let config = Arc::new(config);
+    let patrol_id = args.id.clone();
+
     if args.once {
-        // One-shot dispatch: claim a task, dispatch it through the in-process
-        // synaptic loop, and write the result.
+        // One-shot dispatch: claim a task, run it through the in-process synaptic
+        // loop, and write the result.
         let outcome = patrol
             .run_one(|task: PatrolTask| {
-                Box::pin(
-                    async move { Ok(nerve_core::PatrolResult::success(&task.task_id, "stub", 0)) },
+                patrol_dispatch(
+                    task,
+                    patrol_id.clone(),
+                    cwd.clone(),
+                    Arc::clone(&config),
+                    Arc::clone(&adapters),
                 )
             })
             .await
@@ -1283,13 +1455,16 @@ async fn run_patrol_subcommand(args: PatrolArgs, mock: bool) -> Result<()> {
         return Ok(());
     }
 
-    let _ = mock; // adapter mode currently selected via config, not patrol arg
     let (_tx, rx) = watch::channel(false);
     patrol
         .run_loop(
             |task: PatrolTask| {
-                Box::pin(
-                    async move { Ok(nerve_core::PatrolResult::success(&task.task_id, "stub", 0)) },
+                patrol_dispatch(
+                    task,
+                    patrol_id.clone(),
+                    cwd.clone(),
+                    Arc::clone(&config),
+                    Arc::clone(&adapters),
                 )
             },
             rx,
@@ -1297,6 +1472,62 @@ async fn run_patrol_subcommand(args: PatrolArgs, mock: bool) -> Result<()> {
         .await
         .context("patrol run_loop failed")?;
     Ok(())
+}
+
+/// S13: map a finalized [`RunReport`] to a [`PatrolResult`]. A `blocked` run
+/// (the deterministic gate rejected the patch) becomes a Failed result; any
+/// other terminal state is Success. `patch_sha` is the UNAPPLIED patch id —
+/// dispatch runs dry-run, so `report.applied` is always false here.
+fn patrol_result_from_report(
+    task_id: &str,
+    patrol_id: &str,
+    report: &RunReport,
+) -> nerve_core::PatrolResult {
+    let cost = report.usage.estimated_cost_microusd.unwrap_or(0);
+    let mut result = if report.blocked {
+        nerve_core::PatrolResult::failed(
+            task_id,
+            patrol_id,
+            cost,
+            format!(
+                "run blocked by verification gate (goal_satisfied={:?})",
+                report.goal_satisfied
+            ),
+        )
+    } else {
+        nerve_core::PatrolResult::success(task_id, patrol_id, cost)
+    };
+    result.patch_sha = report.final_patch.as_ref().map(|patch| patch.id.clone());
+    result
+}
+
+/// S13: the real Patrol dispatch — run one claimed task through the synaptic
+/// loop in DRY-RUN (`RunOptions::new(false)`). The deterministic verification
+/// gate (S4/S6/S7/S10/S11/S12) stays intact and the loop NEVER applies: a
+/// dispatched plan step can only produce a reviewed, unapplied patch. A loop
+/// error is recorded as a failed result (the task moves to `failed/`) rather
+/// than aborting the whole patrol.
+fn patrol_dispatch(
+    task: PatrolTask,
+    patrol_id: String,
+    cwd: PathBuf,
+    config: Arc<Config>,
+    adapters: Arc<Vec<Box<dyn ModelAdapter>>>,
+) -> nerve_core::DispatchFuture {
+    Box::pin(async move {
+        let loop_task = Task::new(task.prompt.clone(), &cwd);
+        match run_synaptic_loop(loop_task, &config, adapters.as_slice(), RunOptions::new(false))
+            .await
+        {
+            Ok(report) => Ok(patrol_result_from_report(&task.task_id, &patrol_id, &report)),
+            Err(err) => Ok(nerve_core::PatrolResult::failed(
+                &task.task_id,
+                &patrol_id,
+                0,
+                err.to_string(),
+            )),
+        }
+    })
 }
 
 fn patrol_rpc_token_path(session_meta: &Path, id: &str) -> PathBuf {
@@ -1879,12 +2110,25 @@ async fn run_plan_subcommand(args: PlanArgs, mock: bool, json: bool) -> Result<(
     .await
     .map_err(plan_error_to_anyhow)?;
 
+    // S13: persist the plan so `nv dispatch-plan <id>` can hand its steps to the
+    // loop later. Best-effort — a persistence failure must not fail plan output.
+    persist_plan_for_dispatch(&task_cwd, &report);
+
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
     print_plan_report(&report);
     Ok(())
+}
+
+/// S13: best-effort persist a [`PlanReport`] under `.nerve/plans/` so it can be
+/// dispatched later. A save failure is surfaced loudly on stderr but never fails
+/// the caller — plan output is purely advisory and must always print.
+fn persist_plan_for_dispatch(cwd: &Path, report: &PlanReport) {
+    if let Err(err) = NerveStore::new(cwd).save_plan(report) {
+        eprintln!("⚠ failed to persist plan `{}` for dispatch: {err}", report.task_id);
+    }
 }
 
 fn plan_error_to_anyhow(err: PlanError) -> anyhow::Error {
@@ -1977,6 +2221,7 @@ async fn run_interactive_plan(prompt: String, state: &InteractiveState) -> Resul
     )
     .await
     .map_err(plan_error_to_anyhow)?;
+    persist_plan_for_dispatch(&cwd, &report);
     print_plan_report(&report);
     Ok(())
 }
@@ -4906,6 +5151,7 @@ async fn handle_rpc_command(
             )
             .await
             .map_err(plan_error_to_anyhow)?;
+            persist_plan_for_dispatch(&cwd, &report);
             let envelope = rpc_envelope(
                 rpc_kinds::PLAN_PROPOSED,
                 serde_json::json!({
@@ -4918,6 +5164,32 @@ async fn handle_rpc_command(
             );
             emit_envelope_line(&envelope);
             let _ = bus.emit(rpc_kinds::PLAN_PROPOSED, envelope.payload.clone());
+        }
+        "dispatch_plan" => {
+            // S13 RPC entry point for `nv dispatch-plan`. Loads a stored plan,
+            // converts its steps to PatrolTasks, and enqueues them. Enqueue only
+            // — it never runs a loop and never applies.
+            let plan_id = value
+                .get("plan_id")
+                .and_then(serde_json::Value::as_str)
+                .context("missing string field `plan_id`")?;
+            let max_steps = value
+                .get("max_steps")
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as usize);
+            let budget_microusd = value
+                .get("budget_microusd")
+                .and_then(serde_json::Value::as_u64);
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            let config = Config::load_from(&cwd)?;
+            let enqueued =
+                dispatch_plan_steps(&cwd, &config, plan_id, max_steps, budget_microusd).await?;
+            let envelope = rpc_envelope(
+                RPC_PLAN_DISPATCHED,
+                serde_json::json!({ "plan_id": plan_id, "enqueued": enqueued }),
+            );
+            emit_envelope_line(&envelope);
+            let _ = bus.emit(RPC_PLAN_DISPATCHED, envelope.payload.clone());
         }
         "get_state" | "history" => {
             let cwd = env::current_dir().context("failed to read current directory")?;
@@ -6555,6 +6827,183 @@ mod tests {
             }
             other => panic!("expected Patrol subcommand, got {other:?}"),
         }
+    }
+
+    // ----- S13: plan → loop dispatch -----
+
+    #[test]
+    fn parse_dispatch_plan_subcommand_flags() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "nv",
+            "dispatch-plan",
+            "plan-abc",
+            "--max-steps",
+            "2",
+            "--budget-microusd",
+            "5000",
+        ])
+        .expect("clap must accept `nv dispatch-plan ...`");
+        match cli.command {
+            Some(Command::DispatchPlan(args)) => {
+                assert_eq!(args.plan_id, "plan-abc");
+                assert_eq!(args.max_steps, Some(2));
+                assert_eq!(args.budget_microusd, Some(5000));
+            }
+            other => panic!("expected DispatchPlan subcommand, got {other:?}"),
+        }
+    }
+
+    fn save_sample_plan(dir: &Path, plan_id: &str, steps_md: &str) {
+        let report: PlanReport = serde_json::from_value(serde_json::json!({
+            "task_id": plan_id,
+            "plan_markdown": format!("## Objective\nbuild it\n\n## Affected files\n- a.rs\n\n## Steps\n{steps_md}"),
+            "reviewer_feedback": "",
+            "estimated_files": ["a.rs"],
+            "finished_at": "2026-06-17T00:00:00Z",
+        }))
+        .expect("valid PlanReport json");
+        NerveStore::new(dir).save_plan(&report).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_steps_enqueues_each_step() {
+        let dir = tempfile::tempdir().unwrap();
+        save_sample_plan(dir.path(), "plan-xyz", "1. one\n2. two\n3. three\n");
+        let config = Config::load_from(dir.path()).unwrap();
+
+        let enqueued = dispatch_plan_steps(dir.path(), &config, "plan-xyz", None, Some(1000))
+            .await
+            .unwrap();
+        assert_eq!(
+            enqueued,
+            vec![
+                "plan-xyz-step-01".to_string(),
+                "plan-xyz-step-02".to_string(),
+                "plan-xyz-step-03".to_string(),
+            ]
+        );
+        // Each queued task exists on disk under .nerve/queue/pending/.
+        let pending = dir.path().join(".nerve").join("queue").join("pending");
+        for id in &enqueued {
+            assert!(pending.join(format!("{id}.json")).exists(), "missing {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_steps_respects_max_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        save_sample_plan(dir.path(), "plan-cap", "1. one\n2. two\n3. three\n");
+        let config = Config::load_from(dir.path()).unwrap();
+
+        let enqueued = dispatch_plan_steps(dir.path(), &config, "plan-cap", Some(2), Some(1000))
+            .await
+            .unwrap();
+        assert_eq!(enqueued.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_steps_empty_steps_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        // A `## Steps` section with prose but no list items → no parseable steps.
+        save_sample_plan(dir.path(), "plan-empty", "just prose, no list\n");
+        let config = Config::load_from(dir.path()).unwrap();
+
+        let err = dispatch_plan_steps(dir.path(), &config, "plan-empty", None, Some(1000))
+            .await
+            .expect_err("a stepless plan must be refused, not silently no-op");
+        assert!(err.to_string().contains("no parseable steps"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_max_steps_zero_fails_closed() {
+        // A plan WITH steps but `--max-steps 0` must not silently report a
+        // zero-step success — it fails closed with a precise, distinct error.
+        let dir = tempfile::tempdir().unwrap();
+        save_sample_plan(dir.path(), "plan-zero", "1. one\n2. two\n");
+        let config = Config::load_from(dir.path()).unwrap();
+
+        let err = dispatch_plan_steps(dir.path(), &config, "plan-zero", Some(0), Some(1000))
+            .await
+            .expect_err("--max-steps 0 must be refused, not a silent no-op success");
+        assert!(err.to_string().contains("--max-steps must be >= 1"));
+
+        // Nothing enqueued.
+        let pending = dir.path().join(".nerve").join("queue").join("pending");
+        let queued = std::fs::read_dir(&pending).map(|rd| rd.count()).unwrap_or(0);
+        assert_eq!(queued, 0, "a refused dispatch must enqueue nothing");
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_missing_plan_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load_from(dir.path()).unwrap();
+        assert!(
+            dispatch_plan_steps(dir.path(), &config, "nope", None, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_rejects_overlong_plan_id_fails_closed() {
+        // A 121-byte plan id is a VALID store key (`validate_store_id` allows
+        // 1..=128) so the plan saves and loads fine — but the derived queue
+        // task id `<plan_id>-step-01` is 129 bytes, over Mayor's 128-byte
+        // component limit. Dispatch must refuse up front with an actionable
+        // error and enqueue NOTHING (no partial dispatch). Regression for the
+        // S13 review's correctness finding.
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = "p".repeat(121);
+        save_sample_plan(dir.path(), &plan_id, "1. one\n2. two\n");
+        let config = Config::load_from(dir.path()).unwrap();
+
+        let err = dispatch_plan_steps(dir.path(), &config, &plan_id, None, Some(1000))
+            .await
+            .expect_err("an overlong plan id must be refused, not partially dispatched");
+        let msg = err.to_string();
+        assert!(msg.contains("exceeds"), "unhelpful error: {msg}");
+        assert!(msg.contains("128-byte"), "unhelpful error: {msg}");
+
+        // Fail-closed: not a single step may have been enqueued.
+        let pending = dir.path().join(".nerve").join("queue").join("pending");
+        let queued = std::fs::read_dir(&pending).map(|rd| rd.count()).unwrap_or(0);
+        assert_eq!(queued, 0, "dispatch must enqueue nothing when it fails closed");
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_accepts_max_length_dispatchable_plan_id() {
+        // Boundary: a 120-byte plan id derives `<120>-step-NN` = 128 bytes for
+        // any 2-digit step index — exactly at the limit, so it dispatches.
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = "p".repeat(120);
+        save_sample_plan(dir.path(), &plan_id, "1. one\n2. two\n");
+        let config = Config::load_from(dir.path()).unwrap();
+
+        let enqueued = dispatch_plan_steps(dir.path(), &config, &plan_id, None, Some(1000))
+            .await
+            .expect("a 120-byte plan id stays within the 128-byte queue-id limit");
+        assert_eq!(enqueued.len(), 2);
+        for id in &enqueued {
+            assert_eq!(id.len(), 128, "boundary task id `{id}` must be exactly 128 bytes");
+        }
+    }
+
+    #[test]
+    fn patrol_result_maps_blocked_to_failed_else_success() {
+        // Accepted (not blocked) run → Success, cost from usage, no patch.
+        let mut ok = report_with_classification(None);
+        ok.usage.estimated_cost_microusd = Some(4242);
+        let res = patrol_result_from_report("t1", "p1", &ok);
+        assert_eq!(res.verdict, nerve_core::PatrolVerdict::Success);
+        assert_eq!(res.cost_microusd, 4242);
+        assert_eq!(res.patch_sha, None);
+
+        // Blocked run (deterministic gate rejected) → Failed.
+        let mut blocked = report_with_classification(None);
+        blocked.blocked = true;
+        let res = patrol_result_from_report("t1", "p1", &blocked);
+        assert_eq!(res.verdict, nerve_core::PatrolVerdict::Failed);
     }
 
     /// Doctor must surface a `Fail` entry when `sessions/index.json` is

@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use nerve_config::ProfileSelection;
 use nerve_patch::{ApplyReport, NvPatch};
-use nerve_types::{RoundRecord, Task, Verdict};
+use nerve_types::{PlanReport, RoundRecord, Task, Verdict};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -230,6 +230,56 @@ impl NerveStore {
         read_json(&path).map(Some)
     }
 
+    /// S13: persist a [`PlanReport`] under `.nerve/plans/<task_id>.json` so a
+    /// later `nv dispatch-plan <id>` can retrieve it and hand its steps off to
+    /// the loop. Atomic write; the directory is created on demand. Returns the
+    /// path written. Purely additive — plan output is unchanged for callers
+    /// that never dispatch.
+    pub fn save_plan(&self, report: &PlanReport) -> Result<PathBuf> {
+        validate_store_id("plan id", &report.task_id)?;
+        fs::create_dir_all(self.plans_dir())
+            .with_context(|| format!("failed to create `{}`", self.plans_dir().display()))?;
+        let path = self.plan_path(&report.task_id);
+        write_json(&path, report)?;
+        Ok(path)
+    }
+
+    /// S13: load a stored [`PlanReport`] by id. `plan_id` is operator-supplied
+    /// (`nv dispatch-plan <plan-id>`), unlike the UUID `Task::id`s elsewhere, so
+    /// it is validated as a safe file component first — a traversal id must
+    /// never read JSON outside `.nerve/plans/`. Missing plan is an error.
+    pub fn load_plan(&self, plan_id: &str) -> Result<PlanReport> {
+        validate_store_id("plan id", plan_id)?;
+        let path = self.plan_path(plan_id);
+        if !path.exists() {
+            anyhow::bail!("no stored plan `{plan_id}` at `{}`", path.display());
+        }
+        read_json(&path)
+    }
+
+    /// S13: enumerate stored plan ids (sorted). Empty when no plan has been
+    /// saved yet.
+    pub fn list_plans(&self) -> Result<Vec<String>> {
+        let dir = self.plans_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::new();
+        for entry in
+            fs::read_dir(&dir).with_context(|| format!("failed to read `{}`", dir.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+                ids.push(stem.to_string());
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
         let sessions_dir = self.sessions_dir();
         if !sessions_dir.exists() {
@@ -407,6 +457,11 @@ impl NerveStore {
         self.root_dir().join("approvals")
     }
 
+    /// S13: persisted [`PlanReport`]s, the source for `nv dispatch-plan`.
+    fn plans_dir(&self) -> PathBuf {
+        self.root_dir().join("plans")
+    }
+
     fn session_path(&self, id: &str) -> PathBuf {
         self.sessions_dir().join(format!("{id}.json"))
     }
@@ -421,6 +476,10 @@ impl NerveStore {
 
     fn session_meta_path(&self, id: &str) -> PathBuf {
         self.session_meta_dir().join(format!("{id}.json"))
+    }
+
+    fn plan_path(&self, id: &str) -> PathBuf {
+        self.plans_dir().join(format!("{id}.json"))
     }
 
     fn patch_path(&self, id: &str) -> PathBuf {
@@ -512,6 +571,23 @@ impl Drop for StoreLock {
     }
 }
 
+/// S13: reject an operator-supplied id that could escape the store directory.
+/// Used for `plan_id` (from `nv dispatch-plan <plan-id>`), which—unlike the
+/// UUID `Task::id`s the rest of the store keys on—is untrusted input. Mirrors
+/// the strict allowlist contract of `mayor_patrol::validate_file_component`
+/// (1..=128 chars of `[A-Za-z0-9_-]`), so `/`, `\`, `..`, and control chars all
+/// fail closed. UUID task ids (hex + hyphen) pass.
+fn validate_store_id(kind: &str, id: &str) -> Result<()> {
+    let ok = (1..=128).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !ok {
+        anyhow::bail!("invalid {kind} `{id}`: must be 1..=128 chars of [A-Za-z0-9_-]");
+    }
+    Ok(())
+}
+
 fn read_json<T>(path: &Path) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -601,6 +677,60 @@ mod tests {
             rounds: (0..rounds).map(|i| sample_round(i as u8)).collect(),
             updated_at: Utc::now().to_rfc3339(),
         }
+    }
+
+    fn sample_plan_report(task_id: &str) -> PlanReport {
+        PlanReport {
+            task_id: task_id.to_string(),
+            plan_markdown: "## Objective\nx\n\n## Steps\n1. a\n2. b\n".to_string(),
+            reviewer_feedback: String::new(),
+            estimated_loc: Some(10),
+            estimated_files: vec![PathBuf::from("a.rs")],
+            cost: None,
+            finished_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn plan_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        let report = sample_plan_report("plan-001");
+
+        let path = store.save_plan(&report).unwrap();
+        assert!(path.ends_with("plans/plan-001.json"));
+        let loaded = store.load_plan("plan-001").unwrap();
+        assert_eq!(loaded, report);
+        assert_eq!(store.list_plans().unwrap(), vec!["plan-001".to_string()]);
+    }
+
+    #[test]
+    fn load_plan_missing_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        assert!(store.load_plan("nope").is_err());
+        // No plans dir yet → empty list, not an error.
+        assert!(store.list_plans().unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_plan_rejects_traversal_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        for bad in ["../escape", "a/b", "..", "with space", "tab\tid", ""] {
+            assert!(
+                store.load_plan(bad).is_err(),
+                "traversal/invalid id must be rejected: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_plan_rejects_traversal_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        let report = sample_plan_report("../escape");
+        assert!(store.save_plan(&report).is_err());
     }
 
     #[test]

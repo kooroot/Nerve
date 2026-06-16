@@ -42,9 +42,11 @@ pub use goal::{GoalError, GoalEvaluator};
 pub use goal_intent::{GOAL_INTENT_SYSTEM_PROMPT, GoalIntentConverter, GoalIntentError};
 pub use mayor_patrol::{
     DispatchFuture, Mayor, MayorError, MayorStatus, Patrol, PatrolResult, PatrolTask, PatrolVerdict,
+    is_valid_queue_id,
 };
 pub use plan::{
     PLAN_ONLY_SYSTEM_PROMPT, PLAN_REVIEW_SYSTEM_PROMPT, PlanError, PlanRunOptions, PlanSections,
+    PlanStep, parse_plan_steps, parse_plan_steps_from_markdown, plan_step_to_patrol_task,
     run_plan_mode, validate_plan_markdown,
 };
 pub use rpc::{EmitError, EmitOutcome, RpcBus, RpcError};

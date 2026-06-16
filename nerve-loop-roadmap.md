@@ -69,7 +69,7 @@ Claude Code와 Codex의 changelog를 벤치마킹해 Nerve의 loop/goal 방향�
 ### 🌊 Wave 3 — plan/goal 핸드오프 + fleet
 | Step | 항목 | effort | 상태 |
 |---|---|---|---|
-| S13 | 실행형 plan → loop 핸드오프 (Steps → Task/PatrolTask) | L | ⬜ |
+| S13 | 실행형 plan → loop 핸드오프 (Steps → Task/PatrolTask) | L | ✅ |
 | S14 | Agent-Teams 조율 원장 (공유 task 원장 + mailbox + 파일락 claim) | L | ⬜ |
 | S15 | Conductor 라이브 상태 + 일괄 cancel (S9 의존) | L | ⬜ |
 
@@ -580,3 +580,50 @@ north star를 지키도록 **거부-방향/단조(monotone)** 로만: 분류기�
 - 검증: `cargo build --workspace` clean, `cargo test --workspace` green (config 53, core 185, cli 53, adapter 92,
   types 25, tui 13), `cargo clippy --workspace --all-targets -- -D warnings` exit 0. 불변식 `allow<=want` 전수
   테스트로 확인, Off byte-identical 확인, e2e에서 enforce가 수락(`!blocked`)을 유지한 채 apply만 veto함 확인.
+
+### S13 — 실행형 plan → loop 핸드오프 (Steps → Task/PatrolTask) (✅ DONE, 2026-06-17)
+
+구조적 공백 #3 해소: `PlanReport`는 읽기전용 advisory markdown이고 `## Steps`는 자유 텍스트라 루프로 가는
+실행 핸드오프가 없었다. S13은 plan을 **실행형**으로 만든다 — 스텝을 파싱 → `PatrolTask`로 변환 → Mayor 큐에
+enqueue → Patrol 워커가 각각을 **진짜 synaptic 루프**로 돌린다(결정론적 검증 게이트 그대로, apply는 기본 OFF).
+
+**North star(반드시 유지)**: (N1) plan은 절대 수락 게이트가 아님 — 디스패치된 스텝은 full 루프(S4/S6/S7/S10/
+S11/S12 게이트 활성)로 돌고, plan(LLM markdown)은 task **프롬프트**만 시드한다. (N2) apply는 요란한 opt-in,
+디스패치 기본은 dry-run(`RunOptions::new(false)`); `PatrolTask`에 apply 비트 없음 — apply는 per-run S11 consent
+결정으로 남는다. (N3) 재귀 중첩 에이전트 없음 — Mayor/Patrol **큐**(process-per-loop, max_depth=1)로 핸드오프.
+(N4) cwd는 호출자 고정 — `mayor_patrol::PatrolTask`에 cwd 필드가 없어 plan 텍스트가 실행 디렉토리를 못 바꾼다.
+(N5) 변환은 **결정론적**(LLM 없음) — Nerve가 `PLAN_ONLY_SYSTEM_PROMPT`로 만든 canonical markdown의 `## Steps`를
+순수 파서로 분해(S12의 결정론 선택과 일관). (N6) additive/inert — `save_plan` best-effort, plan 출력 불변, plan은
+`check_cmd`를 못 정함(루프가 config에서 게이트 해석).
+
+- `nerve-core/plan.rs`: `PlanStep { index, title, detail }`; 순수 `parse_plan_steps`(ordered `1.`/`2)` + unordered
+  `-`/`*`/`+` 마커 인식, base-indent 추적으로 **중첩 sub-bullet은 새 스텝이 아니라 continuation**, 마커 없으면 빈
+  vec); `parse_plan_steps_from_markdown`(extract_section "Steps" → parse); `plan_step_to_patrol_task`(task_id=
+  `<plan>-step-NN`, 프롬프트=objective+step detail+affected files, **check_cmd/cwd 미인코딩**).
+- `nerve-core/store.rs`: `NerveStore.save_plan/load_plan/list_plans` (`.nerve/plans/<id>.json`, atomic).
+  **`validate_store_id`(load-bearing)**: 운영자 입력 `plan_id`를 `[A-Za-z0-9_-]` allowlist(1..=128)로 강제 →
+  `..`/`/`/`\`/control 모두 fail-closed(mayor `validate_file_component` 계약과 일치). UUID task id는 통과.
+- `nerve-core/mayor_patrol.rs`: 큐 컴포넌트 규칙(1..=128 of `[A-Za-z0-9_-]`)을 공개 술어 `is_valid_queue_id`로
+  추출 — `validate_file_component`/`Mayor::enqueue`가 이를 경유하므로 **dispatch 사전검사와 enqueue 검사가
+  절대 어긋나지 않는다**(단일 술어).
+- `nerve-cli/main.rs`: `nv dispatch-plan <id> [--budget --max-steps --cwd]` + RPC `dispatch_plan` → 공유 코어
+  `dispatch_plan_steps`(load → parse → `Mayor::enqueue` per step; **빈 스텝이면 fail-closed로 거부**; enqueue
+  ONLY, 루프/apply 안 함) → `plan.dispatched` 이벤트. **(리뷰 정합성 수정)** dispatch는 enqueue 전에 모든
+  `PatrolTask`를 먼저 만들고 파생 task id `<plan_id>-step-NN`을 `is_valid_queue_id`로 **원자적으로 사전검증** —
+  128바이트 store 한계 근처의 `plan_id`(또는 스텝 수가 많아 접미사가 늘어난 경우)는 128바이트를 넘는 task id를
+  파생하므로, **부분 dispatch 없이** 명확한 에러로 fail-closed(이전엔 일부 스텝 enqueue 후 Mayor의 모호한
+  InvalidIdentifier로 중단됐을 수 있음 — accepted-but-undispatchable plan id). **(리뷰 nit)** `--max-steps 0`은
+  이제 zero-step "success"를 조용히 반환하지 않고 명확한 에러로 fail-closed. 3개 plan 경로(subcommand/RPC/interactive)는 이제 plan을
+  best-effort 영속화(`persist_plan_for_dispatch`). **스텁 Patrol 디스패치 클로저를 실제 클로저로 교체**:
+  `patrol_dispatch`(Arc<Config>+Arc<adapters>, `run_synaptic_loop` **dry-run**, 루프 에러는 `failed/`로 기록·
+  patrol 중단 안 함), `patrol_result_from_report`(blocked→Failed·else Success, cost=usage, patch_sha=미적용 패치 id).
+- 검증: `cargo build --workspace` clean, `cargo test --workspace` green (core 185→200 [+15: 파서 ordered/paren/
+  unordered/dense-index/continuation/prose-ignore/empty/from-markdown + converter 결정론·safe-id + store
+  round-trip/missing/traversal-reject×2 + is_valid_queue_id 경계·enqueue-계약 교차검증], cli 53→61 [+8:
+  dispatch-plan flag-parse + enqueue-each/max-steps/empty-fail-closed/max-steps-0-fail-closed/missing-plan +
+  overlong-plan-id fail-closed(121바이트 회귀)·max-length-dispatchable(120바이트 경계) + patrol_result
+  blocked→Failed], adapter 92, config 53, patch 20, types 25, tui 13),
+  `cargo clippy --workspace --all-targets -- -D warnings` exit 0.
+- DOUBLE 리뷰: codex r1(d62c419) = REQUEST_CHANGES(정합성: 121..=128바이트 plan id가 무효 task id 파생→dispatch
+  실패) → 파생 task id 사전검증으로 해결. codex r1(재검증 HEAD) = ACCEPT_WITH_NITS(nit: `--max-steps 0` 무음
+  no-op) → fail-closed로 수정. 동일 clean HEAD에서 연속 2회 no-blocking 리뷰로 LAND.

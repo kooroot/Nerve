@@ -777,13 +777,24 @@ fn list_heartbeats(dir: &Path) -> Result<Vec<String>, MayorError> {
     Ok(entries)
 }
 
-fn validate_file_component(kind: &'static str, value: &str) -> Result<(), MayorError> {
-    let valid = !value.is_empty()
-        && value.len() <= 128
-        && value
+/// True iff `id` is a valid on-disk queue component: 1..=128 bytes of
+/// `[A-Za-z0-9_-]`. This is the SAME predicate [`Mayor::enqueue`] enforces on
+/// every `task_id` (via [`validate_file_component`]); it is exposed so callers
+/// that DERIVE a task id (e.g. the plan dispatcher's `<plan_id>-step-NN`) can
+/// fail closed with a precise, up-front error instead of partially dispatching
+/// and surfacing Mayor's opaque `InvalidIdentifier` mid-loop. Routing both the
+/// pre-check and the enqueue check through one predicate guarantees they can
+/// never disagree.
+pub fn is_valid_queue_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if valid {
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn validate_file_component(kind: &'static str, value: &str) -> Result<(), MayorError> {
+    if is_valid_queue_id(value) {
         Ok(())
     } else {
         Err(MayorError::InvalidIdentifier(kind))
@@ -942,6 +953,25 @@ mod tests {
                 .join(".nerve/queue/pending/../escape.json")
                 .exists()
         );
+    }
+
+    #[test]
+    fn is_valid_queue_id_matches_enqueue_contract() {
+        // The public predicate must agree byte-for-byte with what
+        // `Mayor::enqueue`'s `validate_file_component` accepts: 1..=128 bytes
+        // of [A-Za-z0-9_-]. Dispatch pre-checks derived task ids against this.
+        assert!(is_valid_queue_id("plan-xyz-step-01"));
+        assert!(is_valid_queue_id(&"p".repeat(128)), "128 bytes is the limit");
+        assert!(!is_valid_queue_id(&"p".repeat(129)), "129 bytes overflows");
+        assert!(!is_valid_queue_id(""), "empty is rejected");
+        assert!(!is_valid_queue_id("../escape"));
+        assert!(!is_valid_queue_id("with space"));
+        assert!(!is_valid_queue_id("nested/id"));
+        // Cross-check: anything the predicate rejects, enqueue must also reject.
+        assert!(matches!(
+            validate_file_component("task_id", &"p".repeat(129)),
+            Err(MayorError::InvalidIdentifier("task_id"))
+        ));
     }
 
     #[tokio::test]
