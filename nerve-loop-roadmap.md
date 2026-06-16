@@ -63,7 +63,7 @@ Claude Code와 Codex의 changelog를 벤치마킹해 Nerve의 loop/goal 방향�
 | S8 | 라운드 증분 체크포인트 (record_round → .nerve store) | M | ✅ |
 | **S9** | 논블로킹 라운드-이음새 데몬 v2 + 라이브 JSONL 스트림 | L | ✅ |
 | S10 | crossfire advisory → redirect/단락 | M | ✅ |
-| S11 | 승인-에스컬레이션 지속성 (sticky per run) | S | ⬜ |
+| S11 | 승인-에스컬레이션 지속성 (sticky per run) | S | ✅ |
 | S12 | auto-mode 분류기 게이트 (implement↔apply) | M | ⬜ |
 
 ### 🌊 Wave 3 — plan/goal 핸드오프 + fleet
@@ -471,3 +471,64 @@ goal_satisfied로는 **절대** 못 민다. "looks good" crossfire는 아무것�
   안 건드려, `raw_text`만 읽는 shipped lead refine 프롬프트(nerve-adapter `refine`)에 redirect가 **무효**였음
   (게이트-방향 버그는 아님). 수정: merge가 crossfire 힌트를 `raw_text`에도 렌더(라벨 + 표준 verdict 토큰).
   redirect 테스트는 `captured[0].raw_text.contains(MARKER)`, off 테스트는 `raw_text`에 마커 부재를 추가 검증.
+
+### S11 — 승인-에스컬레이션 지속성 (sticky per run) (✅ DONE, 2026-06-17)
+
+S9의 nonblocking 데몬 위에서, 운영자가 **진행 중인 특정 run**을 라운드 이음새에서 apply-consent로
+**중간 승급**할 수 있게 한다. 승급은 그 run의 단일 apply 지점에서 존중되고 run의 전 생애(모든 라운드/
+이음새)에 **sticky**하며, **per-run-id**로 격리된다(run B로 절대 새지 않음). 기본값은 불변(dry-run).
+
+**설계를 지배한 보안 발견(load-bearing)**: 순진한 "apply 시점에 `.nerve/approvals/{run-id}.json`을
+읽는다" 설계는 **안전하지 않다**. lead는 `task.cwd`에서 `.nerve/`에 쓰기 가능한 임의의 CLI 서브프로세스다.
+S8 체크포인트(`.nerve/checkpoints/{task.id}.json`)에서 자기 run-id를 알아내 생성 중 `apply_consent:true`
+파일을 **스스로 써서** 운영자 동의를 위조하고 dry-run→apply로 self-escalate 할 수 있다. 즉 "샌드박스
+안 된 lead가 끄적일 수 있다"는 기존 사실을 **동의-위조 / 게이트-승급 벡터**로 바꾼다. North star 위반
+(수락/동의를 절대 날조 금지; 승급은 시끄러운 **운영자** opt-in이어야 하고 lead가 닿으면 안 됨).
+
+=> 게이트-권위 동의 신호는 lead가 위조 불가능해야 한다: **신뢰된 데몬 프로세스의 인-메모리 핸들**
+(`ApplyConsent(Arc<AtomicBool>)`)이며, lead의 cwd가 닿는 디스크 파일이 **아니다**. 디스크 기록
+(`.nerve/approvals/`)은 **감사 전용(AUDIT-ONLY)**이고 apply 게이트가 **절대 읽지 않는다** — lead가
+그 파일을 위조해도 아무것도 안 바뀐다.
+
+North star(S11, 반드시 유지): (1) 게이트 권위 = 인-메모리 `ApplyConsent`(데몬 소유, lead 도달 불가);
+디스크 기록은 감사 전용·게이트 미참조. (2) grant는 **오직** `options.apply` 트리거에만 먹이고 `blocked`/
+`goal_satisfied`는 불변 — `(apply||grant) && !blocked`이므로 **blocked run은 grant가 있어도 절대 apply
+안 함**. (3) per-run 격리(`Task::id` 키). (4) 무-grant 기본은 오늘과 byte-identical(`apply == options.apply`).
+(5) 승급은 시끄러운 명시적 **운영자** opt-in(`approve` RPC)이며 절대 기본값/lead-도달 아님. (6) grant는
+**수락이 아니다** — `ApprovalGrant`는 verdict/blocked/goal_satisfied/patch가 없고 동의+신원만 가진,
+`RunReport`/`RunCheckpoint`와 구조적으로 구별되는(양방향 `deny_unknown_fields`) 타입.
+
+- `nerve-core/src/lib.rs`: `ApplyConsent(Arc<AtomicBool>)` newtype — `new()`/`grant()`(store true,SeqCst)/
+  `is_granted()`(load,SeqCst), Clone=공유 핸들. `RunOptions.apply_grant: Option<ApplyConsent>`(Default=None →
+  기존 동작 byte-identical) + `with_apply_grant()` 빌더 + private `apply_consented()` 리졸버
+  (`self.apply || apply_grant.is_some_and(is_granted)`). **두 apply 사이트 모두**(consensus
+  `run_synaptic_loop_inner`, tournament `run_tournament_strategy`) `options.apply && !blocked` →
+  `options.apply_consented() && !blocked`로 교체 — `apply_consented()`는 거부-방향 전용(실제 운영자 grant로만
+  ENABLE), `!blocked`(불변 결정론 게이트)와 AND.
+- `nerve-core/src/store.rs`: `ApprovalGrant { run_id, apply_consent, granted_at }`(`deny_unknown_fields`,
+  `ApprovalGrant::apply(run_id)` ctor) + `record_approval`(`.nerve/approvals/{run-id}.json` write_json) +
+  `load_approval`(absent=Ok(None)) + `approvals_dir`/`approval_path` + `ensure_dirs`에 추가. 전부 **감사 전용**
+  으로 문서화 — 게이트가 절대 참조 안 함.
+- `nerve-cli/src/main.rs`: `struct TrackedRun { join, consent }`로 `RunRegistry` 값 타입 변경(drain/retain/
+  insert 3개 use 사이트 수정). `spawn_streaming_run`에서 `ApplyConsent::new()` 생성 — run 태스크가 한 clone을
+  apply 이음새에서 읽고, 레지스트리가 다른 clone을 보유(`approve`가 flip). 신규 `"approve"` RPC: `run_id`
+  조회 → 인-메모리 `consent.grant()`(게이트-권위) + 감사용 `record_approval`(디스크) + `approve_ack` 라인.
+  미존재 run-id면 `granted:false`로 아무것도 안 씀. `"status"`에 `load_approval`로 standing grant
+  (`approval_grant` 라인) 노출 — 디스크 감사에 진짜 reader를 주고 재접속 클라이언트가 승인 상태를 봄.
+  (인터랙티브 `/approve`는 SKIP — REPL은 blocking이라 중간에 flip할 라이브 인-메모리 핸들이 없음; async S9
+  데몬이 올바른 표면. 누락 아님, 의도적.)
+- 검증: `cargo test --workspace` green (core 168→175: S11 7개 [lib 5: handle-shared-starts-ungranted /
+  consented-only-from-real-grant / grant-enables-apply-on-accepted / ungranted-handle-is-dry-run /
+  **grant-never-applies-a-blocked-run**(grant가 `!blocked`에 안 먹이는 load-bearing 가드) ; store 2:
+  round-trip+per-run-isolation+absent=None / **구조적-구별**(deny_unknown_fields 교차 역직렬화 양방향 실패)];
+  config 49, cli 51→52, adapter 92, types 25, tui 13), `clippy --workspace --all-targets -- -D warnings` exit 0,
+  `build --workspace` clean. lead 위조-방어 확인(게이트는 인-메모리 핸들만 읽음, 디스크는 감사 전용), grant가
+  `blocked`/`goal_satisfied` 미오염 확인, 무-grant byte-identical 확인.
+- 적대적 리뷰(codex r2, REQUEST_CHANGES)가 잡은 결함을 반영: `approve`가 `reg.get(run_id)`만 보고 grant해서,
+  레지스트리에 남아있던 **이미 끝난(finished) run**도 `granted:true`를 돌려주고 `.nerve/approvals/`에 감사
+  레코드를 썼음 — apply 게이트는 인-메모리 핸들만 읽고 끝난 run은 apply seam을 이미 지나 **승급-에스컬레이션은
+  아님**(보안상 무해)이나, "in-flight only"(F) 계약 위반(끝난 run은 행동 불가인데 오해 소지 감사 레코드 생성).
+  수정: `grant_in_flight(reg, run_id)` 헬퍼 추출 — 부재 **또는 `join.is_finished()`**면 `false`+무기록(끝난
+  엔트리는 다음 spawn/shutdown까지 레지스트리에 남으므로 존재만으로 부족, `is_finished` 가드가 계약을 강제).
+  테스트 `approve_grants_only_in_flight_runs`(finished→무grant·consent불변, unknown→무grant, in-flight→grant·
+  consent flip) 추가(cli 51→52).

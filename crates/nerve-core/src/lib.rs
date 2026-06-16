@@ -15,6 +15,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::{Duration, sleep};
@@ -49,7 +50,7 @@ pub use rpc::{EmitError, EmitOutcome, RpcBus, RpcError};
 pub use session_fork::{
     ForkConfig, ForkError, ForkOptions, SessionForker, SessionIndexEntry, SessionTree,
 };
-pub use store::{RunCheckpoint, RunStatus};
+pub use store::{ApprovalGrant, RunCheckpoint, RunStatus};
 pub use ulimit::{UlimitError, apply_ulimit};
 pub use verifier::{
     BUILTIN_VERIFIER_GOAL_ID, DetectedVerifier, PROJECT_VERIFIER_CONSENT_ENV, ResolvedVerifier,
@@ -128,6 +129,37 @@ pub struct RunReport {
     pub blocked: bool,
 }
 
+/// S11: a shared, daemon-controlled handle for escalating a SPECIFIC in-flight
+/// run to apply-consent mid-run, honored at the run's apply point and sticky for
+/// the run's whole life (all rounds/seams). It is the AUTHORITATIVE, forge-proof
+/// consent signal: it lives in the daemon's memory and is flipped by the operator
+/// (`approve <run-id>`), so — unlike a disk file under `.nerve/` — the lead
+/// subprocess cannot reach or forge it. The `.nerve/approvals/` record (see
+/// [`store::ApprovalGrant`]) is an audit trail only and is never read by the gate.
+///
+/// REJECTION-SAFE: this can only ever ENABLE apply from a real operator grant; it
+/// feeds ONLY the apply trigger (`options.apply || granted`), never `blocked` or
+/// `goal_satisfied`, so a blocked/rejected run is still never applied.
+#[derive(Debug, Clone, Default)]
+pub struct ApplyConsent(Arc<AtomicBool>);
+
+impl ApplyConsent {
+    /// A fresh, ungranted handle.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the operator's apply-consent for this run (idempotent).
+    pub fn grant(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the operator has granted apply-consent for this run.
+    pub fn is_granted(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
     pub apply: bool,
@@ -143,6 +175,11 @@ pub struct RunOptions {
     /// forces the worktree path; `Some(false)` forces the legacy path even if
     /// the config has it enabled (useful for tests and recovery).
     pub worktree: Option<bool>,
+    /// S11: optional shared handle for mid-run operator apply-consent (see
+    /// [`ApplyConsent`]). `None` (the default) leaves apply == `apply` exactly.
+    /// When set, an operator can escalate THIS run to apply at a round seam; the
+    /// gate independently re-judges the patch, so this never weakens acceptance.
+    pub apply_grant: Option<ApplyConsent>,
 }
 
 impl RunOptions {
@@ -152,6 +189,7 @@ impl RunOptions {
             goal: None,
             ulimit: None,
             worktree: None,
+            apply_grant: None,
         }
     }
 
@@ -170,6 +208,25 @@ impl RunOptions {
     pub fn with_worktree(mut self, on: bool) -> Self {
         self.worktree = Some(on);
         self
+    }
+
+    /// S11: attach a shared apply-consent handle so the daemon can escalate this
+    /// run to apply mid-flight. See [`ApplyConsent`].
+    pub fn with_apply_grant(mut self, grant: ApplyConsent) -> Self {
+        self.apply_grant = Some(grant);
+        self
+    }
+
+    /// S11: whether this run may APPLY its accepted patch — the invocation-time
+    /// `apply` OR a granted in-memory escalation handle. REJECTION-SAFE: only
+    /// ever enables from a real operator grant; the caller still ANDs this with
+    /// `!blocked`, so it never applies a blocked/rejected run.
+    fn apply_consented(&self) -> bool {
+        self.apply
+            || self
+                .apply_grant
+                .as_ref()
+                .is_some_and(ApplyConsent::is_granted)
     }
 }
 
@@ -596,10 +653,14 @@ async fn run_synaptic_loop_inner(
         || nits_unverified
         || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
 
+    // S11: apply IFF the operator consented (invocation `--apply` OR a mid-run
+    // escalation grant) AND the run is not blocked. `apply_consented()` is
+    // rejection-direction only; `!blocked` is the unchanged deterministic gate,
+    // so a granted-but-blocked run still never applies.
     let applied = apply_final_patch(
         &task,
         final_patch.as_ref(),
-        options.apply && !blocked,
+        options.apply_consented() && !blocked,
         resolve_worktree_apply(&options, &config.orchestration),
     )
     .await?;
@@ -760,10 +821,14 @@ async fn run_tournament_strategy(
         || nits_unverified
         || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
 
+    // S11: apply IFF the operator consented (invocation `--apply` OR a mid-run
+    // escalation grant) AND the run is not blocked. `apply_consented()` is
+    // rejection-direction only; `!blocked` is the unchanged deterministic gate,
+    // so a granted-but-blocked run still never applies.
     let applied = apply_final_patch(
         &task,
         final_patch.as_ref(),
-        options.apply && !blocked,
+        options.apply_consented() && !blocked,
         resolve_worktree_apply(&options, &config.orchestration),
     )
     .await?;
@@ -2817,6 +2882,115 @@ mod tests {
         assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
         assert!(report.applied);
         assert!(dir.path().join("mock-output.txt").exists());
+    }
+
+    // --- S11: per-run apply-consent escalation -------------------------------
+
+    #[test]
+    fn apply_consent_handle_is_shared_and_starts_ungranted() {
+        let consent = ApplyConsent::new();
+        assert!(!consent.is_granted());
+        // A grant on one handle is visible through every clone — this shared
+        // semantics is what lets the daemon flip a live run's consent mid-flight
+        // while the run holds its own clone.
+        let clone = consent.clone();
+        consent.grant();
+        assert!(clone.is_granted());
+    }
+
+    #[test]
+    fn apply_consented_only_enables_from_a_real_grant() {
+        // `--apply` alone consents.
+        assert!(RunOptions::new(true).apply_consented());
+        // Dry-run with no handle never consents.
+        assert!(!RunOptions::new(false).apply_consented());
+        // An ATTACHED but ungranted handle is byte-identical to dry-run.
+        assert!(
+            !RunOptions::new(false)
+                .with_apply_grant(ApplyConsent::new())
+                .apply_consented()
+        );
+        // A granted handle consents even when `--apply` was not passed.
+        let granted = ApplyConsent::new();
+        granted.grant();
+        assert!(
+            RunOptions::new(false)
+                .with_apply_grant(granted)
+                .apply_consented()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_grant_enables_apply_on_accepted_run() {
+        // An operator escalation (granted mid-run) makes an ACCEPTED dry-run
+        // actually apply — the daemon's mid-flight `approve` path.
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("granted apply", dir.path());
+        let config = consensus_config();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+        let consent = ApplyConsent::new();
+        consent.grant(); // operator approved THIS run
+        let options = RunOptions::new(false).with_apply_grant(consent);
+
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
+        assert!(report.applied);
+        assert!(dir.path().join("mock-output.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn ungranted_apply_handle_is_dry_run() {
+        // Attaching an UNGRANTED handle must be byte-identical to dry-run: an
+        // accepted run does NOT apply unless the operator actually granted.
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("ungranted dry-run", dir.path());
+        let config = consensus_config();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+        let options = RunOptions::new(false).with_apply_grant(ApplyConsent::new());
+
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
+        assert!(!report.applied);
+        assert!(!dir.path().join("mock-output.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn apply_grant_never_applies_a_blocked_run() {
+        // North star: the grant feeds ONLY the apply trigger, never `!blocked`.
+        // A failing deterministic goal check blocks the run; even a granted
+        // escalation must NOT apply it.
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("granted but blocked", dir.path());
+        let config = consensus_config();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+        let consent = ApplyConsent::new();
+        consent.grant();
+        let options = RunOptions::new(false)
+            .with_apply_grant(consent)
+            .with_goal(goal_spec(&["false"]));
+
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert!(report.blocked);
+        assert!(!report.applied);
+        assert!(!dir.path().join("mock-output.txt").exists());
     }
 
     #[tokio::test]

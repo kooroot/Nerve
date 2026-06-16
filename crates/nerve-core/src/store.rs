@@ -99,6 +99,45 @@ pub struct RunCheckpoint {
     pub updated_at: String,
 }
 
+/// S11: an AUDIT record that an operator explicitly escalated approval (today:
+/// apply-consent) for ONE run, keyed on the run's id. Written when the operator
+/// sends an `approve` for an in-flight run so a reconnecting client can SEE the
+/// standing grant; it is "sticky per run" because the run's authoritative,
+/// forge-proof consent lives in the daemon's in-memory `ApplyConsent` handle for
+/// the run's whole life.
+///
+/// **Security invariant (load-bearing):** this disk record is AUDIT-ONLY and is
+/// NEVER consulted by the deterministic apply gate. The lead is an arbitrary CLI
+/// subprocess with write access to `.nerve/` in `task.cwd`; if the gate trusted
+/// this file the lead could forge operator consent and self-escalate dry-run →
+/// apply. The gate instead reads the in-memory `ApplyConsent` (see nerve-core
+/// `RunOptions::apply_grant`), which the lead cannot reach. A grant is also NOT
+/// an acceptance: it is structurally distinct from [`RunReport`]/[`RunCheckpoint`]
+/// — it carries ONLY consent + identity, never a verdict / `blocked` /
+/// `goal_satisfied` / patch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalGrant {
+    /// The run this grant is scoped to (`Task::id`). A grant for one run-id is
+    /// never consulted for another — no cross-run leak.
+    pub run_id: String,
+    /// Operator consented to APPLY this run's accepted patch.
+    pub apply_consent: bool,
+    /// rfc3339 timestamp the grant was recorded (chrono::Utc).
+    pub granted_at: String,
+}
+
+impl ApprovalGrant {
+    /// An apply-consent grant for `run_id`, stamped now.
+    pub fn apply(run_id: impl Into<String>) -> Self {
+        Self {
+            run_id: run_id.into(),
+            apply_consent: true,
+            granted_at: Utc::now().to_rfc3339(),
+        }
+    }
+}
+
 impl NerveStore {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self { cwd: cwd.into() }
@@ -170,6 +209,25 @@ impl NerveStore {
                 Err(error).with_context(|| format!("failed to remove `{}`", path.display()))
             }
         }
+    }
+
+    /// S11: persist a per-run approval grant as an AUDIT record under
+    /// `.nerve/approvals/{run-id}.json`. See [`ApprovalGrant`]: this is written
+    /// by the trusted daemon for observability/reconnect and is NEVER consulted
+    /// by the apply gate (the gate reads the in-memory `ApplyConsent` handle).
+    pub fn record_approval(&self, grant: &ApprovalGrant) -> Result<()> {
+        write_json(&self.approval_path(&grant.run_id), grant)
+    }
+
+    /// S11: load the standing approval grant for `run_id`, if any. Absence (no
+    /// file) is `Ok(None)`. Used only for observability (e.g. daemon `status`),
+    /// never as a gate input.
+    pub fn load_approval(&self, run_id: &str) -> Result<Option<ApprovalGrant>> {
+        let path = self.approval_path(run_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_json(&path).map(Some)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
@@ -255,6 +313,8 @@ impl NerveStore {
             .with_context(|| format!("failed to create `{}`", self.patches_dir().display()))?;
         fs::create_dir_all(self.checkpoints_dir())
             .with_context(|| format!("failed to create `{}`", self.checkpoints_dir().display()))?;
+        fs::create_dir_all(self.approvals_dir())
+            .with_context(|| format!("failed to create `{}`", self.approvals_dir().display()))?;
         Ok(())
     }
 
@@ -342,12 +402,21 @@ impl NerveStore {
         self.root_dir().join("checkpoints")
     }
 
+    /// S11: per-run approval grant audit records (see [`ApprovalGrant`]).
+    fn approvals_dir(&self) -> PathBuf {
+        self.root_dir().join("approvals")
+    }
+
     fn session_path(&self, id: &str) -> PathBuf {
         self.sessions_dir().join(format!("{id}.json"))
     }
 
     fn checkpoint_path(&self, id: &str) -> PathBuf {
         self.checkpoints_dir().join(format!("{id}.json"))
+    }
+
+    fn approval_path(&self, id: &str) -> PathBuf {
+        self.approvals_dir().join(format!("{id}.json"))
     }
 
     fn session_meta_path(&self, id: &str) -> PathBuf {
@@ -698,5 +767,41 @@ mod tests {
         let summary = store.list_sessions().unwrap().remove(0);
         assert_eq!(summary.name.as_deref(), Some("first pass"));
         assert_eq!(summary.cwd, dir.path());
+    }
+
+    // --- S11: per-run approval grant audit records ---------------------------
+
+    #[test]
+    fn approval_grant_round_trips_and_is_per_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+
+        // Absent grant reads as None (the dry-run-safe default).
+        assert!(store.load_approval("run-a").unwrap().is_none());
+
+        let grant = ApprovalGrant::apply("run-a");
+        assert!(grant.apply_consent);
+        store.record_approval(&grant).unwrap();
+
+        let loaded = store.load_approval("run-a").unwrap().unwrap();
+        assert_eq!(loaded, grant);
+        // Per-run isolation: a grant for run-a is never visible for run-b.
+        assert!(store.load_approval("run-b").unwrap().is_none());
+    }
+
+    #[test]
+    fn approval_grant_is_structurally_distinct_from_checkpoint() {
+        // A grant must never be deserializable as a checkpoint (or vice-versa):
+        // `deny_unknown_fields` on both keeps a consent record from ever being
+        // read as in-flight run state, and vice-versa.
+        let grant = ApprovalGrant::apply("run-a");
+        let grant_json = serde_json::to_string(&grant).unwrap();
+        assert!(serde_json::from_str::<RunCheckpoint>(&grant_json).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("t", dir.path());
+        let checkpoint = sample_checkpoint(&task, 1);
+        let checkpoint_json = serde_json::to_string(&checkpoint).unwrap();
+        assert!(serde_json::from_str::<ApprovalGrant>(&checkpoint_json).is_err());
     }
 }

@@ -9,14 +9,14 @@ use nerve_config::{
     RpcConfig,
 };
 use nerve_core::session_fork::{ForkOptions as CoreForkOptions, SessionTree};
-use nerve_core::store::{NerveStore, RunCheckpoint};
+use nerve_core::store::{ApprovalGrant, NerveStore, RunCheckpoint};
 use nerve_core::{
-    AuditChainState, BudgetAuditEntry, BudgetSnapshot, ChainStatus, DoctorCheck, DoctorStatus,
-    ForkConfig as CoreForkConfig, GoalIntentConverter, Mayor, Patrol, PatrolTask, PlanError,
-    PROJECT_VERIFIER_CONSENT_ENV, PlanRunOptions, RpcBus, RunOptions, RunReport, SessionForker,
-    append_budget_audit_entry, doctor_checks, format_chain_broken,
-    project_verifier_consent_from_env, resolve_builtin_verifier, run_plan_mode, run_synaptic_loop,
-    run_synaptic_loop_streaming,
+    ApplyConsent, AuditChainState, BudgetAuditEntry, BudgetSnapshot, ChainStatus, DoctorCheck,
+    DoctorStatus, ForkConfig as CoreForkConfig, GoalIntentConverter, Mayor,
+    PROJECT_VERIFIER_CONSENT_ENV, Patrol, PatrolTask, PlanError, PlanRunOptions, RpcBus,
+    RunOptions, RunReport, SessionForker, append_budget_audit_entry, doctor_checks,
+    format_chain_broken, project_verifier_consent_from_env, resolve_builtin_verifier,
+    run_plan_mode, run_synaptic_loop, run_synaptic_loop_streaming,
 };
 use nerve_tui::{TuiApp, TuiAppOptions, TuiState};
 use nerve_types::{
@@ -4391,7 +4391,7 @@ async fn run_rpc_daemon(
     // releases the bus clones held by the run tasks so the `Arc::try_unwrap`
     // below can reclaim the bus.
     let handles: Vec<JoinHandle<()>> = match registry.lock() {
-        Ok(mut reg) => reg.drain().map(|(_, handle)| handle).collect(),
+        Ok(mut reg) => reg.drain().map(|(_, run)| run.join).collect(),
         Err(_) => Vec::new(),
     };
     for handle in handles {
@@ -4422,11 +4422,38 @@ fn rpc_envelope(kind: &str, payload: serde_json::Value) -> RpcEnvelope {
     RpcEnvelope::new(kind, payload).with_fresh_metadata()
 }
 
+/// S9/S11: a tracked in-flight run — its join handle (for graceful shutdown)
+/// plus its S11 [`ApplyConsent`] handle (so the operator can escalate THIS run
+/// to apply mid-flight via the `approve` command). The consent handle is held
+/// in the daemon's memory and is unreachable by the lead subprocess, which is
+/// what makes it a forge-proof consent signal (see `ApplyConsent`).
+struct TrackedRun {
+    join: JoinHandle<()>,
+    consent: ApplyConsent,
+}
+
+/// S11: grant apply-consent to an in-flight run, returning whether a grant was
+/// made. A run-id that is ABSENT *or already FINISHED* returns `false` and flips
+/// nothing: a finished run has already passed its single apply seam and can never
+/// act on a grant, so "approving" it would only write a misleading audit record
+/// for a run that can never apply. (Finished entries linger in the registry until
+/// the next spawn/shutdown prunes them, so this guard — not mere presence — is
+/// what makes the `approve` contract "in-flight only" hold.)
+fn grant_in_flight(reg: &HashMap<String, TrackedRun>, run_id: &str) -> bool {
+    match reg.get(run_id) {
+        Some(run) if !run.join.is_finished() => {
+            run.consent.grant();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// S9: tracks in-flight (nonblocking) run tasks by run-id so the daemon read
 /// loop stays responsive while runs execute, and graceful shutdown can await
 /// them. A plain `std::sync::Mutex` is fine: every critical section is a short
 /// synchronous insert / `retain` / `drain` with no `.await` held across it.
-type RunRegistry = Arc<std::sync::Mutex<HashMap<String, JoinHandle<()>>>>;
+type RunRegistry = Arc<std::sync::Mutex<HashMap<String, TrackedRun>>>;
 
 /// S9: map a completed round to its live `round.started` + `round.ended`
 /// envelopes (the round-seam signal streamed as each round finishes).
@@ -4587,6 +4614,13 @@ fn spawn_streaming_run(
     emit_envelope_line(&session_started);
     let _ = bus.emit(rpc_kinds::SESSION_STARTED, session_started.payload.clone());
 
+    // S11: the shared apply-consent handle for THIS run. The run task holds one
+    // clone (read at the apply seam); the registry holds another so the operator
+    // can `approve` this run-id mid-flight. Held in daemon memory — unreachable
+    // by the lead subprocess.
+    let consent = ApplyConsent::new();
+    let run_consent = consent.clone();
+
     let (round_tx, mut round_rx) = mpsc::unbounded_channel::<RoundRecord>();
 
     // STREAMER: forward each live round to round.started + round.ended. Ends
@@ -4607,7 +4641,7 @@ fn spawn_streaming_run(
     let run_bus = bus.clone();
     let run_id_for_task = run_id.clone();
     let handle = tokio::spawn(async move {
-        let mut options = RunOptions::new(apply);
+        let mut options = RunOptions::new(apply).with_apply_grant(run_consent);
         if let Some(spec) = config.orchestration.check_ulimit.as_ref()
             && !spec.is_empty()
         {
@@ -4654,8 +4688,14 @@ fn spawn_streaming_run(
 
     if let Ok(mut reg) = registry.lock() {
         // Drop handles for runs that already finished so the map stays bounded.
-        reg.retain(|_, handle| !handle.is_finished());
-        reg.insert(run_id, handle);
+        reg.retain(|_, run| !run.join.is_finished());
+        reg.insert(
+            run_id,
+            TrackedRun {
+                join: handle,
+                consent,
+            },
+        );
     }
     Ok(())
 }
@@ -4726,18 +4766,74 @@ async fn handle_rpc_command(
                 registry.clone(),
             )?;
         }
+        "approve" => {
+            // S11: escalate a SPECIFIC in-flight run to apply-consent. The
+            // operator names the run-id (from `session.started`/`status`); we
+            // flip its IN-MEMORY `ApplyConsent` handle (the forge-proof gate
+            // input the lead cannot reach) so the run applies its accepted patch
+            // at its apply seam. We also record an audit grant under
+            // `.nerve/approvals/` so a reconnecting client can see the standing
+            // grant. This NEVER weakens acceptance: the run still applies only
+            // if the deterministic gate did not block it.
+            let run_id = value
+                .get("run_id")
+                .or_else(|| value.get("session_id"))
+                .and_then(serde_json::Value::as_str)
+                .context("missing string field `run_id`")?;
+            // Only an in-flight (not-yet-finished) run can still reach its apply
+            // seam, so only it may be escalated; a finished/unknown run-id is a
+            // no-op (`granted:false`, nothing written). See `grant_in_flight`.
+            let granted = match registry.lock() {
+                Ok(reg) => grant_in_flight(&reg, run_id),
+                Err(_) => false,
+            };
+            if granted {
+                let cwd = env::current_dir().context("failed to read current directory")?;
+                if let Err(error) =
+                    NerveStore::new(&cwd).record_approval(&ApprovalGrant::apply(run_id))
+                {
+                    eprintln!("warning: failed to record approval grant: {error}");
+                }
+            }
+            // A plain ack line (additive, no schema bump). `granted=false` means
+            // the run-id is not in flight (finished or never existed), so nothing
+            // was escalated.
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "approve_ack",
+                    "run_id": run_id,
+                    "granted": granted,
+                })
+            );
+        }
         "status" => {
             // S9: report in-flight runs from the S8 on-disk checkpoints, so this
             // works even across a daemon restart. A checkpoint has no acceptance
             // fields, so `status` can only report progress, never acceptance.
             let cwd = env::current_dir().context("failed to read current directory")?;
-            let checkpoints = NerveStore::new(&cwd)
+            let store = NerveStore::new(&cwd);
+            let checkpoints = store
                 .list_checkpoints()
                 .with_context(|| "failed to list in-flight run checkpoints")?;
             for checkpoint in &checkpoints {
                 let envelope = checkpoint_status_envelope(checkpoint);
                 emit_envelope_line(&envelope);
                 let _ = bus.emit(&envelope.kind, envelope.payload.clone());
+                // S11: surface a standing apply-consent grant for this run so a
+                // reconnecting client knows it was approved. Audit-only — this
+                // never drives the gate (the gate reads the in-memory handle).
+                if let Ok(Some(grant)) = store.load_approval(&checkpoint.task.id) {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "approval_grant",
+                            "run_id": grant.run_id,
+                            "apply_consent": grant.apply_consent,
+                            "granted_at": grant.granted_at,
+                        })
+                    );
+                }
             }
             // A terminal summary line so a consumer knows the listing is complete.
             println!(
@@ -5590,6 +5686,53 @@ mod tests {
         let paths = collect_context_paths("audit crates/nerve-core/src/lib.rs now", Path::new("."));
 
         assert!(paths.contains(&PathBuf::from("crates/nerve-core/src/lib.rs")));
+    }
+
+    // --- S11: approve escalates in-flight runs only ---------------------------
+
+    #[tokio::test]
+    async fn approve_grants_only_in_flight_runs() {
+        // S11 (codex r2 fix): a FINISHED or UNKNOWN run-id must NOT be granted and
+        // must flip no consent — only an in-flight run can still reach its apply
+        // seam, so approving a finished run would write a misleading audit record
+        // for a run that can never apply. Finished entries linger in the registry
+        // until the next spawn/shutdown, so `grant_in_flight`'s `is_finished`
+        // guard (not mere presence) is what enforces the "in-flight only" contract.
+        let mut reg: HashMap<String, TrackedRun> = HashMap::new();
+
+        // A finished run: an empty task driven to completion by the scheduler.
+        let finished = tokio::spawn(async {});
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let finished_consent = ApplyConsent::new();
+        reg.insert(
+            "finished".to_string(),
+            TrackedRun {
+                join: finished,
+                consent: finished_consent.clone(),
+            },
+        );
+
+        // An in-flight run: a task that never completes on its own.
+        let inflight = tokio::spawn(std::future::pending::<()>());
+        let inflight_consent = ApplyConsent::new();
+        reg.insert(
+            "inflight".to_string(),
+            TrackedRun {
+                join: inflight,
+                consent: inflight_consent.clone(),
+            },
+        );
+
+        // Finished run: not granted, consent untouched (no misleading audit).
+        assert!(!grant_in_flight(&reg, "finished"));
+        assert!(!finished_consent.is_granted());
+        // Unknown run-id: not granted.
+        assert!(!grant_in_flight(&reg, "does-not-exist"));
+        // In-flight run: granted, consent flipped.
+        assert!(grant_in_flight(&reg, "inflight"));
+        assert!(inflight_consent.is_granted());
     }
 
     // --- S9: live round-seam stream + status helpers --------------------------
