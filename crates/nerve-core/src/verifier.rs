@@ -17,11 +17,14 @@
 //!
 //! Execution is **opt-in, not default**: running a project's test command
 //! executes project-controlled code, and the guards above are resource limits,
-//! not filesystem/network isolation. Until the OS execution sandbox (roadmap
-//! S5, S4's documented safety dependency) lands, the default
+//! not filesystem/network isolation. The default
 //! [`BuiltinVerifierMode::Off`](nerve_config::BuiltinVerifierMode::Off) keeps
 //! Nerve from executing repo code without consent; the CLI warns loudly that
-//! acceptance then rests on the reviewer alone (roadmap anti-pattern #1).
+//! acceptance then rests on the reviewer alone (roadmap anti-pattern #1). For
+//! filesystem/network confinement of the executed code, pair an opt-in verifier
+//! with the OS execution sandbox (roadmap S5,
+//! [`SandboxConfig`](nerve_config::SandboxConfig)) — `sandbox.mode=required`
+//! fails closed if no backend is available.
 
 use nerve_config::{BuiltinVerifierMode, GoalSpec, Orchestration};
 use std::collections::BTreeMap;

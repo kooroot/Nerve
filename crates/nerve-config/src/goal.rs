@@ -70,11 +70,16 @@ impl GoalSpec {
         }
         let program = &self.check_cmd[0];
         if program.is_empty()
+            || program.starts_with('-')
             || program.contains('/')
             || program.contains('\\')
             || program.split('/').any(|seg| seg == "..")
             || program.contains("..")
         {
+            // Reject a leading `-`: a program name never starts with one, and a
+            // sandbox wrapper (`sandbox-exec`/`bwrap`) could otherwise mis-parse
+            // `check_cmd[0]` as one of ITS own options, executing a different
+            // command than the unwrapped gate would (S5 sandbox-transparency).
             return Err(ConfigError::InvalidCheckCmdProgram(program.clone()));
         }
         if self.timeout_secs == 0 {

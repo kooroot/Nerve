@@ -106,6 +106,15 @@ pub struct Orchestration {
     // alone. Defaults to `off` (never executes repo code without consent).
     #[serde(default)]
     pub builtin_verifier: BuiltinVerifierConfig,
+    // S5: OS execution sandbox for deterministic checks (`/goal` and the
+    // built-in verifier both run project-controlled code). Confines filesystem
+    // writes and network on top of the existing resource guards. Defaults to
+    // `off` (no behavior change). It never fabricates a success: it can only
+    // refuse (→ Fail) or wrap, and the gate still keys Pass on the child's real
+    // exit status. (It does not promise confined/unconfined exit-code parity —
+    // confinement is observable; see `nerve_core::sandbox` module docs.)
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
 }
 
 /// S4: how the built-in verifier behaves when a run has no explicit `/goal`
@@ -115,11 +124,12 @@ pub struct Orchestration {
 /// command executes project-controlled code (Cargo build scripts, `package.json`
 /// scripts, …), and the existing guards (env whitelist, timeout, output cap,
 /// optional ulimit) are *resource* limits, not filesystem/network isolation.
-/// Until the OS execution sandbox (roadmap S5, S4's documented safety
-/// dependency) lands, executing repo code is an explicit operator opt-in, never
-/// a default (roadmap anti-pattern #1: risky auto-execution must be loud and
-/// opt-in). The CLI loudly warns whenever no gate is active so acceptance is
-/// never *silently* reduced to reviewer opinion.
+/// Executing repo code is an explicit operator opt-in, never a default (roadmap
+/// anti-pattern #1: risky auto-execution must be loud and opt-in). The CLI
+/// loudly warns whenever no gate is active so acceptance is never *silently*
+/// reduced to reviewer opinion. For filesystem/network confinement of the
+/// executed code, pair this with the OS execution sandbox ([`SandboxConfig`],
+/// roadmap S5); `sandbox.mode=required` fails closed when no backend exists.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BuiltinVerifierMode {
@@ -132,7 +142,7 @@ pub enum BuiltinVerifierMode {
     /// Opt in to detecting the project's test/build command from marker files
     /// (Cargo.toml, go.mod, package.json) and running it as the deterministic
     /// gate. Executes project-controlled code — enable only when you trust the
-    /// tree (or once S5's OS sandbox isolates it).
+    /// tree, or confine it with the OS sandbox ([`SandboxConfig`], roadmap S5).
     Auto,
     /// Use the operator-supplied `command` verbatim as the gate. Like `Auto`,
     /// this executes code; the operator names the exact argv they consent to.
@@ -175,14 +185,17 @@ impl BuiltinVerifierConfig {
                 anyhow::bail!("command must be a non-empty argv when mode = command");
             };
             // Same PATH-safety rule as GoalSpec::check_cmd[0] (sec-1 #1: argv
-            // only, no shell, PATH lookup only — no `/`, `\`, or `..`).
+            // only, no shell, PATH lookup only — no `/`, `\`, or `..`). Also
+            // reject a leading `-` so a sandbox wrapper can't mis-parse it as one
+            // of its own options (S5 sandbox-transparency).
             if program.is_empty()
+                || program.starts_with('-')
                 || program.contains('/')
                 || program.contains('\\')
                 || program.contains("..")
             {
                 anyhow::bail!(
-                    "command[0] `{program}` must be a PATH-searchable program name (no `/`, `\\`, or `..`)"
+                    "command[0] `{program}` must be a PATH-searchable program name (no leading `-`, `/`, `\\`, or `..`)"
                 );
             }
         }
@@ -192,6 +205,71 @@ impl BuiltinVerifierConfig {
 
 fn default_builtin_verifier_timeout_secs() -> u64 {
     600
+}
+
+/// S5: how the OS execution sandbox confines a deterministic check.
+///
+/// Both `/goal` checks and the built-in verifier run project-controlled code.
+/// The existing guards (env whitelist, timeout, output cap, ulimit) are
+/// *resource* limits; the sandbox adds *filesystem/network confinement* via an
+/// OS backend (macOS Seatbelt `sandbox-exec`, Linux `bwrap`). It never
+/// *fabricates* a success: it can only refuse (→ `Fail`, fail-closed) or wrap,
+/// and the gate still keys `Pass` strictly on the executed command's real exit
+/// status. It does NOT promise that a confined run's exit code equals an
+/// unconfined run's — confinement is observable to the executed code, inherent
+/// to every sandbox; exit-code authority is the operator-trusted check's, which
+/// the lead does not control. See the `nerve_core::sandbox` module docs.
+///
+/// Defaults to [`Off`](SandboxMode::Off) so existing runs are byte-for-byte
+/// unchanged; confinement is an explicit opt-in (roadmap anti-pattern #1: risky
+/// execution is loud and opt-in, never a silent default).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    /// No OS confinement (current behavior, the default). When the built-in
+    /// verifier executes repo code unconfined, the existing S4 loud warning
+    /// still applies — acceptance is never *silently* changed.
+    #[default]
+    Off,
+    /// Confine using the best available backend. If no backend is available on
+    /// this platform, the check runs UNCONFINED with a loud warning
+    /// (best-effort) — choose [`Required`](SandboxMode::Required) for a hard
+    /// *fail-closed* guarantee (never runs unconfined).
+    Auto,
+    /// Confine, or refuse to run. If no backend is available or the sandbox
+    /// cannot be established, the check returns `Fail` and the code never
+    /// executes unconfined. FAIL CLOSED. NOTE: the confinement itself is
+    /// best-effort write+network — it blocks direct out-of-root writes/network
+    /// but NOT daemon-mediated side effects (e.g. `defaults`→`cfprefsd`); it
+    /// raises the bar against naive escapes, it is not a hard jail for a
+    /// determined adversary (use a container/VM for that). See
+    /// `nerve_core::sandbox` module docs.
+    Required,
+}
+
+/// S5: configuration for the OS execution sandbox.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxConfig {
+    #[serde(default)]
+    pub mode: SandboxMode,
+    /// Allow the confined check to use the network. Defaults to `false`: a
+    /// deterministic verifier should be hermetic. Denying network blocks the
+    /// check's DIRECT outbound sockets — the common exfil path — but, like the
+    /// write side, it does NOT close daemon-mediated channels (e.g. DNS via
+    /// mDNSResponder, which the process reaches over IPC rather than a socket).
+    /// It raises the bar against naive exfil; it is not a hard guarantee — see
+    /// the `nerve_core::sandbox` module docs. Set `true` for checks that must
+    /// fetch (e.g. first-build dependency download). Ignored when `mode = off`.
+    #[serde(default)]
+    pub allow_network: bool,
+}
+
+impl SandboxConfig {
+    /// Whether this config requests any OS confinement.
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self.mode, SandboxMode::Off)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1108,6 +1186,27 @@ mod tests {
     }
 
     #[test]
+    fn goal_spec_validate_rejects_leading_dash_program() {
+        // A leading `-` could be mis-parsed by a sandbox wrapper as one of its
+        // own options, running a different command than the unwrapped gate would
+        // (S5 sandbox-transparency). `["--", "true"]` must not validate.
+        for argv in [vec!["--".to_string()], vec!["-c".to_string(), "x".into()]] {
+            let spec = GoalSpec {
+                id: "g".into(),
+                check_cmd: argv.clone(),
+                timeout_secs: 60,
+                cwd: None,
+                env: Default::default(),
+                no_progress_max: None,
+            };
+            assert!(
+                matches!(spec.validate(), Err(ConfigError::InvalidCheckCmdProgram(_))),
+                "argv {argv:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn goal_spec_serde_round_trip() {
         let mut env = std::collections::BTreeMap::new();
         env.insert("PATH".to_string(), String::new());
@@ -1945,6 +2044,15 @@ mod tests {
         };
         assert!(cfg.validate().is_err());
 
+        // A leading `-` is rejected so a sandbox wrapper can't mis-parse it as
+        // one of its own options (S5 sandbox-transparency).
+        let cfg = BuiltinVerifierConfig {
+            mode: BuiltinVerifierMode::Command,
+            command: vec!["--".into(), "true".into()],
+            timeout_secs: 60,
+        };
+        assert!(cfg.validate().is_err());
+
         // A bare program name is accepted.
         let cfg = BuiltinVerifierConfig {
             mode: BuiltinVerifierMode::Command,
@@ -1983,5 +2091,74 @@ mod tests {
         assert_eq!(bv.mode, BuiltinVerifierMode::Command);
         assert_eq!(bv.command, vec!["make", "ci"]);
         assert_eq!(bv.timeout_secs, 90);
+    }
+
+    #[test]
+    fn sandbox_defaults_to_off_and_no_network() {
+        // The shipped/default config never confines silently and never changes
+        // existing execution: sandbox is opt-in, network denied when enabled.
+        let cfg = SandboxConfig::default();
+        assert_eq!(cfg.mode, SandboxMode::Off);
+        assert!(!cfg.allow_network);
+        assert!(!cfg.is_enabled());
+    }
+
+    #[test]
+    fn sandbox_round_trips_through_config_json() {
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority",
+                "sandbox": { "mode": "required", "allow_network": true }
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        let sb = config.orchestration.sandbox;
+        assert_eq!(sb.mode, SandboxMode::Required);
+        assert!(sb.allow_network);
+        assert!(sb.is_enabled());
+    }
+
+    #[test]
+    fn sandbox_absent_section_defaults_off() {
+        // A legacy config without a `sandbox` section parses with confinement off.
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.orchestration.sandbox.mode, SandboxMode::Off);
+        assert!(!config.orchestration.sandbox.is_enabled());
+    }
+
+    #[test]
+    fn sandbox_rejects_unknown_fields() {
+        // deny_unknown_fields guards against typo'd keys silently disabling
+        // confinement (e.g. "allownetwork" leaving allow_network at its default).
+        let err = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority",
+                "sandbox": { "mode": "required", "allownetwork": true }
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        );
+        assert!(err.is_err());
     }
 }

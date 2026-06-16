@@ -25,6 +25,7 @@ pub mod goal_intent;
 pub mod mayor_patrol;
 pub mod plan;
 pub mod rpc;
+pub mod sandbox;
 pub mod session_fork;
 pub mod store;
 pub mod ulimit;
@@ -651,12 +652,13 @@ fn build_goal_evaluator(
         return Ok(None);
     };
     let cwd = spec.cwd.clone().unwrap_or_else(|| task.cwd.clone());
-    let evaluator = GoalEvaluator::with_ulimit(
+    let evaluator = GoalEvaluator::with_options(
         spec,
         orchestration.check_env.clone(),
         orchestration.check_output_cap_bytes,
         cwd,
         options.ulimit.clone(),
+        orchestration.sandbox,
     )
     .map_err(|err| anyhow::anyhow!("goal evaluator setup failed: {err}"))?;
     Ok(Some(evaluator))

@@ -1,7 +1,8 @@
+use crate::sandbox::{self, SandboxDecision};
 #[cfg(unix)]
 use crate::ulimit::apply_ulimit;
 use crate::ulimit::{CheckUlimit, UlimitError};
-use nerve_config::GoalSpec;
+use nerve_config::{GoalSpec, SandboxConfig};
 use nerve_types::CheckResult;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -32,6 +33,7 @@ pub struct GoalEvaluator {
     output_cap: usize,
     cwd: PathBuf,
     ulimit: Option<CheckUlimit>,
+    sandbox: SandboxConfig,
 }
 
 impl GoalEvaluator {
@@ -50,6 +52,20 @@ impl GoalEvaluator {
         output_cap: usize,
         cwd: PathBuf,
         ulimit: Option<CheckUlimit>,
+    ) -> Result<Self, GoalError> {
+        Self::with_options(goal, allowed_env, output_cap, cwd, ulimit, SandboxConfig::default())
+    }
+
+    /// Full constructor. S5: `sandbox` confines the check's filesystem writes and
+    /// network via an OS backend (defaults to `Off` through the other
+    /// constructors, preserving existing behavior).
+    pub fn with_options(
+        goal: GoalSpec,
+        allowed_env: Vec<String>,
+        output_cap: usize,
+        cwd: PathBuf,
+        ulimit: Option<CheckUlimit>,
+        sandbox: SandboxConfig,
     ) -> Result<Self, GoalError> {
         goal.validate()
             .map_err(|e| GoalError::InvalidSpec(e.to_string()))?;
@@ -73,6 +89,7 @@ impl GoalEvaluator {
             output_cap,
             cwd,
             ulimit,
+            sandbox,
         })
     }
 
@@ -91,10 +108,37 @@ impl GoalEvaluator {
     }
 
     async fn spawn_and_wait(&self) -> Result<CheckResult, GoalError> {
-        let program = &self.goal.check_cmd[0];
-        let mut command = Command::new(program);
+        // S5: resolve the OS sandbox first. It confines side effects without
+        // fabricating success — wrapping the command (Pass still keys on the
+        // child's real exit status below), or (under `Required` with no backend)
+        // refusing to run (→ Fail). It does not promise confined/unconfined
+        // exit-code parity; see the `sandbox` module docs. The check runs in
+        // `cwd`, which is always writable; the system temp dir is added so build
+        // tools (cargo/rustc) can write their intermediates.
+        let extra_writable = vec![std::env::temp_dir()];
+        let (program, args): (String, Vec<String>) =
+            match sandbox::decide(&self.sandbox, &self.cwd, &self.goal.check_cmd, &extra_writable) {
+                SandboxDecision::Unconfined { warning } => {
+                    if let Some(message) = warning {
+                        tracing::warn!(target: "nerve::sandbox", "{message}");
+                    }
+                    (
+                        self.goal.check_cmd[0].clone(),
+                        self.goal.check_cmd[1..].to_vec(),
+                    )
+                }
+                SandboxDecision::Wrap { program, args } => (program, args),
+                SandboxDecision::Refuse { reason } => {
+                    return Ok(CheckResult::Fail {
+                        reason,
+                        progress: None,
+                    });
+                }
+            };
+
+        let mut command = Command::new(&program);
         command
-            .args(&self.goal.check_cmd[1..])
+            .args(&args)
             .current_dir(&self.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -507,5 +551,66 @@ mod tests {
             CheckResult::Fail { progress, .. } => assert_eq!(progress, Some(750)),
             other => panic!("expected fail with progress, got {other:?}"),
         }
+    }
+
+    // --- S5: OS sandbox end-to-end wiring (macOS Seatbelt, real kernel) ---
+
+    /// A `Required` sandbox must not break a legitimate check that writes inside
+    /// its working directory: the wrapper runs, the in-cwd write is allowed, and
+    /// the check still reports `Pass`.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn goal_evaluator_sandbox_required_allows_write_in_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        // Canonicalize: the kernel resolves /var/folders/... -> /private/... and
+        // the profile must match that resolved view.
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let sandbox = SandboxConfig {
+            mode: nerve_config::SandboxMode::Required,
+            allow_network: false,
+        };
+        let evaluator = GoalEvaluator::with_options(
+            spec_with_cmd(vec!["sh", "-c", "echo ok > marker.txt"], 30),
+            Vec::new(),
+            4096,
+            cwd.clone(),
+            None,
+            sandbox,
+        )
+        .unwrap();
+        assert_eq!(evaluator.evaluate().await, CheckResult::Pass);
+        assert!(cwd.join("marker.txt").exists(), "in-cwd write should persist");
+    }
+
+    /// The sandbox never *fabricates* a success: a wrapped check that exits
+    /// non-zero still reports `Fail`. This is the precise S5 guarantee (the gate
+    /// keys `Pass` strictly on the child's real exit status; the sandbox adds no
+    /// success of its own) — distinct from confined/unconfined exit-code parity,
+    /// which is inherently unachievable since confinement is observable (see the
+    /// `sandbox` module docs / codex S5 r4). The evaluator always grants `cwd` +
+    /// the system temp dir as writable, so the nonzero exit from this non-writing
+    /// failing check wraps cleanly and the `progress` parsing path is unaffected.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn goal_evaluator_sandbox_required_preserves_nonzero_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let sandbox = SandboxConfig {
+            mode: nerve_config::SandboxMode::Required,
+            allow_network: false,
+        };
+        let evaluator = GoalEvaluator::with_options(
+            spec_with_cmd(vec!["false"], 30),
+            Vec::new(),
+            4096,
+            cwd,
+            None,
+            sandbox,
+        )
+        .unwrap();
+        assert!(
+            matches!(evaluator.evaluate().await, CheckResult::Fail { .. }),
+            "a wrapped failing check must still Fail"
+        );
     }
 }

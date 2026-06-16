@@ -53,7 +53,7 @@ Claude Code와 Codex의 changelog를 벤치마킹해 Nerve의 loop/goal 방향�
 | Step | 항목 | effort | 상태 |
 |---|---|---|---|
 | **S4** | 상시 빌트인 Verifier 게이트 (test/build/lint/patch-applies) | M | ✅ **DONE** (codex-verified) |
-| S5 | OS 실행 샌드박스 (Seatbelt / bwrap+seccomp+Landlock) — S4 안전 의존성 | M~L | ⬜ |
+| S5 | OS 실행 샌드박스 (macOS Seatbelt / Linux bwrap; raw seccomp/Landlock은 향후 강화) — S4 안전 의존성 | M~L | ✅ |
 | S6 | 스키마 강제 verdict 객체 (free-text LGTM 파싱 폐기) | M | ✅ |
 | S7 | distance-to-goal 진행 신호 (CheckResult에 score) | M | ✅ |
 
@@ -258,3 +258,84 @@ false-accept를 유발하면 보안 버그(false-reject/추가 abort는 허용).
 - 검증: `cargo test --workspace` green (core 138: parse_progress libtest/pytest/all-failed/unrecognized/last-line/worst-across-streams +
   progress() accessor + goal-evaluator 통합 + round_is_stalled/check_result_progress 회귀; config 42, cli 49+16+4, adapter 92+1, types 25, tui 13),
   `clippy -D warnings` clean.
+
+### S5 — OS 실행 샌드박스 (✅ DONE, 2026-06-17)
+
+결정론적 체크(`/goal` + 빌트인 verifier)가 실행하는 **프로젝트 제어 코드**(Cargo build script,
+`package.json` script, 테스트 코드)를 OS 수준에서 격리한다. 기존 자원 가드(env 화이트리스트·timeout·
+output cap·ulimit) 위에 **파일시스템 쓰기 + 네트워크 confinement**를 더한다. Wave 1(검증-게이트 코어) 완료.
+
+North star(S5, 정밀): 샌드박스는 성공을 **날조하지 않는다**. 게이트 판정을 더 보수적으로 만들거나(Refuse→Fail,
+코드 미실행), 실행 명령의 **실제 exit status를 그대로 둔다**(Wrap 후에도 Pass는 자식의 실제 exit에만 의존).
+백엔드를 세울 수 없는데 운영자가 `required`를 요청했으면 **fail-closed** — 코드는 무방비로 실행되지 않고 `Fail`을
+반환한다(anti-pattern #1: 위험 실행은 요란한 opt-in, 침묵 기본 금지).
+단, confined/unconfined **exit-code 동일성은 보장하지 않는다**(모든 샌드박스에 내재 — 거부된 syscall은 코드가
+분기할 수 있는 에러를 반환; 예 `write-outside-cwd && exit 1 || exit 0`은 unconfined 1·confined 0). 이는
+허용 가능한 잔여물: exit-code 권한은 **운영자 신뢰 체크(`check_cmd`/빌트인 verifier)**의 것이고 **lead는 이를
+제어하지 못한다**(lead는 패치=체크가 실행하는 코드만 제어). 현실적 운영자 체크(예 `cargo test` 같은 집계 러너,
+운영자 단언 하나라도 실패하면 non-zero)에 대해 lead는 거부 분기로 진짜 실패를 통과로 못 뒤집고, exit 로직을
+완전히 작성할 수 있는 경우엔 unconfined로도 이미 통과 가능 — 샌드박스는 악성 **부작용**(루트 밖 쓰기·네트워크)만
+안전 방향으로 제거. 따라서 `Required`는 confinement에 의도적으로 invert하도록 작성된 체크에 대해 `Off`의
+**엄격한 보수적 상위집합이 아니다**(체크 작성자의 책임, 게이트의 문제 아님).
+
+- `nerve-config`: `SandboxMode { Off|Auto|Required }`(기본 **Off** → 기존 동작 byte-identical 불변),
+  `SandboxConfig { mode, allow_network }`(`allow_network` 기본 **false**: verifier는 hermetic해야 하고
+  네트워크 차단이 프로세스 **직접 outbound 소켓**(흔한 exfil 경로)을 막음 — 단 daemon-mediated 채널[DNS via
+  mDNSResponder]은 쓰기 측과 동일 잔여물로 남음, 하단 한계 참조). `deny_unknown_fields`로 오타 키가 confinement를 조용히 끄는 것 방지.
+  `Orchestration.sandbox`로 배선.
+- `nerve-core/sandbox.rs`(신규): `decide(config, cwd, check_cmd, extra_writable) -> SandboxDecision
+  { Unconfined{warning} | Wrap{program,args} | Refuse{reason} }`. Off → Unconfined. 백엔드 부재 시
+  Required→Refuse(fail-closed), Auto→경고+무방비(best-effort). writable root는 **canonicalize**
+  (심볼릭링크 해소: macOS `/var/folders`→`/private/var/folders`, `/tmp`→`/private/tmp`)해 커널의 resolved
+  뷰와 일치 — 불일치 시 *거부* 방향(fail-safe), over-broad allow 절대 아님.
+- **macOS Seatbelt**(실커널 검증): SBPL 프로파일 = `(version 1)(allow default)(deny file-write*)
+  (allow file-write* (subpath cwd)(subpath temp))[(deny network*)]`. last-match-wins라 deny 후 root 재허용이
+  정상 동작. 경로는 SBPL string literal escaping(`"`/`\`)로 **profile injection** 차단. wrapper program은
+  절대경로 `/usr/bin/sandbox-exec`(cleared PATH와 무관하게 해소), inner 명령은 sandbox-exec가 child PATH로
+  resolve — unwrapped 동작과 동일.
+- **Linux bwrap**(arg-gen 단위테스트, **macOS 호스트에선 런타임 미검증** — 정직히 명시): `--ro-bind / /`
+  (호스트 ro) + writable root별 `--bind`(rw) + `--proc`/`--dev` + `--chdir cwd` + `--die-with-parent` +
+  (네트워크 거부 시)`--unshare-net` + `-- 명령`. raw **seccomp/Landlock은 미구현** — bwrap의 네임스페이스
+  +bind+unshare-net이 FS·네트워크 격리를 담당하며, syscall 필터링은 향후 강화 과제(과대광고 금지, anti-pattern #5).
+  **wrapper 바이너리는 신뢰된 절대경로(`/usr/bin/bwrap` 등)에서만 해소 — `$PATH` 절대 미사용**: lead가 repo에
+  `./bwrap`를 심고 `$PATH`에 `.`/repo-writable dir를 앞세우면 무방비 실행+exit 0로 fail-closed를 우회할 수 있어
+  (codex S5 r1 BLOCK), root-owned 시스템 경로만 신뢰. 비신뢰 위치면 `Required`는 refuse(fail-closed).
+- `goal.rs`: `spawn_and_wait` 맨 위에서 sandbox 해소 → wrap/refuse/unconfined. env_clear·whitelist·
+  ulimit pre_exec·timeout·output cap **전부 보존**. `GoalEvaluator::with_options`(신규, sandbox 인자;
+  `new`/`with_ulimit`은 Off로 위임). 프로덕션 단일 배선점 `build_goal_evaluator`만 `orchestration.sandbox` 전달.
+- **argv 투명성**(sandbox 래핑이 어느 명령을 실행하는지 절대 바꾸지 않음): seatbelt는 profile 뒤 **wrapper 소유 `--`**
+  삽입(`sandbox-exec -p P -- cmd …`)으로 `check_cmd[0]="--"`가 sandbox-exec 옵션으로 소비돼 뒤 토큰이 실행되는 걸 차단
+  (bwrap는 이미 `--` 보유). 추가로 `GoalSpec::validate`·`BuiltinVerifierConfig::validate`가 **`-` 선행 program 거부**
+  (program 이름은 `-`로 시작 안 함; 래퍼 옵션 오인 방지, defense-in-depth). codex S5 r2가 이 누락으로
+  `check_cmd=["--","true"]`→`true` 실행→Pass(미래핑이면 spawn 실패=Fail)인 **수락-방향 위반(false Pass)** BLOCK 적발 → 양쪽 수정.
+- 알려진 제약: macOS 프로파일은 permissive-baseline(reads/exec 허용)이라 강한 jail 아닌 *best-effort 쓰기+네트워크
+  confinement*. confined 프로세스의 **직접(DIRECT) 루트 밖 쓰기/네트워크는 차단**(naive escape 격퇴)하지만
+  **daemon-mediated 부작용은 못 막음** — `(allow default)`에서 Mach IPC로 샌드박스 밖 시스템 데몬에 요청 가능,
+  예: `defaults write`→`cfprefsd`가 `~/Library/Preferences`에 plist를 대신 영속화(직접 쓰기는 거부되는데도; codex S5 r5).
+  네트워크 동류: `(deny network*)`는 프로세스 자체 소켓을 막지만 DNS는 mDNSResponder를 IPC로 거치므로 crafted hostname으로 exfil 가능.
+  쓰기/네트워크 가능 데몬 전수 차단은 whack-a-mole이고 deny-by-default IPC는 실제 빌드툴을 깨므로 **닫지 않고 문서화** —
+  `Required`는 우발/naive escape 문턱을 높일 뿐 작정한 공격자에 대한 보안 경계가 아님(하드 격리는 container/VM).
+  writable에 시스템 temp 전체 포함(빌드툴 intermediate; 저위험 ephemeral, 향후 per-check private temp로 좁힐 여지),
+  reads는 broad. (Linux bwrap는 mount ns+RO 호스트로 이 지점에서 더 강하나, 바인드된 소켓으로 닿는 호스트 데몬은 동류 리스크.)
+- 검증: 실커널 증명(`seatbelt_profile_denies_direct_out_of_root_write`: granted root 안 쓰기 허용 /
+  sibling temp 밖 **직접 쓰기 거부 + 파일 미생성** — daemon-mediated는 범위 밖, 한계로 문서화),
+  e2e 와이어링(Required로 cwd 쓰기 Pass, 래핑된 실패 체크 Fail 보존),
+  순수 단위테스트(profile escaping·deny 선행 순서·network opt-in, bwrap ro/rw-bind·unshare-net·chdir·`--`,
+  wrapper 신뢰-절대경로 불변, argv 투명성 실커널 증명[`-- true`가 `true` 미실행], leading-`-` 거부,
+  fail-closed Refuse/Auto-warn). `cargo test --workspace` green
+  (core 152: sandbox 14 신규; config 47: sandbox 4 + leading-dash 거부 신규), `clippy -D warnings` clean.
+  codex 이중검증이 BLOCK 3건을 연쇄 적발: r1 Linux bwrap **`$PATH` hijack로 Required fail-open** → 신뢰-절대경로 해소;
+  r2 macOS **`check_cmd[0]="--"`로 sandbox-exec가 false Pass 유발(수락-방향 위반)** → wrapper `--` + leading-`-` 거부;
+  r4 **원래의 "Fail→Pass 절대 불가" 주장이 과대**임을 지적(confinement은 관측 가능 → 체크가 거부에 분기, 예
+  `write-outside-cwd && exit 1 || exit 0`) → 주장을 달성 가능·테스트로 잠긴 보장(**성공 미날조**)으로 정밀화하고
+  내재적 exit-code-parity 한계와 그 위협 경계(lead는 check_cmd 미제어; 집계 러너에선 무기화 불가)를 코드·커밋·로드맵에 명시.
+  코드 변경 아닌 **정직한 주장 범위 축소**가 올바른 수정(내재 속성은 코드로 못 고침) — r3는 직전 clean HEAD에서 LGTM.
+  r5 **macOS 쓰기-confinement 주장 과대** 지적(daemon-mediated 쓰기 `defaults`→`cfprefsd`가 `(deny file-write*)` 우회)
+  → 주장을 **직접(DIRECT) 쓰기**로 축소, 테스트명을 `…denies_direct_out_of_root_write`로 변경, daemon-mediated 잔여물을
+  permissive-baseline의 알려진 한계로 명시(전수 차단=whack-a-mole, deny-by-default IPC=빌드 파손 → 닫지 않고 문서화).
+  r5는 fabricated-success/Required→Unconfined 경로는 **없음**을 확인(r4 범위 축소 수용).
+  r5 이후 같은 결함류(daemon-mediated)를 선제 일관 적용: **네트워크 주장도 직접 소켓으로 축소**(DNS via mDNSResponder
+  잔여물 명시) — whack-a-mole을 끊으려 모든 절대적 보안 주장을 best-effort/직접-한정으로 정직하게 통일.
+  r6 **ACCEPT_WITH_NITS**(차단 없음): fail-open/fabricated-success 경로 없음 재확인, 범위 축소된 주장 sound 판정.
+  유일 nit — 요약표가 `bwrap+seccomp+Landlock`로 top-line 과대(상세는 미구현 명시) → 표를 `Seatbelt / bwrap; raw
+  seccomp/Landlock 향후`로 정정(과대광고 제거, 코드 무변경). 수락 게이트(연속 2회 무차단)는 정정 후 HEAD에서 재확인.
