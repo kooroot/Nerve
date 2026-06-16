@@ -115,6 +115,13 @@ pub struct RunReport {
     pub budget_exceeded: bool,
     #[serde(default)]
     pub no_progress_exceeded: bool,
+    // S10: set when the run was short-circuited by a decisive live crossfire
+    // `Block` (Halt action). Additive + rejection-direction (mirrors
+    // `no_progress_exceeded`): it feeds `blocked` and forces `goal_satisfied`
+    // false, never the reverse. `#[serde(default)]` keeps older persisted
+    // reports deserializable.
+    #[serde(default)]
+    pub crossfire_halted: bool,
     #[serde(default)]
     pub goal_satisfied: Option<bool>,
     pub applied: bool,
@@ -367,7 +374,13 @@ async fn run_synaptic_loop_inner(
         }
     });
 
-    let mut lead_output = collect_output_with_crossfire(
+    // S10: `current_crossfire` holds the live crossfire feedback gathered during
+    // the generation that produced the CURRENT `lead_output` (round 0 here; the
+    // refine at the loop tail updates it for each subsequent round). The loop
+    // acts on it at the seam — redirect (steer the next refine) and, under Halt,
+    // short-circuit on a decisive live Block.
+    let crossfire_action = config.orchestration.crossfire_action;
+    let (mut lead_output, mut current_crossfire) = collect_output_with_crossfire(
         lead.implement(&task, &task.cwd, tx.clone()),
         reviewer,
         &task,
@@ -402,6 +415,10 @@ async fn run_synaptic_loop_inner(
     let mut previous_patch_sha: Option<String> = None;
     let mut no_progress_count: u8 = 0;
     let mut no_progress_exceeded = false;
+    // S10 Halt: set when a decisive live crossfire `Block` short-circuits the
+    // loop. Rejection-direction only — it feeds `blocked` and forces
+    // `goal_satisfied=false`, mirroring `no_progress_exceeded`.
+    let mut crossfire_halted = false;
     let mut last_check: Option<CheckResult> = None;
     // S7: best deterministic-check pass-ratio (permille) seen across rounds, so
     // the no-progress guard can also trip when the lead keeps producing DIFFERENT
@@ -471,6 +488,20 @@ async fn run_synaptic_loop_inner(
             break;
         }
 
+        // S10 Halt: a decisive LIVE crossfire `Block` gathered while the lead
+        // generated THIS round's output short-circuits the loop and blocks the
+        // run. The terminal-accept check above returns FIRST for any acceptance,
+        // so this can only ever fire on a NON-accepting round — it never overrides
+        // an acceptance, and (like the `Block` break above) only ever stops the
+        // loop earlier toward rejection. `crossfire_halted` feeds `blocked` and
+        // forces `goal_satisfied=false` below — it can never fabricate acceptance.
+        if crossfire_action.halts()
+            && matches!(most_severe_crossfire(&current_crossfire), Some(Verdict::Block))
+        {
+            crossfire_halted = true;
+            break;
+        }
+
         // no-progress guard (ma-1 + S7): a refinement round that fails to move
         // toward the goal. `round_is_stalled` trips on an identical patch hash
         // (the original guard) for a RequestChanges / strict-mode-stuck
@@ -510,8 +541,19 @@ async fn run_synaptic_loop_inner(
             break;
         }
 
-        lead_output = collect_output_with_crossfire(
-            lead.refine(&task, &lead_output, &final_feedback, &task.cwd, tx.clone()),
+        // S10 Redirect: when enabled, the live crossfire hints from THIS
+        // generation enrich the refine prompt so the lead sees the
+        // over-the-shoulder feedback in addition to the end-of-round review.
+        // Rejection-biased and gate-safe: the gate-bearing `final_feedback` is
+        // never mutated (only this refine-only copy), and the deterministic gate
+        // independently re-judges the resulting patch.
+        let refine_feedback = if crossfire_action.redirects() {
+            merge_crossfire_into_feedback(&final_feedback, &current_crossfire)
+        } else {
+            final_feedback.clone()
+        };
+        let (next_output, next_crossfire) = collect_output_with_crossfire(
+            lead.refine(&task, &lead_output, &refine_feedback, &task.cwd, tx.clone()),
             reviewer,
             &task,
             &selection,
@@ -520,6 +562,8 @@ async fn run_synaptic_loop_inner(
         )
         .await
         .with_context(|| format!("lead adapter `{}` failed during refinement", lead.id()))?;
+        lead_output = next_output;
+        current_crossfire = next_crossfire;
         accumulate_output_usage(&mut usage, &lead_output);
         budget_exceeded = exceeds_budget(&usage, &config.orchestration);
         if budget_exceeded {
@@ -547,6 +591,7 @@ async fn run_synaptic_loop_inner(
             && matches!(last_check, Some(CheckResult::Pass)));
     let blocked = budget_exceeded
         || no_progress_exceeded
+        || crossfire_halted
         || goal_check_failed
         || nits_unverified
         || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
@@ -568,6 +613,7 @@ async fn run_synaptic_loop_inner(
             .accepts_under(selection.review_strictness.permits_nits())
             && !budget_exceeded
             && !no_progress_exceeded
+            && !crossfire_halted
     });
 
     Ok(RunReport {
@@ -582,6 +628,7 @@ async fn run_synaptic_loop_inner(
         usage,
         budget_exceeded,
         no_progress_exceeded,
+        crossfire_halted,
         goal_satisfied,
         applied,
         blocked,
@@ -741,6 +788,9 @@ async fn run_tournament_strategy(
         usage,
         budget_exceeded,
         no_progress_exceeded: false,
+        // Tournament has no crossfire (single round, no scratch watcher), so it
+        // can never be halted by a live crossfire Block.
+        crossfire_halted: false,
         goal_satisfied,
         applied,
         blocked,
@@ -916,6 +966,12 @@ fn budget_exceeded_feedback(reviewer_id: &str, usage: &UsageStats) -> ReviewerFe
     }
 }
 
+/// Drive a lead generation while watching `.nerve/scratch` for over-the-shoulder
+/// crossfire review. Returns the lead output AND the crossfire feedback gathered
+/// during THIS generation (each item is also recorded to the synapse for the
+/// report). S10 uses the returned batch to optionally redirect the next refine
+/// or short-circuit the loop — strictly at the round seam, never mid-generation
+/// (the lead's model subprocess is not `kill_on_drop`).
 async fn collect_output_with_crossfire<F>(
     output_future: F,
     reviewer: &dyn ModelAdapter,
@@ -923,16 +979,17 @@ async fn collect_output_with_crossfire<F>(
     selection: &ProfileSelection,
     synapse: &Synapse,
     tx: mpsc::Sender<AgentEvent>,
-) -> Result<AgentOutput>
+) -> Result<(AgentOutput, Vec<ReviewerFeedback>)>
 where
     F: Future<Output = Result<AgentOutput>>,
 {
     let mut watcher = ScratchWatcher::new(task.cwd.join(".nerve/scratch"))?;
     tokio::pin!(output_future);
 
+    let mut collected: Vec<ReviewerFeedback> = Vec::new();
     loop {
         tokio::select! {
-            output = &mut output_future => return output,
+            output = &mut output_future => return output.map(|output| (output, collected)),
             change = watcher.next_change() => {
                 if let Some(summary) = change? {
                     let feedback = reviewer
@@ -944,11 +1001,120 @@ where
                             tx.clone(),
                         )
                         .await?;
-                    synapse.record_crossfire_feedback(feedback).await;
+                    synapse.record_crossfire_feedback(feedback.clone()).await;
+                    collected.push(feedback);
                 }
             }
         }
     }
+}
+
+/// S10: severity rank for the crossfire helpers. Rejection-monotonic
+/// (`Lgtm` < `AcceptWithNits` < `RequestChanges` < `Block`) — the same ordering
+/// idea the S6 verdict scan relies on.
+fn verdict_severity_rank(verdict: &Verdict) -> u8 {
+    match verdict {
+        Verdict::Lgtm => 0,
+        Verdict::AcceptWithNits => 1,
+        Verdict::RequestChanges => 2,
+        Verdict::Block => 3,
+    }
+}
+
+/// S10: canonical uppercase verdict token (the same wire format the reviewer
+/// emits and `strip_verdict_prefix` parses), so a rendered crossfire hint reads
+/// to the lead exactly like an ordinary reviewer verdict line.
+fn verdict_token(verdict: &Verdict) -> &'static str {
+    match verdict {
+        Verdict::Lgtm => "LGTM",
+        Verdict::AcceptWithNits => "ACCEPT_WITH_NITS",
+        Verdict::RequestChanges => "REQUEST_CHANGES",
+        Verdict::Block => "BLOCK",
+    }
+}
+
+/// S10: uppercase label for an issue severity when rendering crossfire hints.
+fn issue_severity_token(severity: &IssueSeverity) -> &'static str {
+    match severity {
+        IssueSeverity::Info => "INFO",
+        IssueSeverity::Warning => "WARNING",
+        IssueSeverity::Blocking => "BLOCKING",
+    }
+}
+
+/// S10: the most severe verdict among a batch of live crossfire feedback, or
+/// `None` if the batch is empty. Used to decide whether a decisive live `Block`
+/// should short-circuit the loop (Halt action).
+fn most_severe_crossfire(feedback: &[ReviewerFeedback]) -> Option<Verdict> {
+    feedback
+        .iter()
+        .max_by_key(|item| verdict_severity_rank(&item.verdict))
+        .map(|item| item.verdict.clone())
+}
+
+/// S10 redirect: produce a refine-only feedback that augments the end-of-round
+/// review with the live crossfire hints. REJECTION-BIASED: the verdict is only
+/// ever raised toward rejection (never lowered) and crossfire issues are
+/// appended. This feeds ONLY the lead's refine prompt — the gate-bearing
+/// `final_feedback` is never mutated, so crossfire can never fabricate
+/// acceptance (the deterministic gate independently re-judges the next patch).
+/// An empty crossfire batch yields a clone of `base` (no-op steering).
+///
+/// The hints are rendered into `raw_text` as well as `issues`/`verdict`: the
+/// SHIPPED lead adapters build their refine prompt from `feedback.raw_text`
+/// ONLY (see nerve-adapter `refine`), never the structured `verdict`/`issues`,
+/// so without the `raw_text` rendering the redirect would never reach a real
+/// lead. The rendered section is clearly labeled and uses the reviewer's
+/// canonical verdict tokens so it reads like ordinary additional change
+/// requests. This only affects the refine prompt — the deterministic gate never
+/// reads this `raw_text`.
+fn merge_crossfire_into_feedback(
+    base: &ReviewerFeedback,
+    crossfire: &[ReviewerFeedback],
+) -> ReviewerFeedback {
+    let mut merged = base.clone();
+    if crossfire.is_empty() {
+        return merged; // no-op steering — byte-identical clone of base
+    }
+
+    // Structured channel (report/telemetry + any adapter that reads it):
+    // raise the verdict toward rejection, append the crossfire issues.
+    for item in crossfire {
+        if verdict_severity_rank(&item.verdict) > verdict_severity_rank(&merged.verdict) {
+            merged.verdict = item.verdict.clone();
+        }
+        merged.issues.extend(item.issues.iter().cloned());
+    }
+
+    // Prose channel (what shipped adapters actually feed the lead): render the
+    // crossfire hints into raw_text so the refine prompt conveys them.
+    let mut section = String::from(
+        "--- Live crossfire feedback (over-the-shoulder review captured during generation) ---\n\
+         Treat the following as ADDITIONAL change requests for this refine:",
+    );
+    for item in crossfire {
+        section.push_str(&format!("\n[CROSSFIRE {}]", verdict_token(&item.verdict)));
+        let body = item.raw_text.trim();
+        if !body.is_empty() {
+            section.push(' ');
+            section.push_str(body);
+        }
+        for issue in &item.issues {
+            section.push_str(&format!(
+                "\n  - {}: {}",
+                issue_severity_token(&issue.severity),
+                issue.message
+            ));
+        }
+    }
+
+    if merged.raw_text.trim().is_empty() {
+        merged.raw_text = section;
+    } else {
+        merged.raw_text = format!("{}\n\n{}", merged.raw_text, section);
+    }
+
+    merged
 }
 
 #[derive(Debug)]
@@ -1614,6 +1780,381 @@ mod tests {
                 .raw_text
                 .contains("scratch changed")
         );
+    }
+
+    // --- S10: crossfire redirect / short-circuit ------------------------------
+
+    /// A distinctive message only ever emitted by the test reviewer's crossfire
+    /// channel, so a test can prove whether a crossfire hint reached the refine.
+    const CROSSFIRE_MARKER: &str = "CROSSFIRE_HINT_XYZ";
+
+    fn feedback_with_verdict(id: &str, verdict: Verdict, message: &str) -> ReviewerFeedback {
+        let severity = match verdict {
+            Verdict::Block => IssueSeverity::Blocking,
+            Verdict::RequestChanges => IssueSeverity::Warning,
+            _ => IssueSeverity::Info,
+        };
+        ReviewerFeedback {
+            reviewer_id: id.to_string(),
+            verdict,
+            issues: vec![Issue {
+                severity,
+                message: message.to_string(),
+            }],
+            suggested_patch: None,
+            cost: None,
+            raw_text: message.to_string(),
+        }
+    }
+
+    /// A lead that writes to `.nerve/scratch` on every generation (so the live
+    /// crossfire watcher fires) and CAPTURES the feedback it is refined with, so
+    /// a test can assert whether crossfire hints were merged into the refine.
+    #[derive(Debug, Clone)]
+    struct CrossfireLeadAdapter {
+        refine_feedback: std::sync::Arc<std::sync::Mutex<Vec<ReviewerFeedback>>>,
+    }
+
+    impl CrossfireLeadAdapter {
+        fn new() -> Self {
+            Self {
+                refine_feedback: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn captured(&self) -> Vec<ReviewerFeedback> {
+            self.refine_feedback.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelAdapter for CrossfireLeadAdapter {
+        fn id(&self) -> &str {
+            "crossfire-lead"
+        }
+
+        async fn implement(
+            &self,
+            _task: &Task,
+            cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            let scratch = cwd.join(".nerve/scratch/lead");
+            std::fs::create_dir_all(&scratch)?;
+            std::fs::write(scratch.join("note.txt"), "implement progress\n")?;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Ok(AgentOutput::with_patch(
+                self.id(),
+                "lead v0",
+                NvPatch::new(vec![FilePatch::new("a.txt", "old\n", "v0\n")]),
+            ))
+        }
+
+        async fn review(
+            &self,
+            _task: &Task,
+            _lead_output: &AgentOutput,
+            _cwd: &Path,
+            _strictness: &str,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<ReviewerFeedback> {
+            Ok(ReviewerFeedback::lgtm(self.id(), "unused"))
+        }
+
+        async fn refine(
+            &self,
+            _task: &Task,
+            _previous_output: &AgentOutput,
+            feedback: &ReviewerFeedback,
+            cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            let n = {
+                let mut guard = self.refine_feedback.lock().unwrap();
+                guard.push(feedback.clone());
+                guard.len()
+            };
+            let scratch = cwd.join(".nerve/scratch/lead");
+            std::fs::create_dir_all(&scratch)?;
+            std::fs::write(scratch.join("note.txt"), format!("refine progress {n}\n"))?;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Ok(AgentOutput::with_patch(
+                self.id(),
+                "lead refined",
+                NvPatch::new(vec![FilePatch::new("a.txt", "old\n", format!("v{n}\n"))]),
+            ))
+        }
+    }
+
+    /// A reviewer with a fixed end-of-round `review` verdict and a fixed live
+    /// `crossfire` verdict. The crossfire feedback carries [`CROSSFIRE_MARKER`]
+    /// so redirect/record-only can be distinguished.
+    #[derive(Debug, Clone)]
+    struct CrossfireReviewerAdapter {
+        review_verdict: Verdict,
+        crossfire_verdict: Verdict,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelAdapter for CrossfireReviewerAdapter {
+        fn id(&self) -> &str {
+            "crossfire-reviewer"
+        }
+
+        async fn implement(
+            &self,
+            _task: &Task,
+            _cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            Ok(AgentOutput::text(self.id(), "unused"))
+        }
+
+        async fn review(
+            &self,
+            _task: &Task,
+            _lead_output: &AgentOutput,
+            _cwd: &Path,
+            _strictness: &str,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<ReviewerFeedback> {
+            Ok(feedback_with_verdict(
+                self.id(),
+                self.review_verdict.clone(),
+                "review verdict",
+            ))
+        }
+
+        async fn refine(
+            &self,
+            _task: &Task,
+            _previous_output: &AgentOutput,
+            _feedback: &ReviewerFeedback,
+            _cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            Ok(AgentOutput::text(self.id(), "unused"))
+        }
+
+        async fn crossfire(
+            &self,
+            _task: &Task,
+            _scratch_summary: &str,
+            _cwd: &Path,
+            _strictness: &str,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<ReviewerFeedback> {
+            Ok(feedback_with_verdict(
+                self.id(),
+                self.crossfire_verdict.clone(),
+                CROSSFIRE_MARKER,
+            ))
+        }
+    }
+
+    fn crossfire_config(action: &str) -> Config {
+        Config::from_json_str(&format!(
+            r#"{{
+              "orchestration": {{
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority",
+                "crossfire_action": "{action}"
+              }},
+              "roles": {{ "architect": "crossfire-lead", "reviewer": "crossfire-reviewer" }},
+              "profiles": []
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn most_severe_crossfire_picks_block() {
+        let batch = vec![
+            ReviewerFeedback::lgtm("r", "ok"),
+            feedback_with_verdict("r", Verdict::RequestChanges, "changes"),
+            feedback_with_verdict("r", Verdict::Block, "block"),
+            feedback_with_verdict("r", Verdict::AcceptWithNits, "nit"),
+        ];
+        assert_eq!(most_severe_crossfire(&batch), Some(Verdict::Block));
+        assert_eq!(most_severe_crossfire(&[]), None);
+    }
+
+    #[test]
+    fn merge_crossfire_into_feedback_is_rejection_biased() {
+        let base = feedback_with_verdict("r", Verdict::RequestChanges, "base issue");
+        let crossfire = vec![
+            // A "looks good" hint must NEVER lower the verdict ...
+            feedback_with_verdict("r", Verdict::Lgtm, "lgtm hint"),
+            // ... and a Block hint raises it toward rejection.
+            feedback_with_verdict("r", Verdict::Block, CROSSFIRE_MARKER),
+        ];
+        let merged = merge_crossfire_into_feedback(&base, &crossfire);
+        assert_eq!(merged.verdict, Verdict::Block);
+        assert!(merged.issues.iter().any(|i| i.message.contains("base issue")));
+        assert!(merged.issues.iter().any(|i| i.message.contains(CROSSFIRE_MARKER)));
+        // The hint must also reach `raw_text` — the ONLY channel the shipped
+        // lead adapters read for the refine prompt. The end-of-round review's
+        // own text is preserved alongside it.
+        assert!(merged.raw_text.contains(CROSSFIRE_MARKER));
+        assert!(merged.raw_text.contains("base issue"));
+
+        // An empty crossfire batch is a no-op (byte-identical clone of base).
+        let noop = merge_crossfire_into_feedback(&base, &[]);
+        assert_eq!(noop.verdict, base.verdict);
+        assert_eq!(noop.issues.len(), base.issues.len());
+        assert_eq!(noop.raw_text, base.raw_text);
+    }
+
+    #[tokio::test]
+    async fn crossfire_off_is_record_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("off path", dir.path());
+        let config = crossfire_config("off");
+        let lead = CrossfireLeadAdapter::new();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(lead.clone()),
+            Box::new(CrossfireReviewerAdapter {
+                review_verdict: Verdict::RequestChanges,
+                crossfire_verdict: Verdict::Block,
+            }),
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false))
+            .await
+            .unwrap();
+
+        // Crossfire is still RECORDED (advisory) ...
+        assert!(!report.crossfire_feedback.is_empty());
+        // ... but a live Block never halts the run under `off`,
+        assert!(!report.crossfire_halted);
+        // ... and it never steers the refine: no captured refine feedback
+        // carries the crossfire marker — in neither the structured `issues`
+        // nor the `raw_text` the shipped lead adapters actually read.
+        let captured = lead.captured();
+        assert!(!captured.is_empty());
+        assert!(captured.iter().all(|fb| {
+            !fb.raw_text.contains(CROSSFIRE_MARKER)
+                && fb
+                    .issues
+                    .iter()
+                    .all(|i| !i.message.contains(CROSSFIRE_MARKER))
+        }));
+    }
+
+    #[tokio::test]
+    async fn crossfire_redirect_merges_into_refine() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("redirect path", dir.path());
+        let config = crossfire_config("redirect");
+        let lead = CrossfireLeadAdapter::new();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(lead.clone()),
+            Box::new(CrossfireReviewerAdapter {
+                review_verdict: Verdict::RequestChanges,
+                crossfire_verdict: Verdict::RequestChanges,
+            }),
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false))
+            .await
+            .unwrap();
+
+        // Redirect steered the refine: the first refine feedback carries the
+        // live crossfire marker merged in (the end-of-round review never emits
+        // it, so its presence proves the crossfire was the source). It must
+        // reach `raw_text` — the channel shipped lead adapters build the refine
+        // prompt from — not just the structured `issues`.
+        let captured = lead.captured();
+        assert!(!captured.is_empty());
+        assert!(captured[0].raw_text.contains(CROSSFIRE_MARKER));
+        assert!(
+            captured[0]
+                .issues
+                .iter()
+                .any(|i| i.message.contains(CROSSFIRE_MARKER))
+        );
+        // Redirect never halts.
+        assert!(!report.crossfire_halted);
+    }
+
+    #[tokio::test]
+    async fn crossfire_halt_blocks_on_live_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("halt path", dir.path());
+        let config = crossfire_config("halt");
+        let lead = CrossfireLeadAdapter::new();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(lead.clone()),
+            // review is RequestChanges (non-accepting AND not Block, so the
+            // existing Block break does not fire); crossfire is a decisive
+            // live Block.
+            Box::new(CrossfireReviewerAdapter {
+                review_verdict: Verdict::RequestChanges,
+                crossfire_verdict: Verdict::Block,
+            }),
+        ];
+
+        // apply=true: prove the halt's `blocked` gate prevents application.
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(true))
+            .await
+            .unwrap();
+
+        assert!(report.crossfire_halted);
+        assert!(report.blocked);
+        assert!(!report.applied);
+        // The halt short-circuits at round 0 → no refine ever runs.
+        assert!(lead.captured().is_empty());
+    }
+
+    #[tokio::test]
+    async fn crossfire_halt_never_overrides_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("accept path", dir.path());
+        let config = crossfire_config("halt");
+        let lead = CrossfireLeadAdapter::new();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(lead.clone()),
+            // review ACCEPTS (Lgtm) → round 0 is terminal (Lgtm + Skipped check).
+            // The terminal-accept check precedes the Halt check, so a live Block
+            // crossfire can NEVER override the acceptance (rejection-direction
+            // only — this is the load-bearing north-star guard).
+            Box::new(CrossfireReviewerAdapter {
+                review_verdict: Verdict::Lgtm,
+                crossfire_verdict: Verdict::Block,
+            }),
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false))
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
+        assert!(!report.crossfire_halted);
+        assert!(!report.blocked);
+    }
+
+    #[tokio::test]
+    async fn crossfire_non_block_never_halts() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("non-block crossfire", dir.path());
+        let config = crossfire_config("halt");
+        let lead = CrossfireLeadAdapter::new();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(lead.clone()),
+            // Crossfire is only ever RequestChanges (never Block) → never halts,
+            // even under the Halt action.
+            Box::new(CrossfireReviewerAdapter {
+                review_verdict: Verdict::RequestChanges,
+                crossfire_verdict: Verdict::RequestChanges,
+            }),
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false))
+            .await
+            .unwrap();
+
+        assert!(!report.crossfire_halted);
     }
 
     #[test]

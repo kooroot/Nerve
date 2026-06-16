@@ -4522,6 +4522,9 @@ fn emit_terminal_envelopes(report: &RunReport, bus: &RpcBus) -> Result<()> {
             "verdict": report.final_feedback.verdict,
             "applied": report.applied,
             "blocked": report.blocked,
+            // S10: additive field naming the live-crossfire-Block reason behind a
+            // blocked run (Halt action). Additive payload key, no schema bump.
+            "crossfire_halted": report.crossfire_halted,
             "patch_id": report.final_patch.as_ref().map(|patch| patch.id.clone()),
         }),
     );
@@ -5240,7 +5243,11 @@ fn print_report(report: &nerve_core::RunReport, apply_requested: bool) {
         println!("Session budget exceeded; no files were changed.");
     }
 
-    if report.blocked && !report.budget_exceeded {
+    if report.crossfire_halted {
+        println!(
+            "Run short-circuited by a live crossfire Block (S10 halt); no files were changed."
+        );
+    } else if report.blocked && !report.budget_exceeded {
         println!("Patch blocked by reviewer policy; no files were changed.");
     }
 
@@ -5786,6 +5793,7 @@ mod tests {
             usage: Default::default(),
             budget_exceeded: false,
             no_progress_exceeded: false,
+            crossfire_halted: false,
             goal_satisfied: None,
             applied: false,
             blocked: false,
@@ -6411,6 +6419,7 @@ mod tests {
             usage: Default::default(),
             budget_exceeded: false,
             no_progress_exceeded: false,
+            crossfire_halted: false,
             goal_satisfied: None,
             applied: false,
             blocked: false,

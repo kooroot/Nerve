@@ -62,7 +62,7 @@ Claude Code와 Codex의 changelog를 벤치마킹해 Nerve의 loop/goal 방향�
 |---|---|---|---|
 | S8 | 라운드 증분 체크포인트 (record_round → .nerve store) | M | ✅ |
 | **S9** | 논블로킹 라운드-이음새 데몬 v2 + 라이브 JSONL 스트림 | L | ✅ |
-| S10 | crossfire advisory → redirect/단락 | M | ⬜ |
+| S10 | crossfire advisory → redirect/단락 | M | ✅ |
 | S11 | 승인-에스컬레이션 지속성 (sticky per run) | S | ⬜ |
 | S12 | auto-mode 분류기 게이트 (implement↔apply) | M | ⬜ |
 
@@ -419,3 +419,55 @@ North star(S9, 상속): 라이브 스트림은 **읽기전용 텔레메트리** 
   `checkpoint_status_envelope_reports_progress_not_acceptance` — applied/blocked/goal_satisfied 키 부재 단언] 신규;
   config 47, adapter 92+1, types 25, tui 13), `clippy --workspace --all-targets -- -D warnings` exit 0.
   프로덕션 run_synaptic_loop 호출처 정합 + 종료 시 bus 클론 drop 순서(핸들 await 후 `try_unwrap`) 확인.
+
+### S10 — crossfire advisory → redirect / 단락(short-circuit) (✅ DONE, 2026-06-17)
+
+기존엔 lead 생성 중 `.nerve/scratch`를 감시해 reviewer의 **라이브 over-the-shoulder**
+crossfire 피드백을 받지만(`collect_output_with_crossfire`) **기록만**(`record_crossfire_feedback`)
+하고 lead를 조종하거나 라운드를 끊지 않는 순수 advisory였다. S10은 그 신호를 **행동 가능**하게
+만든다: (1) **redirect** — crossfire 힌트가 다음 refine 프롬프트를 조종, (2) **단락(Halt)** —
+결정적 라이브 `Block` crossfire가 루프를 단락하고 run을 block.
+
+**핵심 설계 제약(코드 정독으로 확정)**: subprocess 어댑터의 `Command`는 `kill_on_drop` 미설정
+(nerve-adapter/src/lib.rs:388) → 진행 중 lead 생성 future를 drop하면 모델 CLI 자식이 **고아(orphan)**
+가 됨. 따라서 S10은 **라운드 이음새 기반**(생성 완료 후)으로만 동작하고 생성 중간을 절대 끊지 않음 —
+directive (e) "조종은 라운드 이음새에서만" + anti-pattern #3(in-flight check_cmd/NvPatch 원자적 완료)를
+정확히 준수. lead 생성은 repo 부작용 없는 LLM 호출(`.nerve/scratch`에만 씀)이고 실제 패치 APPLY(NvPatch)는
+끝에서 `apply_final_patch` 한 번뿐이라 S10은 거기 손대지 않음.
+
+North star(S10, 상속): redirect/단락은 STEERING + 텔레메트리 — 결정론적 수락 게이트를 **절대 약화하지
+않는다**. 둘 다 **거부-방향 전용**: 더 많은 정밀검토/refine/abort로만 밀 수 있고 accept/apply/
+goal_satisfied로는 **절대** 못 민다. "looks good" crossfire는 아무것도 가속하지 않고, 오직 결정적
+`Block`만 단락하며 그것도 **blocked run으로** 단락한다.
+
+- `nerve-config`: `CrossfireAction { Off(기본) | Redirect | Halt }`(snake_case, `Orchestration.
+  crossfire_action`). 기본 **Off** → advisory-only 기존 동작 byte-identical. `redirects()`(Redirect|Halt)
+  / `halts()`(Halt) 헬퍼. Halt ⊃ Redirect.
+- `nerve-core`: `collect_output_with_crossfire`가 `(AgentOutput, Vec<ReviewerFeedback>)` 반환 — 그
+  생성 동안 모은 crossfire를 추가로 돌려줌(report용 synapse 기록은 그대로 유지). 헬퍼
+  `verdict_severity_rank`(Lgtm<AcceptWithNits<RequestChanges<Block, 거부-monotonic),
+  `most_severe_crossfire`(배치 최고 severity verdict), `merge_crossfire_into_feedback`(거부-편향: verdict는
+  거부쪽으로만 **올리고** 절대 안 내림, issue는 append, 그리고 힌트를 `raw_text`에도 렌더 — shipped lead
+  어댑터의 refine 프롬프트는 `feedback.raw_text`**만** 읽으므로(nerve-adapter `refine`) 이게 없으면 redirect가
+  실제 lead에 도달 못 함; 빈 배치는 base의 byte-identical clone). **Redirect**: refine 직전 `refine_feedback =
+  merge(final_feedback, current_crossfire)`를 만들어 refine에만 전달 — **게이트가 읽는 `final_feedback`은
+  불변**(게이트가 결과 패치를 독립 재판정하므로 crossfire가 수락을 날조 불가). **Halt**: 라운드 이음새에서
+  terminal-accept 체크(라운드마다 **먼저** 실행 → 수락은 절대 못 뒤집음) 다음에 `crossfire_action.halts()
+  && most_severe_crossfire(current_crossfire)==Block`이면 `crossfire_halted=true; break`. `current_crossfire`는
+  매 라운드 refine 후 **교체**(append 아님)라 stale crossfire가 다음 라운드 halt 판정에 새지 않음. 게이트 배선:
+  `blocked |= crossfire_halted`, `goal_satisfied &&= !crossfire_halted`(no_progress_exceeded와 동형). `RunReport.
+  crossfire_halted: bool`(additive, `#[serde(default)]`). **tournament은 crossfire 없음**(단일 라운드·scratch
+  watcher 없음)이라 `crossfire_halted: false` 필드만 추가.
+- `nerve-cli`: `session.ended` envelope에 additive 필드 `crossfire_halted`(blocked의 정확한 사유, 스키마 bump
+  아님). 사람용 요약에 단락 메시지. (별도 "live" 이벤트 kind는 **추가 안 함** — halt는 report 시점에만 알 수
+  있어 live kind는 과대표현; additive payload 필드가 정직.)
+- 검증: `cargo test --workspace` green (core 161→168: S10 7개 [off-record-only / redirect-merges-into-refine /
+  halt-blocks-on-live-block / **halt-never-overrides-acceptance**(terminal-accept가 halt보다 선행하는 load-bearing
+  가드) / non-block-never-halts / most_severe_crossfire / merge-rejection-biased]; config 47→49: defaults-off +
+  3-variant round-trip; cli 51, adapter 92, types 25, tui 13), `clippy --workspace --all-targets -- -D warnings`
+  exit 0. kill_on_drop 미설정 확인으로 seam-only 설계 확정, redirect가 게이트-bearing final_feedback 불변 확인,
+  halt가 terminal-accept 뒤에 위치해 수락 미오버라이드 확인.
+- 적대적 리뷰(codex r1, REQUEST_CHANGES)가 잡은 결함을 반영: 초판 merge는 verdict/issue만 올리고 `raw_text`를
+  안 건드려, `raw_text`만 읽는 shipped lead refine 프롬프트(nerve-adapter `refine`)에 redirect가 **무효**였음
+  (게이트-방향 버그는 아님). 수정: merge가 crossfire 힌트를 `raw_text`에도 렌더(라벨 + 표준 verdict 토큰).
+  redirect 테스트는 `captured[0].raw_text.contains(MARKER)`, off 테스트는 `raw_text`에 마커 부재를 추가 검증.

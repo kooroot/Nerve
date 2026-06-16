@@ -115,6 +115,13 @@ pub struct Orchestration {
     // confinement is observable; see `nerve_core::sandbox` module docs.)
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    // S10: how the live crossfire reviewer signal feeds back into the loop
+    // (off=record-only / redirect=steer next refine / halt=redirect + block on a
+    // live Block). Defaults to `off` → byte-identical to the prior advisory-only
+    // behavior. Both non-off actions are rejection-direction only and never
+    // weaken the deterministic acceptance gate.
+    #[serde(default)]
+    pub crossfire_action: CrossfireAction,
 }
 
 /// S4: how the built-in verifier behaves when a run has no explicit `/goal`
@@ -738,6 +745,52 @@ impl ReviewStrictness {
     /// refinement round even on cosmetic nits.
     pub fn permits_nits(&self) -> bool {
         matches!(self, Self::Low | Self::Normal)
+    }
+}
+
+/// S10: how the live "crossfire" reviewer signal (gathered over-the-shoulder
+/// while the lead generates, by watching `.nerve/scratch`) feeds back into the
+/// loop. Defaults to [`Off`](CrossfireAction::Off): crossfire stays advisory —
+/// recorded for the report but never steering the lead nor stopping a round.
+///
+/// Both non-`Off` actions are REJECTION-DIRECTION ONLY and act strictly at the
+/// round seam (the lead's model subprocess is not `kill_on_drop`, and steering
+/// is seam-only by design — roadmap directive (e) / anti-pattern #3). They can
+/// only push the loop toward more scrutiny / refine / abort, NEVER toward
+/// acceptance: the deterministic gate (verdict-accept AND check Pass) stays the
+/// sole acceptance authority. A "looks good" crossfire never accelerates
+/// anything; only a decisive crossfire `Block` may short-circuit, and it
+/// short-circuits toward a BLOCKED run.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossfireAction {
+    /// Record-only (today's behavior, byte-identical): crossfire feedback is
+    /// collected into the report but never changes loop control flow.
+    #[default]
+    Off,
+    /// The crossfire hints from a generation enrich the NEXT refine round's
+    /// prompt (the lead sees the live over-the-shoulder feedback in addition to
+    /// the end-of-round review). Pure rejection-direction steering — it only
+    /// changes the lead's INPUT; the gate still re-judges the resulting patch.
+    Redirect,
+    /// `Redirect` plus: a decisive live crossfire `Block` during a generation
+    /// short-circuits the refinement loop and BLOCKS the run (단락). The
+    /// terminal-accept check runs first every round, so this can only ever fire
+    /// on a non-accepting round — it never overrides an acceptance.
+    Halt,
+}
+
+impl CrossfireAction {
+    /// Whether crossfire hints should steer the next refine (true for
+    /// `Redirect` and `Halt`).
+    pub fn redirects(&self) -> bool {
+        matches!(self, Self::Redirect | Self::Halt)
+    }
+
+    /// Whether a decisive live crossfire `Block` may short-circuit + block the
+    /// run (true only for `Halt`).
+    pub fn halts(&self) -> bool {
+        matches!(self, Self::Halt)
     }
 }
 
@@ -2160,5 +2213,52 @@ mod tests {
             }"#,
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn crossfire_action_defaults_off() {
+        // A legacy config without a `crossfire_action` key parses as record-only,
+        // so existing runs keep their byte-identical advisory-only behavior.
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.orchestration.crossfire_action, CrossfireAction::Off);
+        assert!(!config.orchestration.crossfire_action.redirects());
+        assert!(!config.orchestration.crossfire_action.halts());
+    }
+
+    #[test]
+    fn crossfire_action_round_trips_each_variant() {
+        for (token, expected, redirects, halts) in [
+            ("off", CrossfireAction::Off, false, false),
+            ("redirect", CrossfireAction::Redirect, true, false),
+            ("halt", CrossfireAction::Halt, true, true),
+        ] {
+            let config = Config::from_json_str(&format!(
+                r#"{{
+                  "orchestration": {{
+                    "default_strategy": "consensus",
+                    "max_refinement_rounds": 2,
+                    "conflict_policy": "lead_priority",
+                    "crossfire_action": "{token}"
+                  }},
+                  "roles": {{ "architect": "claude-code", "reviewer": "codex" }},
+                  "profiles": []
+                }}"#
+            ))
+            .unwrap();
+            assert_eq!(config.orchestration.crossfire_action, expected);
+            assert_eq!(config.orchestration.crossfire_action.redirects(), redirects);
+            assert_eq!(config.orchestration.crossfire_action.halts(), halts);
+        }
     }
 }
