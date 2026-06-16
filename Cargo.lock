@@ -683,6 +683,7 @@ dependencies = [
  "async-trait",
  "nerve-patch",
  "nerve-types",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
