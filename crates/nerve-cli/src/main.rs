@@ -2371,20 +2371,12 @@ impl InteractiveLineEditor {
 
     fn render(&self, prompt: &str) -> Result<()> {
         print!("\r\x1b[J{prompt}{}", self.buffer);
-        let suggestions = self.command_suggestions();
-        for (index, suggestion) in suggestions.iter().enumerate() {
-            let marker = if index == self.selected_suggestion {
-                ">"
-            } else {
-                " "
-            };
-            println!(
-                "\n  {marker} {:<12} {:<16} {}",
-                suggestion.command, suggestion.args, suggestion.description
-            );
+        let palette_lines = self.command_palette_lines();
+        for line in &palette_lines {
+            println!("\n{line}");
         }
-        if !suggestions.is_empty() {
-            print!("\x1b[{}A\r{prompt}{}", suggestions.len(), self.buffer);
+        if !palette_lines.is_empty() {
+            print!("\x1b[{}A\r{prompt}{}", palette_lines.len(), self.buffer);
         }
         std::io::stdout().flush()?;
         Ok(())
@@ -2398,6 +2390,34 @@ impl InteractiveLineEditor {
 
     fn command_suggestions(&self) -> Vec<&'static InteractiveCommandSpec> {
         command_suggestions(&self.buffer)
+    }
+
+    fn command_palette_lines(&self) -> Vec<String> {
+        let suggestions = self.command_suggestions();
+        if suggestions.is_empty() {
+            return Vec::new();
+        }
+
+        let rows: Vec<String> = suggestions
+            .iter()
+            .enumerate()
+            .map(|(index, suggestion)| {
+                let marker = if index == self.selected_suggestion {
+                    ">"
+                } else {
+                    " "
+                };
+                format!(
+                    "{marker} {:<12} {:<24} {}",
+                    suggestion.command, suggestion.args, suggestion.description
+                )
+            })
+            .collect();
+
+        boxed_lines("Commands", &rows)
+            .into_iter()
+            .map(|line| format!("  {line}"))
+            .collect()
     }
 
     fn has_command_suggestions(&self) -> bool {
@@ -2462,9 +2482,27 @@ fn command_suggestions(input: &str) -> Vec<&'static InteractiveCommandSpec> {
         return Vec::new();
     }
     let query = trimmed.to_ascii_lowercase();
-    INTERACTIVE_COMMANDS
+    let prefix_matches: Vec<_> = INTERACTIVE_COMMANDS
         .iter()
         .filter(|spec| spec.command.starts_with(&query))
+        .take(8)
+        .collect();
+    if !prefix_matches.is_empty() {
+        return prefix_matches;
+    }
+
+    let needle = query.trim_start_matches('/');
+    if needle.len() < 2 {
+        return Vec::new();
+    }
+
+    INTERACTIVE_COMMANDS
+        .iter()
+        .filter(|spec| {
+            spec.command.contains(needle)
+                || spec.args.to_ascii_lowercase().contains(needle)
+                || spec.description.to_ascii_lowercase().contains(needle)
+        })
         .take(8)
         .collect()
 }
@@ -2629,17 +2667,40 @@ fn fit_line(value: &str, width: usize) -> String {
 }
 
 fn print_box(title: &str, lines: &[String]) {
+    for line in boxed_lines(title, lines) {
+        println!("{line}");
+    }
+}
+
+fn boxed_lines(title: &str, lines: &[String]) -> Vec<String> {
     let inner = SURFACE_WIDTH.saturating_sub(2);
     let title_text = format!(" {title} ");
     let title_len = visible_len(&title_text);
     let dash_len = inner.saturating_sub(title_len);
-    println!("╭{}{}╮", title_text, "─".repeat(dash_len));
+    let mut rendered = Vec::with_capacity(lines.len() + 2);
+    rendered.push(format!("╭{}{}╮", title_text, "─".repeat(dash_len)));
     for line in lines {
         let fitted = fit_line(line, inner.saturating_sub(2));
         let pad = inner.saturating_sub(2).saturating_sub(visible_len(&fitted));
-        println!("│ {}{} │", fitted, " ".repeat(pad));
+        rendered.push(format!("│ {}{} │", fitted, " ".repeat(pad)));
     }
-    println!("╰{}╯", "─".repeat(inner));
+    rendered.push(format!("╰{}╯", "─".repeat(inner)));
+    rendered
+}
+
+fn display_path(path: &Path) -> String {
+    let raw = path.display().to_string();
+    let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) else {
+        return raw;
+    };
+    let home = PathBuf::from(home).display().to_string();
+    if raw == home {
+        "~".to_string()
+    } else if let Some(rest) = raw.strip_prefix(&(home + "/")) {
+        format!("~/{rest}")
+    } else {
+        raw
+    }
 }
 
 fn print_command_section(title: &str, commands: &[(&str, &str)]) {
@@ -2656,9 +2717,10 @@ fn print_interactive_banner(state: &InteractiveState) {
     print_box(
         "Nerve Terminal",
         &[
-            "Lead writes. Reviewer blocks. Nerve applies only reviewed patches.".to_string(),
-            "Type a task, use /paste for long input, or run !cmd in this workspace.".to_string(),
-            "Inspect with /diff, commit intent with /apply, recover with /rollback.".to_string(),
+            "Lead implements, reviewer gates, orchestrator keeps the patch auditable.".to_string(),
+            "Type a task directly, use /paste for long work, or !cmd for shell context."
+                .to_string(),
+            "Review-first flow: /diff inspect, /apply commit, /rollback recover.".to_string(),
         ],
     );
     print_interactive_status(state);
@@ -2667,7 +2729,7 @@ fn print_interactive_banner(state: &InteractiveState) {
 fn print_interactive_status(state: &InteractiveState) {
     let branch = git_branch_label(env::current_dir().ok().as_deref()).unwrap_or_else(|| "-".into());
     let cwd = env::current_dir()
-        .map(|path| path.display().to_string())
+        .map(|path| display_path(&path))
         .unwrap_or_else(|_| "?".to_string());
     print_box(
         "Workspace",
@@ -2685,35 +2747,27 @@ fn print_interactive_status(state: &InteractiveState) {
         ],
     );
     print_status_bar(state);
+    print_next_actions(state);
 }
 
 fn print_status_bar(state: &InteractiveState) {
-    // Tier 1a status bar: render on a single line. We save+hide cursor before
-    // updating to avoid raw-mode flicker, then restore. The interactive caller
-    // is responsible for not being in the middle of a paste sequence.
     let bar = render_status_bar(state);
-    if std::io::stdout().is_terminal() {
-        print!("\x1b[s\x1b[?25l");
-        println!("{bar}");
-        print!("\x1b[u\x1b[?25h");
-    } else {
-        println!("{bar}");
-    }
+    println!("{bar}");
     let _ = std::io::stdout().flush();
 }
 
 fn render_status_bar(state: &InteractiveState) -> String {
     let round_label = if state.last_max_rounds == 0 {
-        "round -/-".to_string()
+        "r -/-".to_string()
     } else {
-        format!("round {}/{}", state.last_round_count, state.last_max_rounds)
+        format!("r {}/{}", state.last_round_count, state.last_max_rounds)
     };
     let verdict_value = state.last_verdict_label();
     let verdict_label = match verdict_value {
-        "lgtm" => success("verdict lgtm"),
-        "changes" => warn("verdict changes"),
-        value if value.starts_with("block") => error_style(format!("verdict {value}")),
-        _ => "verdict -".to_string(),
+        "lgtm" => success("ok"),
+        "changes" => warn("changes"),
+        value if value.starts_with("block") => error_style("blocked"),
+        _ => "-".to_string(),
     };
     let total_tokens = state
         .cumulative_input_tokens
@@ -2723,16 +2777,84 @@ fn render_status_bar(state: &InteractiveState) -> String {
         Some(spec) => format!("goal {}", spec.id),
         None => "goal -".to_string(),
     };
+    let no_progress_label = if state.no_progress_counter == 0 {
+        String::new()
+    } else {
+        format!("  │  np {}", state.no_progress_counter)
+    };
     format!(
-        "{}  {}  │  {}  │  cost {}  │  tokens {}  │  {}  │  no-progress {}",
+        "{}  {}  │  {}  │  {}  │  tok {}  │  {}  │  {}{}",
         muted("status"),
         round_label,
         verdict_label,
         cost_label,
         total_tokens,
         goal_label,
-        state.no_progress_counter
+        state.apply_label(),
+        no_progress_label
     )
+}
+
+fn next_action_lines(state: &InteractiveState) -> Vec<String> {
+    let safety = if state.apply {
+        "apply mode is live: reviewed patches can change files."
+    } else {
+        "dry-run mode is safe: patches wait for /apply."
+    };
+
+    let Some(report) = state.last_report.as_ref() else {
+        return vec![
+            "Start: type a task, or use /paste for a multi-line request.".to_string(),
+            "Inspect: /doctor checks setup; /help shows the command map.".to_string(),
+            format!("Safety: {safety}"),
+        ];
+    };
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Last: session {}  verdict {:?}  rounds {}",
+        short_id(&report.task.id),
+        report.final_feedback.verdict,
+        report.rounds.len()
+    ));
+
+    match report.final_patch.as_ref() {
+        Some(patch) if report.applied => {
+            lines.push(format!(
+                "Applied patch {}. Use /rollback to undo or /diff to inspect.",
+                short_id(&patch.id)
+            ));
+        }
+        Some(_patch) if report.blocked => {
+            lines.push(
+                "Patch is blocked. Use /resume for raw feedback, then revise the task.".to_string(),
+            );
+        }
+        Some(_patch) => {
+            lines.push(
+                "reviewed patch ready. Use /diff to inspect or /apply to apply it.".to_string(),
+            );
+        }
+        None => {
+            lines.push(
+                "No structured patch. Use /resume for raw output, then refine the task."
+                    .to_string(),
+            );
+        }
+    }
+
+    if state.active_goal.is_some() {
+        lines.push("/goal show explains the active stop condition.".to_string());
+    } else {
+        lines.push(
+            "Optional: /goal :nl <done condition> adds a deterministic stop check.".to_string(),
+        );
+    }
+    lines
+}
+
+fn print_next_actions(state: &InteractiveState) {
+    print_box("Next", &next_action_lines(state));
 }
 
 fn format_cost_microusd(microusd: u64) -> String {
@@ -2776,8 +2898,22 @@ fn print_interactive_error(error: &anyhow::Error) {
 }
 
 async fn run_interactive_task(prompt: String, state: &mut InteractiveState) -> Result<()> {
-    println!("▶ task: {prompt}");
-    println!("  lead/reviewer loop running...");
+    print_box(
+        "Task",
+        &[
+            format!("request {}", prompt),
+            format!(
+                "adapter={} mode={} workspace={}",
+                state.adapter_label(),
+                state.apply_label(),
+                env::current_dir()
+                    .map(|path| display_path(&path))
+                    .unwrap_or_else(|_| "?".to_string())
+            ),
+            "lead/reviewer loop running...".to_string(),
+        ],
+    );
+    let apply_requested = state.apply;
     let report = run_report_with_overrides(
         prompt,
         state.apply,
@@ -2788,7 +2924,6 @@ async fn run_interactive_task(prompt: String, state: &mut InteractiveState) -> R
         state.worktree_override,
     )
     .await?;
-    print_interactive_result(&report, state.apply);
     state.record_report(&report);
     // Fresh task at the prompt always resets to a root session so the prompt
     // suffix reflects the new top-level session id rather than a previously
@@ -2796,32 +2931,50 @@ async fn run_interactive_task(prompt: String, state: &mut InteractiveState) -> R
     state.current_session_id = Some(report.task.id.clone());
     state.last_report = Some(report);
     state.refresh_counts();
+    if let Some(report) = state.last_report.as_ref() {
+        print_interactive_result(report, apply_requested);
+    }
     print_status_bar(state);
+    print_next_actions(state);
     Ok(())
 }
 
 fn print_interactive_result(report: &RunReport, apply_requested: bool) {
-    println!(
-        "✓ session {} | verdict={:?} | rounds={} | applied={} | blocked={}",
-        short_id(&report.task.id),
-        report.final_feedback.verdict,
-        report.rounds.len(),
-        report.applied,
-        report.blocked
-    );
+    let mut lines = vec![
+        format!(
+            "session {}  verdict {:?}  rounds {}",
+            short_id(&report.task.id),
+            report.final_feedback.verdict,
+            report.rounds.len()
+        ),
+        format!(
+            "applied={} blocked={} budget_exceeded={}",
+            report.applied, report.blocked, report.budget_exceeded
+        ),
+        format!(
+            "usage input={} output={} total={}",
+            report.usage.input_tokens,
+            report.usage.output_tokens,
+            report.usage.total_tokens()
+        ),
+    ];
+
     if let Some(patch) = &report.final_patch {
-        println!("  patch {} | files={}", patch.id, patch.files.len());
+        lines.push(format!("patch {}  files={}", patch.id, patch.files.len()));
         if report.applied {
-            println!("  applied. Use /rollback to undo the last patch.");
+            lines.push("Applied patch. Use /rollback to undo the last patch.".to_string());
         } else if !apply_requested && !report.blocked {
-            println!("  reviewed patch ready. Use /diff to inspect or /apply to apply it.");
+            lines.push(
+                "reviewed patch ready. Use /diff to inspect or /apply to apply it.".to_string(),
+            );
         }
     } else {
-        println!(
-            "  no structured patch produced. Use /resume {} for raw output.",
+        lines.push(format!(
+            "no structured patch produced. Use /resume {} for raw output.",
             report.task.id
-        );
+        ));
     }
+    print_box("Result", &lines);
 }
 
 async fn handle_interactive_command(command: &str, state: &mut InteractiveState) -> Result<bool> {
@@ -2836,18 +2989,6 @@ async fn handle_interactive_command(command: &str, state: &mut InteractiveState)
         "status" => {
             state.refresh_counts();
             print_interactive_status(state);
-            if let Some(report) = &state.last_report {
-                println!(
-                    "last session={} verdict={:?} patch={}",
-                    report.task.id,
-                    report.final_feedback.verdict,
-                    report
-                        .final_patch
-                        .as_ref()
-                        .map(|patch| patch.id.as_str())
-                        .unwrap_or("-")
-                );
-            }
         }
         "mode" => {
             let mode = parts.next().context("usage: /mode <dry-run|apply>")?;
@@ -5189,6 +5330,13 @@ mod tests {
     fn slash_command_suggestions_ignore_task_text_and_arguments() {
         assert!(command_suggestions("fix /doctor output").is_empty());
         assert!(command_suggestions("/mode dry-run").is_empty());
+    }
+
+    #[test]
+    fn slash_command_suggestions_fall_back_to_description_search() {
+        let suggestions = command_suggestions("/provider");
+
+        assert!(suggestions.iter().any(|spec| spec.command == "/adapter"));
     }
 
     #[test]
