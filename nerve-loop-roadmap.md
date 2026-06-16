@@ -46,7 +46,7 @@ Claude Code와 Codex의 changelog를 벤치마킹해 Nerve의 loop/goal 방향�
 | Step | 항목 | effort | 상태 |
 |---|---|---|---|
 | **S1** | accept-with-nits (등급제 verdict) | S | ✅ **DONE** (codex-verified) |
-| S2 | 탄력적 어댑터 spawn 재시도 | S | ⬜ |
+| **S2** | 탄력적 어댑터 spawn 재시도 | S | ✅ **DONE** (codex-verified) |
 | S3 | fail-loud 컨텍스트 로딩 | S | ⬜ |
 
 ### 🌊 Wave 1 — 검증-게이트 코어 (north star)
@@ -98,3 +98,15 @@ reviewer가 저-severity nit만 남았을 때(`ACCEPT_WITH_NITS` 토큰) 결정�
 - codex 이중 검증이 cargo-green + 메인 리뷰가 놓친 테제 위반 3건을 연쇄로 적발: stop-edge Skipped 우회 → AbortOnConflict apply 게이트 → 나머지 정책+persistence. R4에서 "No BLOCKING".
 - 검증: `cargo test --workspace` 303 green, `clippy -D warnings` clean, codex clean. 회귀 테스트 ~18개.
 - ⚠️ 알려진 제약: **S4(상시 Verifier) 전까진 사실상 무동작** — goal 없으면 Skipped라 nit 수락 안 되고 refine로 강등. 의도된 안전 기본값이며 S4가 실제 Pass를 공급하면 활성화.
+
+### S2 — 탄력적 어댑터 spawn 재시도 (✅ DONE, 2026-06-16)
+
+`SubprocessAdapter`가 `spawn(2)` 일시 실패(EAGAIN/ENOMEM/ETXTBSY/EINTR)에 한해 지수 백오프로 재시도.
+ENOENT/EACCES(바이너리 부재·권한)는 **fail-fast** — 깨진 어댑터를 재시도로 가리지 않음(테제: 검증 게이트 약화 금지).
+
+- `is_transient_spawn_error` (errno→`ErrorKind` 분류), `spawn_with_retry` (제네릭·단위테스트 가능), `spawn_retry_backoff` (오버플로 안전).
+- 설정 노브 `orchestration.adapter_spawn_retries: Option<u32>` → `AdapterLimits`로 `default_adapters_with_limits`에 배선. 기본 2회, `MAX_SPAWN_RETRIES=10` 클램프.
+- **codex 이중 검증이 cargo-green + 메인 리뷰가 놓친 BLOCKING 2건 적발**:
+  (1) `ETXTBSY`는 `ResourceBusy`가 아니라 `ErrorKind::ExecutableFileBusy`로 매핑됨(codex가 `from_raw_os_error`로 실증) → 분류 누락 수정.
+  (2) 무한 재시도 + `1u32 << attempt` 오버플로(attempt≥32 panic) + 백오프가 타임아웃 밖 → 재시도/백오프 상한(shift≤16, per-attempt≤2s) 추가.
+- 검증: `cargo test --workspace` green (어댑터 40 tests, +오버플로/클램프/errno 회귀 5개), `clippy -D warnings` clean.

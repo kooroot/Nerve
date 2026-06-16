@@ -56,6 +56,11 @@ pub struct Orchestration {
     pub adapter_timeout_secs: Option<u64>,
     #[serde(default)]
     pub adapter_max_output_bytes: Option<usize>,
+    // S2: additional spawn attempts on transient OS spawn failures
+    // (EAGAIN/ENOMEM/ETXTBSY/EINTR). None falls back to the adapter default;
+    // Some(0) disables retries.
+    #[serde(default)]
+    pub adapter_spawn_retries: Option<u32>,
     // sec-3 #1: hard ceiling that user `/budget raising` cannot exceed.
     #[serde(default)]
     pub budget_cost_microusd_ceiling: Option<u64>,

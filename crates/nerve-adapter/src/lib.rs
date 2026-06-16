@@ -32,6 +32,31 @@ pub const DEFAULT_ADAPTER_TIMEOUT_SECS: u64 = 300;
 /// Exceeding this kills the child and surfaces `AdapterError::OutputTooLarge`.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Default number of *additional* spawn attempts after the first one when the
+/// OS rejects `spawn(2)` with a transient error (EAGAIN/ENOMEM/ETXTBSY/EINTR).
+/// `2` means up to three total attempts. Non-transient failures (ENOENT,
+/// EACCES) never retry — a missing or non-executable adapter binary must fail
+/// loudly on the first attempt.
+pub const DEFAULT_SPAWN_RETRIES: u32 = 2;
+
+/// Hard ceiling on configured spawn retries. The retry backoff runs *outside*
+/// the adapter wall-clock timeout, so an unbounded retry count could stall the
+/// orchestrator indefinitely on a persistently transient failure. Capping at
+/// `10` bounds worst-case added latency to a few seconds of backoff.
+pub const MAX_SPAWN_RETRIES: u32 = 10;
+
+/// Base backoff between transient spawn retries. The delay grows exponentially
+/// per attempt (`base << attempt`), capped at [`SPAWN_RETRY_BACKOFF_MAX`].
+const SPAWN_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(50);
+
+/// Per-attempt backoff ceiling so a high attempt index cannot produce a
+/// multi-minute sleep.
+const SPAWN_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(2);
+
+/// Shift ceiling guarding `1u32 << shift` against overflow (panics at
+/// `shift >= 32`). `16` already saturates the backoff cap for any sane base.
+const SPAWN_RETRY_SHIFT_CAP: u32 = 16;
+
 #[derive(Debug, Error)]
 pub enum AdapterError {
     #[error("adapter timed out after {secs}s")]
@@ -277,6 +302,7 @@ pub struct SubprocessAdapter {
     args: Vec<String>,
     timeout_secs: u64,
     max_output_bytes: usize,
+    spawn_retries: u32,
 }
 
 impl SubprocessAdapter {
@@ -287,6 +313,7 @@ impl SubprocessAdapter {
             args,
             timeout_secs: DEFAULT_ADAPTER_TIMEOUT_SECS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            spawn_retries: DEFAULT_SPAWN_RETRIES,
         }
     }
 
@@ -299,6 +326,14 @@ impl SubprocessAdapter {
     /// Override the per-stream output cap (bytes) before the child is killed.
     pub fn with_max_output_bytes(mut self, bytes: usize) -> Self {
         self.max_output_bytes = bytes;
+        self
+    }
+
+    /// Override the number of additional spawn attempts on transient OS errors.
+    /// `0` disables retries (single attempt). Clamped to [`MAX_SPAWN_RETRIES`]
+    /// so an over-large config value cannot stall orchestration.
+    pub fn with_spawn_retries(mut self, retries: u32) -> Self {
+        self.spawn_retries = retries.min(MAX_SPAWN_RETRIES);
         self
     }
 
@@ -344,14 +379,32 @@ impl SubprocessAdapter {
         // Detach the child from the parent TTY: stdin null, stdout/stderr piped
         // so we can stream-cap them. Without Stdio::null on stdin, a raw-TTY
         // parent could leak keystrokes into the spawned LLM CLI.
-        let mut child = Command::new(&self.command)
-            .args(args)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to spawn `{}` adapter", self.id))?;
+        //
+        // S2: a transient `spawn(2)` rejection (EAGAIN under fork pressure,
+        // ENOMEM, ETXTBSY while the binary is still being written, EINTR) is
+        // retried with exponential backoff. A missing/non-executable binary
+        // (ENOENT/EACCES) is non-transient and fails immediately.
+        let mut child = spawn_with_retry(
+            || {
+                Command::new(&self.command)
+                    .args(&args)
+                    .current_dir(cwd)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+            },
+            self.spawn_retries,
+            SPAWN_RETRY_BACKOFF_BASE,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to spawn `{}` adapter after {} attempt(s)",
+                self.id,
+                self.spawn_retries.saturating_add(1)
+            )
+        })?;
 
         let stdout_pipe = child
             .stdout
@@ -425,6 +478,82 @@ impl SubprocessAdapter {
             .await;
 
         Ok(stdout)
+    }
+}
+
+/// Classify whether a `spawn(2)` failure is worth retrying.
+///
+/// Transient: the OS could not start the child *right now* but the same argv
+/// might succeed shortly — fork resource exhaustion (`EAGAIN` →
+/// [`std::io::ErrorKind::WouldBlock`]), out of memory (`ENOMEM` →
+/// `OutOfMemory`), the executable being written concurrently (`ETXTBSY` →
+/// `ResourceBusy`), or an interrupted syscall (`EINTR` → `Interrupted`).
+///
+/// Non-transient: anything else, notably a missing binary (`ENOENT` →
+/// `NotFound`) or a non-executable one (`EACCES` → `PermissionDenied`), which
+/// would fail identically on every retry and must surface immediately.
+///
+/// Note the errno→`ErrorKind` mapping: on current Rust `ETXTBSY` becomes
+/// [`std::io::ErrorKind::ExecutableFileBusy`] (verified via `from_raw_os_error`)
+/// rather than `ResourceBusy`, so both are matched — omitting `ExecutableFileBusy`
+/// would make the "binary still being written" case fail fast.
+fn is_transient_spawn_error(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        err.kind(),
+        ErrorKind::WouldBlock          // EAGAIN: fork resource exhaustion
+            | ErrorKind::OutOfMemory   // ENOMEM
+            | ErrorKind::ExecutableFileBusy // ETXTBSY: binary being written
+            | ErrorKind::ResourceBusy  // EBUSY (and ETXTBSY on some platforms)
+            | ErrorKind::Interrupted   // EINTR
+    )
+}
+
+/// Overflow-safe exponential backoff for spawn retry attempt `attempt`.
+///
+/// `1u32 << attempt` panics once `attempt >= 32`, so the shift is capped at
+/// [`SPAWN_RETRY_SHIFT_CAP`] and the result clamped to [`SPAWN_RETRY_BACKOFF_MAX`].
+fn spawn_retry_backoff(attempt: u32, base: Duration) -> Duration {
+    if base.is_zero() {
+        return Duration::ZERO;
+    }
+    let shift = attempt.min(SPAWN_RETRY_SHIFT_CAP);
+    base.saturating_mul(1u32 << shift).min(SPAWN_RETRY_BACKOFF_MAX)
+}
+
+/// Spawn with bounded exponential backoff on transient failures.
+///
+/// Generic over the spawner's `Ok` type so the retry/backoff/classification
+/// logic is unit-testable without fabricating a live [`tokio::process::Child`].
+/// Makes `retries + 1` attempts at most; returns the first success, or the last
+/// error once retries are exhausted or a non-transient error is hit.
+async fn spawn_with_retry<T, F>(
+    mut spawn: F,
+    retries: u32,
+    backoff_base: Duration,
+) -> std::io::Result<T>
+where
+    F: FnMut() -> std::io::Result<T>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match spawn() {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt < retries && is_transient_spawn_error(&err) => {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    retries,
+                    error = %err,
+                    "transient spawn failure; retrying after backoff"
+                );
+                let backoff = spawn_retry_backoff(attempt, backoff_base);
+                if !backoff.is_zero() {
+                    tokio::time::sleep(backoff).await;
+                }
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
     }
 }
 
@@ -618,13 +747,36 @@ fn build_oneshot_prompt(system_prompt: &str, user_prompt: &str) -> String {
 }
 
 pub fn default_adapters(mock: bool) -> Vec<Box<dyn ModelAdapter>> {
-    default_adapters_with_limits(mock, None, None)
+    default_adapters_with_limits(mock, AdapterLimits::default())
+}
+
+/// Tunable spawn guards forwarded from `Orchestration` config to the real
+/// subprocess adapters. Every field is `None` → keep the adapter default, so
+/// older callers stay byte-identical.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdapterLimits {
+    pub timeout_secs: Option<u64>,
+    pub max_output_bytes: Option<usize>,
+    pub spawn_retries: Option<u32>,
+}
+
+impl AdapterLimits {
+    pub fn new(
+        timeout_secs: Option<u64>,
+        max_output_bytes: Option<usize>,
+        spawn_retries: Option<u32>,
+    ) -> Self {
+        Self {
+            timeout_secs,
+            max_output_bytes,
+            spawn_retries,
+        }
+    }
 }
 
 pub fn default_adapters_with_limits(
     mock: bool,
-    timeout_secs: Option<u64>,
-    max_output_bytes: Option<usize>,
+    limits: AdapterLimits,
 ) -> Vec<Box<dyn ModelAdapter>> {
     if mock {
         vec![
@@ -635,28 +787,22 @@ pub fn default_adapters_with_limits(
         vec![
             Box::new(apply_adapter_limits(
                 SubprocessAdapter::claude_code(),
-                timeout_secs,
-                max_output_bytes,
+                limits,
             )),
-            Box::new(apply_adapter_limits(
-                SubprocessAdapter::codex(),
-                timeout_secs,
-                max_output_bytes,
-            )),
+            Box::new(apply_adapter_limits(SubprocessAdapter::codex(), limits)),
         ]
     }
 }
 
-fn apply_adapter_limits(
-    mut adapter: SubprocessAdapter,
-    timeout_secs: Option<u64>,
-    max_output_bytes: Option<usize>,
-) -> SubprocessAdapter {
-    if let Some(secs) = timeout_secs {
+fn apply_adapter_limits(mut adapter: SubprocessAdapter, limits: AdapterLimits) -> SubprocessAdapter {
+    if let Some(secs) = limits.timeout_secs {
         adapter = adapter.with_timeout_secs(secs);
     }
-    if let Some(bytes) = max_output_bytes {
+    if let Some(bytes) = limits.max_output_bytes {
         adapter = adapter.with_max_output_bytes(bytes);
+    }
+    if let Some(retries) = limits.spawn_retries {
+        adapter = adapter.with_spawn_retries(retries);
     }
     adapter
 }
@@ -1177,10 +1323,165 @@ Lead notes before the patch.
 
     #[test]
     fn adapter_limits_are_applied_to_real_adapters() {
-        let adapter = apply_adapter_limits(SubprocessAdapter::codex(), Some(7), Some(11));
+        let adapter = apply_adapter_limits(
+            SubprocessAdapter::codex(),
+            AdapterLimits::new(Some(7), Some(11), Some(5)),
+        );
 
         assert_eq!(adapter.timeout_secs, 7);
         assert_eq!(adapter.max_output_bytes, 11);
+        assert_eq!(adapter.spawn_retries, 5);
+    }
+
+    #[test]
+    fn adapter_limits_default_preserves_adapter_defaults() {
+        let adapter = apply_adapter_limits(SubprocessAdapter::codex(), AdapterLimits::default());
+
+        assert_eq!(adapter.timeout_secs, DEFAULT_ADAPTER_TIMEOUT_SECS);
+        assert_eq!(adapter.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
+        assert_eq!(adapter.spawn_retries, DEFAULT_SPAWN_RETRIES);
+    }
+
+    #[test]
+    fn transient_spawn_errors_are_classified_for_retry() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::OutOfMemory,
+            ErrorKind::ExecutableFileBusy,
+            ErrorKind::ResourceBusy,
+            ErrorKind::Interrupted,
+        ] {
+            assert!(
+                is_transient_spawn_error(&Error::from(kind)),
+                "{kind:?} should be retried"
+            );
+        }
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+        ] {
+            assert!(
+                !is_transient_spawn_error(&Error::from(kind)),
+                "{kind:?} must fail fast"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn etxtbsy_errno_is_classified_transient() {
+        // Guards against the errno→ErrorKind mapping drifting: ETXTBSY (26 on
+        // Linux/macOS) is the real "binary being written" spawn failure and
+        // must be retried. Built from the raw OS error, not a fabricated kind.
+        let err = std::io::Error::from_raw_os_error(libc_etxtbsy());
+        assert!(
+            is_transient_spawn_error(&err),
+            "ETXTBSY mapped to {:?}, which the classifier missed",
+            err.kind()
+        );
+    }
+
+    #[cfg(unix)]
+    fn libc_etxtbsy() -> i32 {
+        // ETXTBSY is 26 on both Linux and macOS/BSD; avoid a libc dep for one
+        // constant. The assertion above fails loudly if a platform differs.
+        26
+    }
+
+    #[test]
+    fn with_spawn_retries_clamps_to_max() {
+        let adapter = SubprocessAdapter::codex().with_spawn_retries(9_999);
+        assert_eq!(adapter.spawn_retries, MAX_SPAWN_RETRIES);
+    }
+
+    #[test]
+    fn spawn_retry_backoff_is_overflow_safe_and_capped() {
+        // Zero base → no sleep.
+        assert_eq!(
+            spawn_retry_backoff(0, Duration::ZERO),
+            Duration::ZERO
+        );
+        // First attempt → base.
+        assert_eq!(
+            spawn_retry_backoff(0, Duration::from_millis(50)),
+            Duration::from_millis(50)
+        );
+        // Huge attempt index must not panic and must clamp to the ceiling.
+        assert_eq!(
+            spawn_retry_backoff(1_000, Duration::from_millis(50)),
+            SPAWN_RETRY_BACKOFF_MAX
+        );
+        assert_eq!(
+            spawn_retry_backoff(u32::MAX, Duration::from_millis(1)),
+            SPAWN_RETRY_BACKOFF_MAX
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_with_retry_recovers_after_transient_failures() {
+        use std::cell::Cell;
+        use std::io::{Error, ErrorKind};
+
+        let attempts = Cell::new(0u32);
+        let result: std::io::Result<&str> = spawn_with_retry(
+            || {
+                let n = attempts.get();
+                attempts.set(n + 1);
+                if n < 2 {
+                    Err(Error::from(ErrorKind::WouldBlock))
+                } else {
+                    Ok("spawned")
+                }
+            },
+            DEFAULT_SPAWN_RETRIES,
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), "spawned");
+        assert_eq!(attempts.get(), 3, "two transient failures then success");
+    }
+
+    #[tokio::test]
+    async fn spawn_with_retry_fails_fast_on_non_transient_error() {
+        use std::cell::Cell;
+        use std::io::{Error, ErrorKind};
+
+        let attempts = Cell::new(0u32);
+        let result: std::io::Result<&str> = spawn_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(Error::from(ErrorKind::NotFound))
+            },
+            5,
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::NotFound);
+        assert_eq!(attempts.get(), 1, "missing binary must not be retried");
+    }
+
+    #[tokio::test]
+    async fn spawn_with_retry_exhausts_retries_then_surfaces_last_error() {
+        use std::cell::Cell;
+        use std::io::{Error, ErrorKind};
+
+        let attempts = Cell::new(0u32);
+        let result: std::io::Result<&str> = spawn_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(Error::from(ErrorKind::ResourceBusy))
+            },
+            2,
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::ResourceBusy);
+        assert_eq!(attempts.get(), 3, "1 initial + 2 retries, all transient");
     }
 
     #[tokio::test]

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerve_adapter::{
-    McpClient, McpRegistry, ModelAdapter, SubprocessAdapter, default_adapters_with_limits,
-    default_write_tool_patterns, scope_mcp_spec_to_allowlist,
+    AdapterLimits, McpClient, McpRegistry, ModelAdapter, SubprocessAdapter,
+    default_adapters_with_limits, default_write_tool_patterns, scope_mcp_spec_to_allowlist,
 };
 use nerve_config::{
     Config, DaemonProtocol, GoalIntent, GoalSpec, McpConfig, PlanStrategy, RpcConfig,
@@ -4865,8 +4865,11 @@ async fn run_report_with_overrides(
 fn adapters_for_config(mock: bool, config: &Config) -> Vec<Box<dyn ModelAdapter>> {
     default_adapters_with_limits(
         mock,
-        config.orchestration.adapter_timeout_secs,
-        config.orchestration.adapter_max_output_bytes,
+        AdapterLimits::new(
+            config.orchestration.adapter_timeout_secs,
+            config.orchestration.adapter_max_output_bytes,
+            config.orchestration.adapter_spawn_retries,
+        ),
     )
 }
 
