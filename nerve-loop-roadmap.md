@@ -60,7 +60,7 @@ Claude Code와 Codex의 changelog를 벤치마킹해 Nerve의 loop/goal 방향�
 ### 🌊 Wave 2 — 조종 가능·지속 루프 (daemon v2)
 | Step | 항목 | effort | 상태 |
 |---|---|---|---|
-| S8 | 라운드 증분 체크포인트 (record_round → .nerve store) | M | ⬜ |
+| S8 | 라운드 증분 체크포인트 (record_round → .nerve store) | M | ✅ |
 | **S9** | 논블로킹 라운드-이음새 데몬 v2 + 라이브 JSONL 스트림 | L | ⬜ |
 | S10 | crossfire advisory → redirect/단락 | M | ⬜ |
 | S11 | 승인-에스컬레이션 지속성 (sticky per run) | S | ⬜ |
@@ -339,3 +339,33 @@ North star(S5, 정밀): 샌드박스는 성공을 **날조하지 않는다**. �
   r6 **ACCEPT_WITH_NITS**(차단 없음): fail-open/fabricated-success 경로 없음 재확인, 범위 축소된 주장 sound 판정.
   유일 nit — 요약표가 `bwrap+seccomp+Landlock`로 top-line 과대(상세는 미구현 명시) → 표를 `Seatbelt / bwrap; raw
   seccomp/Landlock 향후`로 정정(과대광고 제거, 코드 무변경). 수락 게이트(연속 2회 무차단)는 정정 후 HEAD에서 재확인.
+
+### S8 — 라운드 증분 체크포인트 (✅ DONE, 2026-06-17)
+
+기존엔 `Synapse`가 라운드를 **메모리에만** 누적하고, `run_synaptic_loop`/`run_tournament_strategy`가
+끝에서 단 한 번 `RunReport`를 만들고 CLI가 그 후 `save_report`를 1회 호출 → **루프 중간 크래시는
+모든 라운드 진행을 유실**하고, 진행 중 실행의 on-disk 뷰가 없어 S9(논블로킹 데몬 + 라이브 스트림)의
+기질이 부재했다. S8은 완료된 라운드마다 `.nerve/checkpoints/{id}.json`을 원자적으로 써서 그 둘을 해소.
+
+North star(S8, 상속): 체크포인트 쓰기(또는 그 **실패**)는 어떤 패치가 수락/적용되는지, `blocked`/
+`goal_satisfied`를 **절대 바꾸지 못한다**(S7과 동형의 *순수 가산 텔레메트리*). 체크포인트는 구조적으로
+진행-중 산출물이라 크래시 복구된 체크포인트가 **완료/수락된 실행으로 오인될 수 없다**.
+
+- `store.rs`: `RunStatus { Running | Finished }` + `RunCheckpoint { task, selection, status, rounds,
+  updated_at }`(`deny_unknown_fields`). **수락 필드를 의도적으로 전부 생략** — `applied`/`blocked`/
+  `goal_satisfied`/`final_patch` 부재이므로 체크포인트가 수락을 *주장하는 것이 타입 수준에서 불가능*
+  (north star #2). 쓰기 경로는 항상 `Running`만 생산(`Finished`는 S9용 예약 — 미생산이라 doc에 명시).
+  API: `save_checkpoint`(원자적 write_json), `load_checkpoint`, `list_checkpoints`(복구/관측 표면, 부재 dir→빈 Vec),
+  `clear_checkpoint`(멱등 — 부재면 Ok). `ensure_dirs`에 `checkpoints_dir` 추가. **`save_report`가 finalize 시
+  체크포인트를 clear** → "프로세스 종료 후 체크포인트 존재 == 미finalize(중단된) 실행"이라는 깔끔한 복구 신호.
+- `lib.rs`: `Synapse`에 `checkpoint: Option<CheckpointSink { store, task, selection }>` 필드 + `with_checkpoint`
+  생성자(기존 `new`는 `None`이라 모든 기존 호출/테스트 동작 byte-단위 보존). `record_round`는 **락 안에서**
+  in-memory 갱신 + `rounds` 스냅샷을 뜨고 **가드 drop 후** 디스크 I/O(async RwLock을 blocking write에 걸치지 않음).
+  쓰기 실패는 `tracing::warn`만 하고 루프 계속(중단 금지 — 가산 텔레메트리). 두 프로덕션 진입점(consensus·tournament)이
+  `Synapse::with_checkpoint(task, NerveStore::new(&task.cwd), selection)`로 구성(항상-on; CLI store와 같은 `.nerve`를 가리켜
+  finalize clear가 성립; warn-on-fail이라 비쓰기 cwd에서도 안전). `pub use store::{RunCheckpoint, RunStatus}`.
+- 스코프 경계(S9 침범 금지): S8 = 체크포인트 **파일만**. 라이브 JSONL 스트림·논블로킹 데몬·pause/resume/cancel은 S9.
+- 검증: `cargo test --workspace` green (core 159: store 4 [round-trip / save_report-clears / clear 멱등 / list] +
+  Synapse 3 [라운드별 증분 기록 / no-sink 무기록 / **중단 실행이 복구 가능한 체크포인트를 남김** end-to-end] 신규;
+  config 47, cli 49+16+4, adapter 92+1, types 25, tui 13), `clippy -D warnings` clean. 프로덕션 호출처 2곳 모두
+  `task.cwd == store.cwd` 정렬 확인(오펀 없음), `.nerve/`는 gitignore.

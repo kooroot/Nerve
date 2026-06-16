@@ -1,8 +1,9 @@
 use crate::RunReport;
 use anyhow::{Context, Result};
 use chrono::Utc;
+use nerve_config::ProfileSelection;
 use nerve_patch::{ApplyReport, NvPatch};
-use nerve_types::Verdict;
+use nerve_types::{RoundRecord, Task, Verdict};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -61,6 +62,43 @@ pub struct PatchRecord {
     pub applied: bool,
 }
 
+/// Lifecycle marker for a [`RunCheckpoint`]. A checkpoint is only ever written
+/// while a loop is `Running`; the terminal `Finished` state is reserved for a
+/// possible future "the run ended but I want the checkpoint to linger" use and
+/// is never produced by the S8 write path (finalize *clears* the checkpoint
+/// instead — see [`NerveStore::save_report`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    Running,
+    Finished,
+}
+
+/// An explicitly IN-PROGRESS snapshot of a synaptic loop, written once per
+/// completed round so a mid-loop crash leaves the rounds-so-far recoverable on
+/// disk (substrate for S9's nonblocking daemon + live stream).
+///
+/// **Security invariant (S8 north star #2):** a checkpoint is *structurally*
+/// distinct from a finalized [`RunReport`] — it deliberately carries NO
+/// `applied` / `blocked` / `goal_satisfied` / `final_patch` fields. Those exist
+/// only at finalize, so it is impossible for a crash-recovered checkpoint to be
+/// mistaken for a completed/accepted run, and a checkpoint write (or its
+/// failure) can never change which patch the deterministic gate accepts. The
+/// presence of a checkpoint file after process exit means exactly "this run was
+/// interrupted before finalize" — `save_report` removes it on a clean finish.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RunCheckpoint {
+    pub task: Task,
+    pub selection: ProfileSelection,
+    /// `Running` for every checkpoint the loop writes; see [`RunStatus`].
+    pub status: RunStatus,
+    /// Rounds completed so far, in order.
+    pub rounds: Vec<RoundRecord>,
+    /// rfc3339 timestamp of this snapshot (chrono::Utc, as elsewhere in store).
+    pub updated_at: String,
+}
+
 impl NerveStore {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self { cwd: cwd.into() }
@@ -77,7 +115,61 @@ impl NerveStore {
             self.upsert_patch_record(PatchRecord::from_report(report, patch))?;
         }
 
+        // The finalized report supersedes any in-flight checkpoint for this run:
+        // its presence means "still running / interrupted", so a clean finalize
+        // must remove it (idempotent — Ok if it was never written).
+        self.clear_checkpoint(&report.task.id)?;
+
         Ok(())
+    }
+
+    /// Persist an IN-PROGRESS round checkpoint (S8). Atomic write under
+    /// `.nerve/checkpoints/{id}.json`. See [`RunCheckpoint`] for why this can
+    /// never assert acceptance.
+    pub fn save_checkpoint(&self, checkpoint: &RunCheckpoint) -> Result<()> {
+        fs::create_dir_all(self.checkpoints_dir())
+            .with_context(|| format!("failed to create `{}`", self.checkpoints_dir().display()))?;
+        write_json(&self.checkpoint_path(&checkpoint.task.id), checkpoint)
+    }
+
+    /// Load the in-flight checkpoint for `id` (errors if absent — callers that
+    /// tolerate absence should check [`Self::list_checkpoints`] instead).
+    pub fn load_checkpoint(&self, id: &str) -> Result<RunCheckpoint> {
+        read_json(&self.checkpoint_path(id))
+    }
+
+    /// All in-flight / interrupted checkpoints — the recovery + observability
+    /// surface S9's daemon reads to resume or report on running loops.
+    pub fn list_checkpoints(&self) -> Result<Vec<RunCheckpoint>> {
+        let dir = self.checkpoints_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut checkpoints = Vec::new();
+        for entry in fs::read_dir(&dir)
+            .with_context(|| format!("failed to read `{}`", dir.display()))?
+        {
+            let entry = entry?;
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            checkpoints.push(read_json(&entry.path())?);
+        }
+        checkpoints.sort_by(|a: &RunCheckpoint, b| b.updated_at.cmp(&a.updated_at));
+        Ok(checkpoints)
+    }
+
+    /// Remove the checkpoint for `id`. Idempotent: `Ok(())` if already absent,
+    /// so it is safe to call unconditionally at finalize.
+    pub fn clear_checkpoint(&self, id: &str) -> Result<()> {
+        let path = self.checkpoint_path(id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to remove `{}`", path.display()))
+            }
+        }
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
@@ -161,6 +253,8 @@ impl NerveStore {
             .with_context(|| format!("failed to create `{}`", self.session_meta_dir().display()))?;
         fs::create_dir_all(self.patches_dir())
             .with_context(|| format!("failed to create `{}`", self.patches_dir().display()))?;
+        fs::create_dir_all(self.checkpoints_dir())
+            .with_context(|| format!("failed to create `{}`", self.checkpoints_dir().display()))?;
         Ok(())
     }
 
@@ -244,8 +338,16 @@ impl NerveStore {
         self.root_dir().join("patches")
     }
 
+    fn checkpoints_dir(&self) -> PathBuf {
+        self.root_dir().join("checkpoints")
+    }
+
     fn session_path(&self, id: &str) -> PathBuf {
         self.sessions_dir().join(format!("{id}.json"))
+    }
+
+    fn checkpoint_path(&self, id: &str) -> PathBuf {
+        self.checkpoints_dir().join(format!("{id}.json"))
     }
 
     fn session_meta_path(&self, id: &str) -> PathBuf {
@@ -396,7 +498,122 @@ mod tests {
     use crate::RunReport;
     use nerve_config::{PlanStrategy, ProfileSelection, ReviewStrictness};
     use nerve_patch::{FilePatch, NvPatch};
-    use nerve_types::{AgentOutput, ReviewerFeedback, Task};
+    use nerve_types::{AgentOutput, ReviewerFeedback, RoundRecord, Task};
+
+    fn sample_selection() -> ProfileSelection {
+        ProfileSelection {
+            id: None,
+            lead: "lead".to_string(),
+            reviewer: "reviewer".to_string(),
+            review_strictness: ReviewStrictness::Normal,
+            max_refinement_rounds: 1,
+            plan_strategy: PlanStrategy::Single,
+            plan_system_prompt_override: None,
+        }
+    }
+
+    fn sample_round(round: u8) -> RoundRecord {
+        let patch = NvPatch::new(vec![FilePatch::create("created.txt", "created\n")]);
+        RoundRecord {
+            round,
+            lead: AgentOutput::with_patch("lead", "patch", patch),
+            reviewer: ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            check_result: None,
+            patch_sha: None,
+            envelope_id: None,
+        }
+    }
+
+    fn sample_checkpoint(task: &Task, rounds: usize) -> RunCheckpoint {
+        RunCheckpoint {
+            task: task.clone(),
+            selection: sample_selection(),
+            status: RunStatus::Running,
+            rounds: (0..rounds).map(|i| sample_round(i as u8)).collect(),
+            updated_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn checkpoint_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        let task = Task::new("do work", dir.path());
+        let checkpoint = sample_checkpoint(&task, 2);
+
+        store.save_checkpoint(&checkpoint).unwrap();
+        let loaded = store.load_checkpoint(&task.id).unwrap();
+
+        assert_eq!(loaded, checkpoint);
+        assert_eq!(loaded.status, RunStatus::Running);
+        assert_eq!(loaded.rounds.len(), 2);
+    }
+
+    #[test]
+    fn save_report_clears_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        let patch = NvPatch::new(vec![FilePatch::create("created.txt", "created\n")]);
+        let task = Task::new("create file", dir.path());
+        store.save_checkpoint(&sample_checkpoint(&task, 1)).unwrap();
+        assert!(store.load_checkpoint(&task.id).is_ok());
+
+        let report = RunReport {
+            task: task.clone(),
+            selection: sample_selection(),
+            rounds: Vec::new(),
+            crossfire_feedback: Vec::new(),
+            final_output: AgentOutput::with_patch("lead", "patch", patch.clone()),
+            final_feedback: ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            final_patch: Some(patch),
+            events: Vec::new(),
+            usage: Default::default(),
+            budget_exceeded: false,
+            no_progress_exceeded: false,
+            goal_satisfied: None,
+            applied: false,
+            blocked: false,
+        };
+        store.save_report(&report).unwrap();
+
+        // The finalized report supersedes the in-flight checkpoint.
+        assert!(store.load_checkpoint(&task.id).is_err());
+        assert!(store.list_checkpoints().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_checkpoint_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        // Clearing a never-written checkpoint is a no-op success.
+        store.clear_checkpoint("nonexistent").unwrap();
+
+        let task = Task::new("do work", dir.path());
+        store.save_checkpoint(&sample_checkpoint(&task, 1)).unwrap();
+        store.clear_checkpoint(&task.id).unwrap();
+        store.clear_checkpoint(&task.id).unwrap();
+        assert!(store.load_checkpoint(&task.id).is_err());
+    }
+
+    #[test]
+    fn list_checkpoints_returns_in_flight_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        // No directory yet ⇒ empty, not an error.
+        assert!(store.list_checkpoints().unwrap().is_empty());
+
+        let task_a = Task::new("task a", dir.path());
+        let task_b = Task::new("task b", dir.path());
+        store.save_checkpoint(&sample_checkpoint(&task_a, 1)).unwrap();
+        store.save_checkpoint(&sample_checkpoint(&task_b, 3)).unwrap();
+
+        let listed = store.list_checkpoints().unwrap();
+        assert_eq!(listed.len(), 2);
+        let ids: std::collections::HashSet<_> =
+            listed.iter().map(|c| c.task.id.clone()).collect();
+        assert!(ids.contains(&task_a.id));
+        assert!(ids.contains(&task_b.id));
+    }
 
     #[test]
     fn apply_and_rollback_keep_session_history_in_sync() {

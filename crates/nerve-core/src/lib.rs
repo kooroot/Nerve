@@ -49,6 +49,7 @@ pub use rpc::{EmitError, EmitOutcome, RpcBus, RpcError};
 pub use session_fork::{
     ForkConfig, ForkError, ForkOptions, SessionForker, SessionIndexEntry, SessionTree,
 };
+pub use store::{RunCheckpoint, RunStatus};
 pub use ulimit::{UlimitError, apply_ulimit};
 pub use verifier::{
     BUILTIN_VERIFIER_GOAL_ID, DetectedVerifier, PROJECT_VERIFIER_CONSENT_ENV, ResolvedVerifier,
@@ -60,6 +61,24 @@ pub use worktree::{IsolatedRound, OrphanManifestEntry, WorktreeError, WorktreeIs
 pub struct Synapse {
     inner: Arc<RwLock<SynapseState>>,
     events: broadcast::Sender<AgentEvent>,
+    /// S8: when set, each completed round is snapshotted to `.nerve/checkpoints`
+    /// so a mid-loop crash leaves the rounds-so-far recoverable. `None` ⇒ no
+    /// checkpointing, so every existing caller/test keeps its exact prior
+    /// behavior (`Synapse::new`).
+    checkpoint: Option<CheckpointSink>,
+}
+
+/// Turns a [`Synapse::record_round`] call into an on-disk [`store::RunCheckpoint`].
+///
+/// Purely additive telemetry (S8 north star): a checkpoint carries no
+/// acceptance fields and a write failure is logged and swallowed, so it can
+/// never change which patch the deterministic gate accepts nor abort a
+/// run — exactly the S7 "additive telemetry, never weakens the gate" contract.
+#[derive(Debug, Clone)]
+struct CheckpointSink {
+    store: store::NerveStore,
+    task: Task,
+    selection: ProfileSelection,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +169,22 @@ fn resolve_worktree_apply(options: &RunOptions, orchestration: &Orchestration) -
 
 impl Synapse {
     pub fn new(task: Task) -> Self {
+        Self::build(task, None)
+    }
+
+    /// S8: a [`Synapse`] that checkpoints each completed round to
+    /// `.nerve/checkpoints` via `store`. Used by the production loop entry
+    /// points; tests use [`Synapse::new`] to opt out.
+    pub fn with_checkpoint(task: Task, store: store::NerveStore, selection: ProfileSelection) -> Self {
+        let sink = CheckpointSink {
+            store,
+            task: task.clone(),
+            selection,
+        };
+        Self::build(task, Some(sink))
+    }
+
+    fn build(task: Task, checkpoint: Option<CheckpointSink>) -> Self {
         let (events, _) = broadcast::channel(256);
         Self {
             inner: Arc::new(RwLock::new(SynapseState {
@@ -161,6 +196,7 @@ impl Synapse {
                 events: Vec::new(),
             })),
             events,
+            checkpoint,
         }
     }
 
@@ -174,10 +210,38 @@ impl Synapse {
     }
 
     pub async fn record_round(&self, round: RoundRecord) {
-        let mut inner = self.inner.write().await;
-        inner.lead_output = Some(round.lead.clone());
-        inner.reviewer_feedback = Some(round.reviewer.clone());
-        inner.rounds.push(round);
+        // Mutate in-memory state and snapshot the rounds UNDER the lock, then
+        // drop the guard before any (synchronous) disk I/O so we never hold the
+        // async RwLock across a blocking write.
+        let rounds = {
+            let mut inner = self.inner.write().await;
+            inner.lead_output = Some(round.lead.clone());
+            inner.reviewer_feedback = Some(round.reviewer.clone());
+            inner.rounds.push(round);
+            inner.rounds.clone()
+        };
+
+        // S8: persist the in-flight checkpoint. Additive telemetry only — a
+        // write failure is logged and swallowed (never aborts the loop, never
+        // touches acceptance). Cadence is once per completed round (model-call
+        // bounded), and the payload is small + atomic, so the inline sync write
+        // is acceptable here; a dedicated writer task is a future S9 concern.
+        if let Some(sink) = &self.checkpoint {
+            let checkpoint = store::RunCheckpoint {
+                task: sink.task.clone(),
+                selection: sink.selection.clone(),
+                status: store::RunStatus::Running,
+                rounds,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Err(error) = sink.store.save_checkpoint(&checkpoint) {
+                tracing::warn!(
+                    target: "nerve::checkpoint",
+                    task = %sink.task.id,
+                    "round checkpoint write failed: {error:#}"
+                );
+            }
+        }
     }
 
     pub async fn record_crossfire_feedback(&self, feedback: ReviewerFeedback) {
@@ -216,7 +280,11 @@ pub async fn run_synaptic_loop(
         return run_tournament_strategy(task, config, selection, lead, reviewer, options).await;
     }
 
-    let synapse = Synapse::new(task.clone());
+    let synapse = Synapse::with_checkpoint(
+        task.clone(),
+        store::NerveStore::new(&task.cwd),
+        selection.clone(),
+    );
     let (tx, mut rx) = mpsc::channel(1024);
     let event_synapse = synapse.clone();
 
@@ -455,7 +523,11 @@ async fn run_tournament_strategy(
     reviewer: &dyn ModelAdapter,
     options: RunOptions,
 ) -> Result<RunReport> {
-    let synapse = Synapse::new(task.clone());
+    let synapse = Synapse::with_checkpoint(
+        task.clone(),
+        store::NerveStore::new(&task.cwd),
+        selection.clone(),
+    );
     let (tx, mut rx) = mpsc::channel(1024);
     let event_synapse = synapse.clone();
 
@@ -2741,5 +2813,81 @@ mod tests {
         assert_eq!(report.goal_satisfied, Some(false));
         assert!(report.blocked);
         assert!(!report.applied);
+    }
+
+    // --- S8: round-incremental checkpoint -------------------------------------
+
+    fn checkpoint_round(n: u8) -> RoundRecord {
+        let patch = NvPatch::new(vec![FilePatch::create("created.txt", "created\n")]);
+        RoundRecord {
+            round: n,
+            lead: AgentOutput::with_patch("lead", "patch", patch),
+            reviewer: ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            check_result: None,
+            patch_sha: None,
+            envelope_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn record_round_writes_incremental_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("checkpoint me", dir.path());
+        let config = consensus_config();
+        let selection = config.select_profile(&task).unwrap();
+        let store = store::NerveStore::new(dir.path());
+        let synapse = Synapse::with_checkpoint(task.clone(), store.clone(), selection);
+
+        synapse.record_round(checkpoint_round(0)).await;
+        synapse.record_round(checkpoint_round(1)).await;
+
+        let checkpoint = store.load_checkpoint(&task.id).unwrap();
+        assert_eq!(checkpoint.status, RunStatus::Running);
+        assert_eq!(checkpoint.rounds.len(), 2);
+        assert_eq!(checkpoint.rounds[1].round, 1);
+        // A checkpoint is structurally incapable of asserting acceptance: it has
+        // no applied/blocked/goal_satisfied/final_patch fields at all.
+    }
+
+    #[tokio::test]
+    async fn synapse_without_checkpoint_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("no checkpoint", dir.path());
+        let synapse = Synapse::new(task);
+
+        synapse.record_round(checkpoint_round(0)).await;
+
+        // Existing-behavior preservation: `Synapse::new` never touches disk.
+        assert!(!dir.path().join(".nerve").join("checkpoints").exists());
+    }
+
+    #[tokio::test]
+    async fn interrupted_run_leaves_recoverable_checkpoint() {
+        // The MockAdapter pair drives RequestChanges -> LGTM = 2 rounds. The loop
+        // checkpoints each round but never finalizes (only the CLI calls
+        // save_report), so this models a crash before finalize: all completed
+        // rounds must be recoverable from the on-disk checkpoint.
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("add a health endpoint", dir.path());
+        let config = consensus_config();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false))
+            .await
+            .unwrap();
+        assert_eq!(report.rounds.len(), 2);
+
+        let store = store::NerveStore::new(dir.path());
+        let checkpoint = store.load_checkpoint(&report.task.id).unwrap();
+        assert_eq!(checkpoint.status, RunStatus::Running);
+        assert_eq!(checkpoint.rounds.len(), report.rounds.len());
+
+        // Finalizing supersedes (clears) the in-flight checkpoint.
+        store.save_report(&report).unwrap();
+        assert!(store.load_checkpoint(&report.task.id).is_err());
+        assert!(store.list_checkpoints().unwrap().is_empty());
     }
 }
