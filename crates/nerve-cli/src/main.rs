@@ -9,20 +9,21 @@ use nerve_config::{
     RpcConfig,
 };
 use nerve_core::session_fork::{ForkOptions as CoreForkOptions, SessionTree};
-use nerve_core::store::NerveStore;
+use nerve_core::store::{NerveStore, RunCheckpoint};
 use nerve_core::{
     AuditChainState, BudgetAuditEntry, BudgetSnapshot, ChainStatus, DoctorCheck, DoctorStatus,
     ForkConfig as CoreForkConfig, GoalIntentConverter, Mayor, Patrol, PatrolTask, PlanError,
     PROJECT_VERIFIER_CONSENT_ENV, PlanRunOptions, RpcBus, RunOptions, RunReport, SessionForker,
     append_budget_audit_entry, doctor_checks, format_chain_broken,
     project_verifier_consent_from_env, resolve_builtin_verifier, run_plan_mode, run_synaptic_loop,
+    run_synaptic_loop_streaming,
 };
 use nerve_tui::{TuiApp, TuiAppOptions, TuiState};
 use nerve_types::{
-    AgentEvent, McpToolCall, PlanReport, RPC_SCHEMA_VERSION, RpcEnvelope, Task, Verdict,
+    AgentEvent, McpToolCall, PlanReport, RPC_SCHEMA_VERSION, RoundRecord, RpcEnvelope, Task, Verdict,
 };
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
@@ -31,7 +32,8 @@ use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{self, AsyncBufReadExt};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio::task::JoinHandle;
 
 const SURFACE_WIDTH: usize = 78;
 
@@ -4318,6 +4320,9 @@ async fn run_rpc_daemon(
         RpcBus::new(rpc_config, &cwd)
             .with_context(|| "failed to open RPC bus for daemon startup")?,
     );
+    // S9: tracks in-flight (nonblocking) runs so the read loop stays responsive
+    // and shutdown can await them.
+    let registry: RunRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     if print_token {
         // Token surfaces as a typed envelope on stdout (not the bearer text
@@ -4356,8 +4361,15 @@ async fn run_rpc_daemon(
             }
         };
 
-        if let Err(error) =
-            handle_rpc_command(value, apply, mock, bus.clone(), worktree_override).await
+        if let Err(error) = handle_rpc_command(
+            value,
+            apply,
+            mock,
+            bus.clone(),
+            worktree_override,
+            registry.clone(),
+        )
+        .await
         {
             println!(
                 "{}",
@@ -4371,6 +4383,19 @@ async fn run_rpc_daemon(
         if once {
             break;
         }
+    }
+
+    // S9: await every in-flight run before shutting down. This makes `--once`
+    // wait for the spawned run to finish (it no longer blocks the read loop),
+    // ensures a graceful shutdown never drops a running loop mid-flight, and
+    // releases the bus clones held by the run tasks so the `Arc::try_unwrap`
+    // below can reclaim the bus.
+    let handles: Vec<JoinHandle<()>> = match registry.lock() {
+        Ok(mut reg) => reg.drain().map(|(_, handle)| handle).collect(),
+        Err(_) => Vec::new(),
+    };
+    for handle in handles {
+        let _ = handle.await;
     }
 
     // sec-4 #5: tear down the bearer-token file on graceful shutdown so a
@@ -4395,6 +4420,241 @@ fn emit_envelope_line(envelope: &RpcEnvelope) {
 
 fn rpc_envelope(kind: &str, payload: serde_json::Value) -> RpcEnvelope {
     RpcEnvelope::new(kind, payload).with_fresh_metadata()
+}
+
+/// S9: tracks in-flight (nonblocking) run tasks by run-id so the daemon read
+/// loop stays responsive while runs execute, and graceful shutdown can await
+/// them. A plain `std::sync::Mutex` is fine: every critical section is a short
+/// synchronous insert / `retain` / `drain` with no `.await` held across it.
+type RunRegistry = Arc<std::sync::Mutex<HashMap<String, JoinHandle<()>>>>;
+
+/// S9: map a completed round to its live `round.started` + `round.ended`
+/// envelopes (the round-seam signal streamed as each round finishes).
+fn round_seam_envelopes(session_id: &str, round: &RoundRecord) -> (RpcEnvelope, RpcEnvelope) {
+    use nerve_types::rpc_kinds;
+    let started = rpc_envelope(
+        rpc_kinds::ROUND_STARTED,
+        serde_json::json!({ "session_id": session_id, "round": round.round }),
+    );
+    let ended = rpc_envelope(
+        rpc_kinds::ROUND_ENDED,
+        serde_json::json!({
+            "session_id": session_id,
+            "round": round.round,
+            "verdict": round.reviewer.verdict,
+            "check": round.check_result,
+        }),
+    );
+    (started, ended)
+}
+
+/// S9: map an in-flight S8 checkpoint to a `session.status` envelope (served by
+/// the `status` command from the on-disk checkpoints, so it works even across a
+/// daemon restart). A checkpoint carries no acceptance fields, so this can only
+/// ever report progress — never that a run was accepted.
+fn checkpoint_status_envelope(checkpoint: &RunCheckpoint) -> RpcEnvelope {
+    use nerve_types::rpc_kinds;
+    rpc_envelope(
+        rpc_kinds::SESSION_STATUS,
+        serde_json::json!({
+            "session_id": checkpoint.task.id,
+            "prompt": checkpoint.task.prompt,
+            "status": checkpoint.status,
+            "rounds": checkpoint.rounds.len(),
+            "updated_at": checkpoint.updated_at,
+        }),
+    )
+}
+
+/// S9: emit the terminal lifecycle envelopes for a finished run (everything
+/// v1's blocking `prompt` handler emitted EXCEPT `session.started` and the
+/// round seams, which v2 now streams live). Preserves full v1 parity: the
+/// legacy flat-JSON batch, the typed agent stdout chunks, and the typed
+/// budget / patch / session.ended envelopes plus the legacy `session_end` line.
+fn emit_terminal_envelopes(report: &RunReport, bus: &RpcBus) -> Result<()> {
+    use nerve_types::rpc_kinds;
+
+    emit_report_events(report)?;
+
+    for event in &report.events {
+        for envelope in agent_event_to_envelopes(event, &report.selection.lead) {
+            emit_envelope_line(&envelope);
+            let _ = bus.emit(&envelope.kind, envelope.payload.clone());
+        }
+    }
+
+    let budget_envelope = rpc_envelope(
+        rpc_kinds::BUDGET_CHANGED,
+        serde_json::json!({
+            "session_id": report.task.id,
+            "input_tokens": report.usage.input_tokens,
+            "output_tokens": report.usage.output_tokens,
+            "estimated_cost_microusd": report.usage.estimated_cost_microusd,
+            "budget_exceeded": report.budget_exceeded,
+        }),
+    );
+    emit_envelope_line(&budget_envelope);
+    let _ = bus.emit(rpc_kinds::BUDGET_CHANGED, budget_envelope.payload.clone());
+
+    if let Some(patch) = &report.final_patch {
+        let kind = if report.applied {
+            rpc_kinds::PATCH_APPLIED
+        } else {
+            rpc_kinds::PATCH_DISCARDED
+        };
+        let patch_envelope = rpc_envelope(
+            kind,
+            serde_json::json!({
+                "session_id": report.task.id,
+                "patch_id": patch.id,
+                "files": patch.files.len(),
+                "blocked": report.blocked,
+            }),
+        );
+        emit_envelope_line(&patch_envelope);
+        let _ = bus.emit(kind, patch_envelope.payload.clone());
+    }
+
+    let session_ended = rpc_envelope(
+        rpc_kinds::SESSION_ENDED,
+        serde_json::json!({
+            "session_id": report.task.id,
+            "verdict": report.final_feedback.verdict,
+            "applied": report.applied,
+            "blocked": report.blocked,
+            "patch_id": report.final_patch.as_ref().map(|patch| patch.id.clone()),
+        }),
+    );
+    emit_envelope_line(&session_ended);
+    let _ = bus.emit(rpc_kinds::SESSION_ENDED, session_ended.payload.clone());
+
+    // Legacy `session_end` JSON kept for v0.3.0 consumers; v0.5.0 consumers read
+    // the typed envelope above.
+    println!(
+        "{}",
+        serde_json::json!({
+            "type": "session_end",
+            "session_id": report.task.id,
+            "verdict": report.final_feedback.verdict,
+            "applied": report.applied,
+            "blocked": report.blocked,
+            "patch_id": report.final_patch.as_ref().map(|patch| patch.id.clone())
+        })
+    );
+    Ok(())
+}
+
+/// S9: spawn a synaptic-loop run WITHOUT blocking the daemon read loop. Emits
+/// `session.started` immediately, streams `round.started`/`round.ended` live as
+/// each round completes (via the loop's round observer), and emits the terminal
+/// lifecycle envelopes when the run finishes. The run is tracked in `registry`
+/// by run-id so shutdown can await it.
+///
+/// Streaming + checkpoints are read-only telemetry: the run still goes through
+/// the unchanged `run_synaptic_loop` deterministic gate, and nothing here can
+/// auto-apply or fabricate acceptance.
+fn spawn_streaming_run(
+    prompt: String,
+    apply: bool,
+    mock: bool,
+    worktree_override: Option<bool>,
+    bus: Arc<RpcBus>,
+    registry: RunRegistry,
+) -> Result<()> {
+    use nerve_types::rpc_kinds;
+
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let config = Config::load_from(&cwd)?;
+    let mut task = Task::new(prompt, &cwd);
+    task.context_paths = collect_context_paths(&task.prompt, &cwd);
+    let run_id = task.id.clone();
+    // Resolve the profile up front so `session.started` can name lead/reviewer;
+    // the loop recomputes it deterministically (cheap, identical result).
+    let selection = config.select_profile(&task)?;
+
+    let session_started = rpc_envelope(
+        rpc_kinds::SESSION_STARTED,
+        serde_json::json!({
+            "session_id": run_id,
+            "prompt": task.prompt,
+            "lead": selection.lead,
+            "reviewer": selection.reviewer,
+        }),
+    );
+    emit_envelope_line(&session_started);
+    let _ = bus.emit(rpc_kinds::SESSION_STARTED, session_started.payload.clone());
+
+    let (round_tx, mut round_rx) = mpsc::unbounded_channel::<RoundRecord>();
+
+    // STREAMER: forward each live round to round.started + round.ended. Ends
+    // when `round_tx` drops (the loop finished and released the observer).
+    let streamer_bus = bus.clone();
+    let streamer_id = run_id.clone();
+    let streamer = tokio::spawn(async move {
+        while let Some(round) = round_rx.recv().await {
+            let (started, ended) = round_seam_envelopes(&streamer_id, &round);
+            emit_envelope_line(&started);
+            let _ = streamer_bus.emit(&started.kind, started.payload.clone());
+            emit_envelope_line(&ended);
+            let _ = streamer_bus.emit(&ended.kind, ended.payload.clone());
+        }
+    });
+
+    // RUN: drive the streaming loop, persist, then emit terminal envelopes.
+    let run_bus = bus.clone();
+    let run_id_for_task = run_id.clone();
+    let handle = tokio::spawn(async move {
+        let mut options = RunOptions::new(apply);
+        if let Some(spec) = config.orchestration.check_ulimit.as_ref()
+            && !spec.is_empty()
+        {
+            options = options.with_ulimit(core_ulimit_from_config(spec));
+        }
+        if let Some(on) = worktree_override {
+            options = options.with_worktree(on);
+        }
+        let adapters = adapters_for_config(mock, &config);
+        let outcome =
+            run_synaptic_loop_streaming(task, &config, &adapters, options, round_tx).await;
+
+        // The loop has released `round_tx`, so the streamer's channel is now
+        // closed; await it FIRST so every live round seam is flushed to stdout
+        // BEFORE any terminal envelope. This preserves causal ordering on the
+        // JSONL stream (session.started -> round seams -> terminal envelopes);
+        // without it the streamer could still be draining buffered rounds while
+        // `session.ended` is printed, interleaving a round.ended after the end.
+        let _ = streamer.await;
+
+        match outcome {
+            Ok(report) => {
+                if let Err(error) = NerveStore::new(&cwd).save_report(&report) {
+                    eprintln!("warning: failed to persist session report: {error}");
+                }
+                if let Err(error) = emit_terminal_envelopes(&report, &run_bus) {
+                    eprintln!("warning: failed to emit terminal envelopes: {error}");
+                }
+            }
+            Err(error) => {
+                // The run failed before producing a report; surface it on the
+                // same JSONL stream so a consumer is not left waiting forever.
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "error",
+                        "session_id": run_id_for_task,
+                        "message": error.to_string(),
+                    })
+                );
+            }
+        }
+    });
+
+    if let Ok(mut reg) = registry.lock() {
+        // Drop handles for runs that already finished so the map stays bounded.
+        reg.retain(|_, handle| !handle.is_finished());
+        reg.insert(run_id, handle);
+    }
+    Ok(())
 }
 
 /// Convert an [`AgentEvent`] into the Tier 2e envelope kinds expected by
@@ -4434,6 +4694,7 @@ async fn handle_rpc_command(
     mock: bool,
     bus: Arc<RpcBus>,
     worktree_override: Option<bool>,
+    registry: RunRegistry,
 ) -> Result<()> {
     use nerve_types::rpc_kinds;
 
@@ -4443,119 +4704,44 @@ async fn handle_rpc_command(
         .context("missing string field `command`")?;
     match command {
         "prompt" => {
+            // S9: spawn the run WITHOUT blocking the read loop. `session.started`
+            // is emitted immediately, round seams stream live, and the terminal
+            // envelopes are emitted when the run finishes. The deterministic
+            // acceptance gate is unchanged — this only changes WHEN envelopes are
+            // emitted (live vs the old post-hoc replay), never WHETHER a patch is
+            // accepted.
             let prompt = value
                 .get("prompt")
                 .and_then(serde_json::Value::as_str)
                 .context("missing string field `prompt`")?;
-            let report = run_report(prompt.to_string(), apply, mock, worktree_override).await?;
-            emit_report_events(&report)?;
-            // Tier 2e (v0.5.0) lifecycle envelopes: emit through the bus and
-            // also stream them as newline-delimited JSON on stdout so consumers
-            // that don't subscribe to the broadcast channel still observe them.
-            let session_started = rpc_envelope(
-                rpc_kinds::SESSION_STARTED,
-                serde_json::json!({
-                    "session_id": report.task.id,
-                    "prompt": report.task.prompt,
-                    "lead": report.selection.lead,
-                    "reviewer": report.selection.reviewer,
-                }),
-            );
-            emit_envelope_line(&session_started);
-            let _ = bus.emit(rpc_kinds::SESSION_STARTED, session_started.payload.clone());
-
-            for event in &report.events {
-                for envelope in agent_event_to_envelopes(event, &report.selection.lead) {
-                    emit_envelope_line(&envelope);
-                    let _ = bus.emit(&envelope.kind, envelope.payload.clone());
-                }
+            spawn_streaming_run(
+                prompt.to_string(),
+                apply,
+                mock,
+                worktree_override,
+                bus.clone(),
+                registry.clone(),
+            )?;
+        }
+        "status" => {
+            // S9: report in-flight runs from the S8 on-disk checkpoints, so this
+            // works even across a daemon restart. A checkpoint has no acceptance
+            // fields, so `status` can only report progress, never acceptance.
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            let checkpoints = NerveStore::new(&cwd)
+                .list_checkpoints()
+                .with_context(|| "failed to list in-flight run checkpoints")?;
+            for checkpoint in &checkpoints {
+                let envelope = checkpoint_status_envelope(checkpoint);
+                emit_envelope_line(&envelope);
+                let _ = bus.emit(&envelope.kind, envelope.payload.clone());
             }
-
-            // Round.started/ended pair per recorded round. We do not have
-            // per-iter timings from `RunReport` (one-shot RPC) so the envelope
-            // carries the round index only.
-            for round in &report.rounds {
-                let round_started = rpc_envelope(
-                    rpc_kinds::ROUND_STARTED,
-                    serde_json::json!({
-                        "session_id": report.task.id,
-                        "round": round.round,
-                    }),
-                );
-                emit_envelope_line(&round_started);
-                let _ = bus.emit(rpc_kinds::ROUND_STARTED, round_started.payload.clone());
-
-                let round_ended = rpc_envelope(
-                    rpc_kinds::ROUND_ENDED,
-                    serde_json::json!({
-                        "session_id": report.task.id,
-                        "round": round.round,
-                        "verdict": round.reviewer.verdict,
-                        "check": round.check_result,
-                    }),
-                );
-                emit_envelope_line(&round_ended);
-                let _ = bus.emit(rpc_kinds::ROUND_ENDED, round_ended.payload.clone());
-            }
-
-            // Budget envelope: cumulative usage at the end of the session.
-            let budget_envelope = rpc_envelope(
-                rpc_kinds::BUDGET_CHANGED,
-                serde_json::json!({
-                    "session_id": report.task.id,
-                    "input_tokens": report.usage.input_tokens,
-                    "output_tokens": report.usage.output_tokens,
-                    "estimated_cost_microusd": report.usage.estimated_cost_microusd,
-                    "budget_exceeded": report.budget_exceeded,
-                }),
-            );
-            emit_envelope_line(&budget_envelope);
-            let _ = bus.emit(rpc_kinds::BUDGET_CHANGED, budget_envelope.payload.clone());
-
-            // Patch envelope: applied vs discarded.
-            if let Some(patch) = &report.final_patch {
-                let kind = if report.applied {
-                    rpc_kinds::PATCH_APPLIED
-                } else {
-                    rpc_kinds::PATCH_DISCARDED
-                };
-                let patch_envelope = rpc_envelope(
-                    kind,
-                    serde_json::json!({
-                        "session_id": report.task.id,
-                        "patch_id": patch.id,
-                        "files": patch.files.len(),
-                        "blocked": report.blocked,
-                    }),
-                );
-                emit_envelope_line(&patch_envelope);
-                let _ = bus.emit(kind, patch_envelope.payload.clone());
-            }
-
-            let session_ended = rpc_envelope(
-                rpc_kinds::SESSION_ENDED,
-                serde_json::json!({
-                    "session_id": report.task.id,
-                    "verdict": report.final_feedback.verdict,
-                    "applied": report.applied,
-                    "blocked": report.blocked,
-                    "patch_id": report.final_patch.as_ref().map(|patch| patch.id.clone())
-                }),
-            );
-            emit_envelope_line(&session_ended);
-            let _ = bus.emit(rpc_kinds::SESSION_ENDED, session_ended.payload.clone());
-
-            // Legacy `session_end` JSON kept for v0.3.0 consumers; v0.5.0
-            // consumers read the typed envelope above.
+            // A terminal summary line so a consumer knows the listing is complete.
             println!(
                 "{}",
                 serde_json::json!({
-                    "type": "session_end",
-                    "session_id": report.task.id,
-                    "verdict": report.final_feedback.verdict,
-                    "applied": report.applied,
-                    "blocked": report.blocked,
-                    "patch_id": report.final_patch.as_ref().map(|patch| patch.id.clone())
+                    "type": "status_end",
+                    "in_flight": checkpoints.len(),
                 })
             );
         }
@@ -5397,6 +5583,69 @@ mod tests {
         let paths = collect_context_paths("audit crates/nerve-core/src/lib.rs now", Path::new("."));
 
         assert!(paths.contains(&PathBuf::from("crates/nerve-core/src/lib.rs")));
+    }
+
+    // --- S9: live round-seam stream + status helpers --------------------------
+
+    #[test]
+    fn round_seam_envelopes_carry_session_round_and_verdict() {
+        let round = nerve_types::RoundRecord {
+            round: 2,
+            lead: nerve_types::AgentOutput::text("lead", "round 2"),
+            reviewer: nerve_types::ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            check_result: Some(nerve_types::CheckResult::Pass),
+            patch_sha: Some("sha2".to_string()),
+            envelope_id: None,
+        };
+        let (started, ended) = round_seam_envelopes("run-1", &round);
+
+        assert_eq!(started.kind, nerve_types::rpc_kinds::ROUND_STARTED);
+        assert_eq!(started.payload["session_id"], "run-1");
+        assert_eq!(started.payload["round"], 2);
+
+        assert_eq!(ended.kind, nerve_types::rpc_kinds::ROUND_ENDED);
+        assert_eq!(ended.payload["session_id"], "run-1");
+        assert_eq!(ended.payload["round"], 2);
+        assert_eq!(
+            ended.payload["verdict"],
+            serde_json::to_value(round.reviewer.verdict.clone()).unwrap()
+        );
+        assert_eq!(
+            ended.payload["check"],
+            serde_json::to_value(round.check_result.clone()).unwrap()
+        );
+    }
+
+    #[test]
+    fn checkpoint_status_envelope_reports_progress_not_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("in flight", dir.path());
+        let checkpoint = RunCheckpoint {
+            task: task.clone(),
+            selection: nerve_config::ProfileSelection {
+                id: None,
+                lead: "lead".to_string(),
+                reviewer: "reviewer".to_string(),
+                review_strictness: nerve_config::ReviewStrictness::Normal,
+                max_refinement_rounds: 1,
+                plan_strategy: PlanStrategy::Single,
+                plan_system_prompt_override: None,
+            },
+            status: nerve_core::store::RunStatus::Running,
+            rounds: Vec::new(),
+            updated_at: "2026-06-17T00:00:00Z".to_string(),
+        };
+        let envelope = checkpoint_status_envelope(&checkpoint);
+
+        assert_eq!(envelope.kind, nerve_types::rpc_kinds::SESSION_STATUS);
+        assert_eq!(envelope.payload["session_id"], task.id);
+        assert_eq!(envelope.payload["status"], "running");
+        assert_eq!(envelope.payload["rounds"], 0);
+        // North star: a status envelope can NEVER assert acceptance — it is
+        // derived from a checkpoint, which carries no acceptance fields.
+        assert!(envelope.payload.get("applied").is_none());
+        assert!(envelope.payload.get("blocked").is_none());
+        assert!(envelope.payload.get("goal_satisfied").is_none());
     }
 
     #[test]

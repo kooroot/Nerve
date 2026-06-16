@@ -315,6 +315,10 @@ pub mod rpc_kinds {
     pub const MCP_TOOL_INVOKED: &str = "mcp.tool_invoked";
     pub const MCP_TOOL_RESULT: &str = "mcp.tool_result";
     pub const SESSION_FORKED: &str = "session.forked";
+    // S9 — daemon v2: in-flight run summary, served from the S8 round
+    // checkpoints by the `status` command. Additive kind (minor-compatible:
+    // older consumers ignore unknown kinds), NOT a schema-version bump.
+    pub const SESSION_STATUS: &str = "session.status";
 }
 
 /// Output of a `/plan` (Plan mode, read-only analysis) run.

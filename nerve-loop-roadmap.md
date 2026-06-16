@@ -61,7 +61,7 @@ Claude Code와 Codex의 changelog를 벤치마킹해 Nerve의 loop/goal 방향�
 | Step | 항목 | effort | 상태 |
 |---|---|---|---|
 | S8 | 라운드 증분 체크포인트 (record_round → .nerve store) | M | ✅ |
-| **S9** | 논블로킹 라운드-이음새 데몬 v2 + 라이브 JSONL 스트림 | L | ⬜ |
+| **S9** | 논블로킹 라운드-이음새 데몬 v2 + 라이브 JSONL 스트림 | L | ✅ |
 | S10 | crossfire advisory → redirect/단락 | M | ⬜ |
 | S11 | 승인-에스컬레이션 지속성 (sticky per run) | S | ⬜ |
 | S12 | auto-mode 분류기 게이트 (implement↔apply) | M | ⬜ |
@@ -369,3 +369,53 @@ North star(S8, 상속): 체크포인트 쓰기(또는 그 **실패**)는 어떤 
   Synapse 3 [라운드별 증분 기록 / no-sink 무기록 / **중단 실행이 복구 가능한 체크포인트를 남김** end-to-end] 신규;
   config 47, cli 49+16+4, adapter 92+1, types 25, tui 13), `clippy -D warnings` clean. 프로덕션 호출처 2곳 모두
   `task.cwd == store.cwd` 정렬 확인(오펀 없음), `.nerve/`는 gitignore.
+
+### S9 — 논블로킹 라운드-이음새 데몬 v2 + 라이브 JSONL 스트림 (✅ DONE, 2026-06-17)
+
+데몬 v1의 `handle_rpc_command`의 `prompt`는 `run_report`를 **완료까지** 돌린 뒤 끝난 `report.events`/
+`report.rounds`를 사후(post-hoc) envelope로 **재생(replay)** 했다 — 그래서 모든 라운드의
+`round.started`/`round.ended`가 실행이 **다 끝난 후에야** 한꺼번에 나오고(라운드별 타이밍 없음), read 루프는
+실행 내내 `.await`에 **블로킹**돼 진행 중 status/관측이 불가능했다. S9는 둘 다 닫는다: 관측 채널로 라운드
+이음새를 **라이브** 송출 + 실행을 spawn해 read 루프를 반응형으로 유지 + S8 체크포인트를 읽는 `status` 명령.
+
+North star(S9, 상속): 라이브 스트림은 **읽기전용 텔레메트리** — envelope를 송출(또는 송출 실패)해도 어떤
+패치가 결정론적 게이트에 수락되는지, `blocked`/`goal_satisfied`/apply를 **절대 바꾸지 못한다**(S7/S8과 동형의
+*순수 가산 텔레메트리*). 논블로킹 spawn은 auto-apply나 수락 날조 경로를 도입하지 않는다 — 실행은 여전히
+**변경되지 않은** `run_synaptic_loop` 게이트를 통과하고, 데몬은 OBSERVE+persist만 한다.
+
+- **nerve-core**: `Synapse`에 두 번째 선택적 sink `round_observer: Option<mpsc::UnboundedSender<RoundRecord>>`
+  추가(S8의 `CheckpointSink` 패턴 미러). `record_round`는 (락 안에서 in-memory 갱신 + rounds 스냅샷, 가드 drop 후
+  S8 체크포인트 쓰기에 이어) `if let Some(tx) = &self.round_observer { let _ = tx.send(round); }` — **best-effort**:
+  unbounded라 느린 소비자에 절대 블록/await 안 하고, send 에러(수신자 drop)는 무시(S8 warn-and-continue와 동형).
+  생성자 `with_checkpoint_and_observer(task, store, selection, observer)` 추가, `with_checkpoint`는 `None`으로
+  위임(S8 호출/테스트 byte-동일). 공개 진입점 `run_synaptic_loop_streaming(task, config, adapters, options,
+  round_observer)` 추가 — 본문 중복을 피하려 기존 `run_synaptic_loop` 본문을 내부 `run_synaptic_loop_inner(...,
+  observer: Option<...>)`로 추출, 공개 `run_synaptic_loop`은 `None`으로, streaming은 `Some(tx)`로 호출.
+  tournament 분기도 observer를 `run_tournament_strategy` → `with_checkpoint_and_observer`로 배선.
+  `pub use store::{RunCheckpoint, RunStatus}`는 S8에서 이미 노출.
+- **nerve-cli 데몬 v2**: **run 레지스트리** `type RunRegistry = Arc<std::sync::Mutex<HashMap<String,
+  JoinHandle<()>>>>`(run-id=task id 키) — spawn된 핸들을 추적해 drop되지 않게 하고 종료 시 await. `std::sync::Mutex`라
+  짧은 동기 임계구역만(`.await`를 가로질러 잡지 않음). `prompt` 분기는 이제 `spawn_streaming_run`을 호출하고 **즉시
+  반환**(논블로킹): cwd/config/task 구성 → `session.started` 라이브 송출 → `mpsc::unbounded_channel::<RoundRecord>()`
+  생성 → STREAMER 태스크 spawn(`round_rx` 드레인 → 라이브 `round_seam_envelopes`) → RUN 태스크 spawn(adapters/options
+  구성 → `run_synaptic_loop_streaming` → `save_report`[S8 체크포인트 clear] → `emit_terminal_envelopes`; Err면 error
+  envelope; `let _ = streamer.await`) → 핸들을 레지스트리에 삽입(먼저 `reg.retain(|_,h| !h.is_finished())`로 완료된
+  것 청소 → 무한 성장 방지). 새 `status` 분기는 `NerveStore::new(&cwd).list_checkpoints()`를 읽어 in-flight 실행마다
+  `checkpoint_status_envelope`(`session.status` {session_id,prompt,status,rounds,updated_at}) + `{"type":"status_end",
+  "in_flight":N}` 송출 — S8 재사용이라 데몬 재시작을 가로질러도 동작. **종료**: `Arc::try_unwrap(bus)` 전에 레지스트리를
+  드레인하고 모든 run 핸들을 `await`(in-flight 실행 완료 + spawn된 bus 클론 drop → `try_unwrap` 성립; `--once`도 올바름:
+  명령 1개 읽고 break → spawn된 실행 await → 종료). 평문(non-RPC) `run_daemon`은 **의도적으로 미변경**(여전히 블로킹).
+- **nerve-types**: `rpc_kinds`에 **가산 const** `SESSION_STATUS = "session.status"` 1개만 추가 — 스키마 **bump 아님**
+  (`RPC_SCHEMA_VERSION` 1.2.0 유지; payload/envelope SHAPE 변경이 아니라 const 추가는 "구버전 소비자는 모르는 kind 무시"
+  규칙에 minor-호환). 라운드 이음새는 기존 `ROUND_STARTED`/`ROUND_ENDED`를 재사용 — `RoundRecord`(이미 Serialize)를
+  관측 채널로 흘려 와이어 변경(AgentEvent 신규 variant) 회피.
+- 스코프 경계(과욕 금지): S9 = 논블로킹 spawn + **라이브** 라운드 이음새 스트림 + `status`만. **per-run cancel /
+  bulk cancel / Conductor 라이브 상태 UI = S15**(레지스트리는 핸들 추적·종료 await용으로 포함하되, 라운드-이음새
+  cancel-token은 S15로 의도적 연기). **crossfire redirect = S10**. 같은 cwd 동시 `prompt` 2건의 apply 충돌 회피는
+  S14 원장의 관심사 — 결정론적 게이트 + worktree-apply가 실행별 정합성을 이미 보장.
+- 검증: `cargo test --workspace` green (core 161: streaming 2 [`streaming_loop_emits_each_round_live` —
+  unbounded 채널 드레인 → 라운드 0,1 2개 / `record_round_observer_send_error_is_ignored` — 수신자 drop 후 패닉
+  없이 state·체크포인트 여전히 갱신] 신규; cli 51: 2 [`round_seam_envelopes_carry_session_round_and_verdict` /
+  `checkpoint_status_envelope_reports_progress_not_acceptance` — applied/blocked/goal_satisfied 키 부재 단언] 신규;
+  config 47, adapter 92+1, types 25, tui 13), `clippy --workspace --all-targets -- -D warnings` exit 0.
+  프로덕션 run_synaptic_loop 호출처 정합 + 종료 시 bus 클론 drop 순서(핸들 await 후 `try_unwrap`) 확인.

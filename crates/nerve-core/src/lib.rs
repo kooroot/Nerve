@@ -66,6 +66,13 @@ pub struct Synapse {
     /// checkpointing, so every existing caller/test keeps its exact prior
     /// behavior (`Synapse::new`).
     checkpoint: Option<CheckpointSink>,
+    /// S9: when set, each completed round is forwarded LIVE to this observer so
+    /// a daemon can stream round seams as they happen instead of replaying from
+    /// the final `RunReport`. Best-effort + unbounded: a send error (receiver
+    /// dropped) is ignored and the send never blocks, so it can NEVER stall or
+    /// abort the loop nor influence acceptance (read-only telemetry, same
+    /// contract as the S8 checkpoint and the S7 progress signal).
+    round_observer: Option<mpsc::UnboundedSender<RoundRecord>>,
 }
 
 /// Turns a [`Synapse::record_round`] call into an on-disk [`store::RunCheckpoint`].
@@ -169,22 +176,38 @@ fn resolve_worktree_apply(options: &RunOptions, orchestration: &Orchestration) -
 
 impl Synapse {
     pub fn new(task: Task) -> Self {
-        Self::build(task, None)
+        Self::build(task, None, None)
     }
 
     /// S8: a [`Synapse`] that checkpoints each completed round to
-    /// `.nerve/checkpoints` via `store`. Used by the production loop entry
-    /// points; tests use [`Synapse::new`] to opt out.
+    /// `.nerve/checkpoints` via `store`. Used by the non-streaming production
+    /// loop entry point; tests use [`Synapse::new`] to opt out.
     pub fn with_checkpoint(task: Task, store: store::NerveStore, selection: ProfileSelection) -> Self {
+        Self::with_checkpoint_and_observer(task, store, selection, None)
+    }
+
+    /// S9: like [`Synapse::with_checkpoint`] but ALSO forwards each completed
+    /// round live to `round_observer` (best-effort, see the field doc). Used by
+    /// the streaming daemon entry point.
+    pub fn with_checkpoint_and_observer(
+        task: Task,
+        store: store::NerveStore,
+        selection: ProfileSelection,
+        round_observer: Option<mpsc::UnboundedSender<RoundRecord>>,
+    ) -> Self {
         let sink = CheckpointSink {
             store,
             task: task.clone(),
             selection,
         };
-        Self::build(task, Some(sink))
+        Self::build(task, Some(sink), round_observer)
     }
 
-    fn build(task: Task, checkpoint: Option<CheckpointSink>) -> Self {
+    fn build(
+        task: Task,
+        checkpoint: Option<CheckpointSink>,
+        round_observer: Option<mpsc::UnboundedSender<RoundRecord>>,
+    ) -> Self {
         let (events, _) = broadcast::channel(256);
         Self {
             inner: Arc::new(RwLock::new(SynapseState {
@@ -197,6 +220,7 @@ impl Synapse {
             })),
             events,
             checkpoint,
+            round_observer,
         }
     }
 
@@ -210,6 +234,11 @@ impl Synapse {
     }
 
     pub async fn record_round(&self, round: RoundRecord) {
+        // S9: clone the round for the live observer BEFORE it is moved into the
+        // in-memory state (only when an observer is attached, so the no-stream
+        // path pays nothing).
+        let observer_round = self.round_observer.as_ref().map(|_| round.clone());
+
         // Mutate in-memory state and snapshot the rounds UNDER the lock, then
         // drop the guard before any (synchronous) disk I/O so we never hold the
         // async RwLock across a blocking write.
@@ -242,6 +271,14 @@ impl Synapse {
                 );
             }
         }
+
+        // S9: forward the completed round to the live observer. Best-effort:
+        // the unbounded send never blocks, and a send error (the daemon's
+        // receiver was dropped) is intentionally ignored — streaming is
+        // read-only telemetry and must never stall or abort the loop.
+        if let (Some(observer), Some(round)) = (&self.round_observer, observer_round) {
+            let _ = observer.send(round);
+        }
     }
 
     pub async fn record_crossfire_feedback(&self, feedback: ReviewerFeedback) {
@@ -265,7 +302,33 @@ pub async fn run_synaptic_loop(
     task: Task,
     config: &Config,
     adapters: &[Box<dyn ModelAdapter>],
+    options: RunOptions,
+) -> Result<RunReport> {
+    run_synaptic_loop_inner(task, config, adapters, options, None).await
+}
+
+/// S9: like [`run_synaptic_loop`] but forwards each completed round LIVE to
+/// `round_observer` so a daemon can stream round seams as they happen instead
+/// of replaying them from the final `RunReport`. The observer is read-only
+/// telemetry (see [`Synapse`]'s `round_observer` field) — a send failure is
+/// ignored and the send never blocks, so it can NEVER affect the deterministic
+/// acceptance gate.
+pub async fn run_synaptic_loop_streaming(
+    task: Task,
+    config: &Config,
+    adapters: &[Box<dyn ModelAdapter>],
+    options: RunOptions,
+    round_observer: mpsc::UnboundedSender<RoundRecord>,
+) -> Result<RunReport> {
+    run_synaptic_loop_inner(task, config, adapters, options, Some(round_observer)).await
+}
+
+async fn run_synaptic_loop_inner(
+    task: Task,
+    config: &Config,
+    adapters: &[Box<dyn ModelAdapter>],
     mut options: RunOptions,
+    round_observer: Option<mpsc::UnboundedSender<RoundRecord>>,
 ) -> Result<RunReport> {
     // S4: when no explicit `/goal` is set, activate the opted-in built-in
     // verifier so the deterministic gate produces a real Pass/Fail instead of
@@ -277,13 +340,23 @@ pub async fn run_synaptic_loop(
     let lead = find_adapter(adapters, &selection.lead)?;
     let reviewer = find_adapter(adapters, &selection.reviewer)?;
     if matches!(config.orchestration.default_strategy, Strategy::Tournament) {
-        return run_tournament_strategy(task, config, selection, lead, reviewer, options).await;
+        return run_tournament_strategy(
+            task,
+            config,
+            selection,
+            lead,
+            reviewer,
+            options,
+            round_observer,
+        )
+        .await;
     }
 
-    let synapse = Synapse::with_checkpoint(
+    let synapse = Synapse::with_checkpoint_and_observer(
         task.clone(),
         store::NerveStore::new(&task.cwd),
         selection.clone(),
+        round_observer,
     );
     let (tx, mut rx) = mpsc::channel(1024);
     let event_synapse = synapse.clone();
@@ -522,11 +595,13 @@ async fn run_tournament_strategy(
     lead: &dyn ModelAdapter,
     reviewer: &dyn ModelAdapter,
     options: RunOptions,
+    round_observer: Option<mpsc::UnboundedSender<RoundRecord>>,
 ) -> Result<RunReport> {
-    let synapse = Synapse::with_checkpoint(
+    let synapse = Synapse::with_checkpoint_and_observer(
         task.clone(),
         store::NerveStore::new(&task.cwd),
         selection.clone(),
+        round_observer,
     );
     let (tx, mut rx) = mpsc::channel(1024);
     let event_synapse = synapse.clone();
@@ -2889,5 +2964,57 @@ mod tests {
         store.save_report(&report).unwrap();
         assert!(store.load_checkpoint(&report.task.id).is_err());
         assert!(store.list_checkpoints().unwrap().is_empty());
+    }
+
+    // --- S9: live round-seam stream -------------------------------------------
+
+    #[tokio::test]
+    async fn streaming_loop_emits_each_round_live() {
+        // MockAdapter drives RequestChanges -> LGTM = 2 rounds; the streaming
+        // entry point must forward each completed round to the observer (the
+        // sender is dropped when the loop ends, so draining terminates).
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("add a health endpoint", dir.path());
+        let config = consensus_config();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+        let (tx, mut rx) = mpsc::unbounded_channel::<RoundRecord>();
+
+        let report =
+            run_synaptic_loop_streaming(task, &config, &adapters, RunOptions::new(false), tx)
+                .await
+                .unwrap();
+
+        let mut streamed = Vec::new();
+        while let Some(round) = rx.recv().await {
+            streamed.push(round);
+        }
+        assert_eq!(streamed.len(), report.rounds.len());
+        assert_eq!(streamed.len(), 2);
+        assert_eq!(streamed[0].round, 0);
+        assert_eq!(streamed[1].round, 1);
+    }
+
+    #[tokio::test]
+    async fn record_round_observer_send_error_is_ignored() {
+        // A dropped receiver makes every observer send fail — the loop must
+        // treat that as a no-op (read-only telemetry): in-memory state and the
+        // S8 checkpoint still update, and record_round does not panic/abort.
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("observer dropped", dir.path());
+        let config = consensus_config();
+        let selection = config.select_profile(&task).unwrap();
+        let store = store::NerveStore::new(dir.path());
+        let (tx, rx) = mpsc::unbounded_channel::<RoundRecord>();
+        drop(rx);
+        let synapse =
+            Synapse::with_checkpoint_and_observer(task.clone(), store.clone(), selection, Some(tx));
+
+        synapse.record_round(checkpoint_round(0)).await;
+
+        assert_eq!(synapse.rounds().await.len(), 1);
+        assert_eq!(store.load_checkpoint(&task.id).unwrap().rounds.len(), 1);
     }
 }
