@@ -448,7 +448,10 @@ impl FilePatch {
         }
     }
 
-    fn is_noop(&self) -> bool {
+    /// Whether this file patch changes nothing: identical content and not a
+    /// rename. Used to skip empty entries when summarizing a patch (e.g. the S12
+    /// auto-mode classifier counts only files that effect a real change).
+    pub fn is_noop(&self) -> bool {
         self.original == self.modified && !matches!(self.operation, FileOperation::Rename { .. })
     }
 }

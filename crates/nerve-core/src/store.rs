@@ -643,6 +643,7 @@ mod tests {
             goal_satisfied: None,
             applied: false,
             blocked: false,
+            apply_classification: None,
         };
         store.save_report(&report).unwrap();
 
@@ -714,6 +715,7 @@ mod tests {
             goal_satisfied: None,
             applied: false,
             blocked: false,
+            apply_classification: None,
         };
         let store = NerveStore::new(dir.path());
         store.save_report(&report).unwrap();
@@ -758,6 +760,7 @@ mod tests {
             goal_satisfied: None,
             applied: false,
             blocked: false,
+            apply_classification: None,
         };
         let store = NerveStore::new(dir.path());
         store.save_report(&report).unwrap();

@@ -122,6 +122,13 @@ pub struct Orchestration {
     // weaken the deterministic acceptance gate.
     #[serde(default)]
     pub crossfire_action: CrossfireAction,
+    // S12: auto-mode classifier gate. A DETERMINISTIC patch-risk classifier that
+    // can only DOWNGRADE a would-be apply to dry-run (implement) when the final
+    // patch looks risky — it never upgrades dry-run→apply and never weakens the
+    // deterministic acceptance gate. Defaults to `off` → byte-identical to today
+    // (the operator's `--apply`/grant alone decides). Rejection-direction only.
+    #[serde(default)]
+    pub apply_classifier: ApplyClassifierConfig,
 }
 
 /// S4: how the built-in verifier behaves when a run has no explicit `/goal`
@@ -794,6 +801,133 @@ impl CrossfireAction {
     }
 }
 
+/// S12: how the deterministic auto-mode classifier treats a run's final patch.
+///
+/// Defaults to [`Off`](ApplyClassifierMode::Off): no classification, and the
+/// apply decision is exactly the operator's (`--apply` or an S11 grant) AND the
+/// deterministic gate — byte-identical to pre-S12.
+///
+/// The classifier is REJECTION-DIRECTION ONLY and monotone: it can only ever
+/// turn a would-be APPLY into a dry-run (implement) when the patch looks risky —
+/// it NEVER turns a dry-run into an apply, and it NEVER touches `blocked` /
+/// `goal_satisfied`. So even at its most aggressive it can only make Nerve *more*
+/// conservative; a misclassification can over-protect (operator re-applies
+/// manually) but can never fabricate an apply the operator did not request.
+/// (Roadmap anti-pattern #1: risky auto-execution is a loud opt-in, never a
+/// default; LLM opinion is never the gate — this classifier is deterministic.)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyClassifierMode {
+    /// Disabled (today's behavior, byte-identical): the patch is never inspected
+    /// and the apply decision is unchanged.
+    #[default]
+    Off,
+    /// Classify the final patch and record the risk + reasons in the run report
+    /// (telemetry only, like the S7 progress signal). The apply gate is UNCHANGED
+    /// — a High-risk classification is surfaced but does not veto apply.
+    Advisory,
+    /// Classify the final patch and, when it is High risk, DOWNGRADE a would-be
+    /// apply to a dry-run (implement). Only ever removes apply permission; never
+    /// grants it, never affects `blocked`/`goal_satisfied`.
+    Enforce,
+}
+
+impl ApplyClassifierMode {
+    /// Whether a classification should be computed at all (`Advisory` or
+    /// `Enforce`). `Off` skips classification entirely.
+    pub fn classifies(&self) -> bool {
+        matches!(self, Self::Advisory | Self::Enforce)
+    }
+
+    /// Whether a High-risk classification may DOWNGRADE a would-be apply to a
+    /// dry-run (true only for `Enforce`).
+    pub fn enforces(&self) -> bool {
+        matches!(self, Self::Enforce)
+    }
+}
+
+/// S12: configuration for the deterministic auto-mode classifier gate.
+///
+/// All thresholds describe when a patch is "High risk" enough to warrant a
+/// downgrade (in `Enforce`) or a warning (in `Advisory`). The classification is
+/// computed from the final patch alone — file count, total changed lines, risky
+/// touched paths, and inherently risky operations (delete/rename) — so it is
+/// fully deterministic and adds no LLM call to the apply path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyClassifierConfig {
+    #[serde(default)]
+    pub mode: ApplyClassifierMode,
+    /// A patch touching MORE than this many (non-noop) files is High risk.
+    #[serde(default = "default_apply_classifier_max_files")]
+    pub max_files: usize,
+    /// A patch changing MORE than this many total lines (added + removed across
+    /// all files) is High risk.
+    #[serde(default = "default_apply_classifier_max_lines")]
+    pub max_lines: usize,
+    /// Glob patterns (matched against each touched path, relative to the task
+    /// cwd) that mark a patch High risk regardless of size — e.g. lockfiles, CI
+    /// config, build manifests, dotenv. Matched with `globset`.
+    #[serde(default = "default_apply_classifier_risky_globs")]
+    pub risky_path_globs: Vec<String>,
+    /// When true, a patch containing a file delete or rename is High risk
+    /// regardless of size (these are the most destructive operations).
+    #[serde(default = "default_apply_classifier_flag_destructive_ops")]
+    pub flag_destructive_ops: bool,
+}
+
+impl Default for ApplyClassifierConfig {
+    fn default() -> Self {
+        Self {
+            mode: ApplyClassifierMode::default(),
+            max_files: default_apply_classifier_max_files(),
+            max_lines: default_apply_classifier_max_lines(),
+            risky_path_globs: default_apply_classifier_risky_globs(),
+            flag_destructive_ops: default_apply_classifier_flag_destructive_ops(),
+        }
+    }
+}
+
+impl ApplyClassifierConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.mode.classifies() && self.max_files == 0 && self.max_lines == 0 {
+            anyhow::bail!(
+                "apply_classifier: max_files and max_lines cannot both be 0 when the classifier is enabled"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn default_apply_classifier_max_files() -> usize {
+    25
+}
+
+fn default_apply_classifier_max_lines() -> usize {
+    800
+}
+
+fn default_apply_classifier_flag_destructive_ops() -> bool {
+    true
+}
+
+fn default_apply_classifier_risky_globs() -> Vec<String> {
+    [
+        "**/Cargo.lock",
+        "**/package-lock.json",
+        "**/pnpm-lock.yaml",
+        "**/yarn.lock",
+        "**/go.sum",
+        "**/.github/**",
+        "**/.env*",
+        "**/Dockerfile",
+        "**/Makefile",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         Self::load_from(env::current_dir().context("failed to read current directory")?)
@@ -909,6 +1043,10 @@ impl Config {
             .builtin_verifier
             .validate()
             .map_err(|e| anyhow::anyhow!("orchestration.builtin_verifier invalid: {e}"))?;
+        self.orchestration
+            .apply_classifier
+            .validate()
+            .map_err(|e| anyhow::anyhow!("orchestration.apply_classifier invalid: {e}"))?;
         if self.roles.architect.trim().is_empty() {
             anyhow::bail!("roles.architect must not be empty");
         }
@@ -2260,5 +2398,114 @@ mod tests {
             assert_eq!(config.orchestration.crossfire_action.redirects(), redirects);
             assert_eq!(config.orchestration.crossfire_action.halts(), halts);
         }
+    }
+
+    #[test]
+    fn apply_classifier_defaults_off() {
+        // A legacy config without an `apply_classifier` key parses with the
+        // classifier disabled, so the apply decision stays byte-identical.
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        let ac = &config.orchestration.apply_classifier;
+        assert_eq!(ac.mode, ApplyClassifierMode::Off);
+        assert!(!ac.mode.classifies());
+        assert!(!ac.mode.enforces());
+        // Defaults are populated even when the key is absent.
+        assert_eq!(ac.max_files, 25);
+        assert_eq!(ac.max_lines, 800);
+        assert!(ac.flag_destructive_ops);
+        assert!(!ac.risky_path_globs.is_empty());
+    }
+
+    #[test]
+    fn apply_classifier_round_trips_each_variant() {
+        for (token, expected, classifies, enforces) in [
+            ("off", ApplyClassifierMode::Off, false, false),
+            ("advisory", ApplyClassifierMode::Advisory, true, false),
+            ("enforce", ApplyClassifierMode::Enforce, true, true),
+        ] {
+            let config = Config::from_json_str(&format!(
+                r#"{{
+                  "orchestration": {{
+                    "default_strategy": "consensus",
+                    "max_refinement_rounds": 2,
+                    "conflict_policy": "lead_priority",
+                    "apply_classifier": {{ "mode": "{token}", "max_files": 10, "max_lines": 200 }}
+                  }},
+                  "roles": {{ "architect": "claude-code", "reviewer": "codex" }},
+                  "profiles": []
+                }}"#
+            ))
+            .unwrap();
+            let ac = &config.orchestration.apply_classifier;
+            assert_eq!(ac.mode, expected);
+            assert_eq!(ac.mode.classifies(), classifies);
+            assert_eq!(ac.mode.enforces(), enforces);
+            assert_eq!(ac.max_files, 10);
+            assert_eq!(ac.max_lines, 200);
+        }
+    }
+
+    #[test]
+    fn apply_classifier_rejects_unknown_fields() {
+        // deny_unknown_fields guards against a typo'd key silently leaving the
+        // classifier mis-tuned (e.g. "maxfiles" leaving max_files at its default).
+        let err = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority",
+                "apply_classifier": { "mode": "enforce", "maxfiles": 3 }
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn apply_classifier_validate_rejects_both_thresholds_zero_when_enabled() {
+        // An enabled classifier with both size thresholds at 0 could never flag a
+        // patch on size — a likely misconfiguration; validate() rejects it.
+        let err = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority",
+                "apply_classifier": { "mode": "enforce", "max_files": 0, "max_lines": 0 }
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        );
+        assert!(err.is_err());
+
+        // The same all-zero thresholds are fine when the classifier is Off.
+        let ok = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority",
+                "apply_classifier": { "mode": "off", "max_files": 0, "max_lines": 0 }
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        );
+        assert!(ok.is_ok());
     }
 }

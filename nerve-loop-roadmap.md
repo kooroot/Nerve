@@ -64,7 +64,7 @@ Claude Code와 Codex의 changelog를 벤치마킹해 Nerve의 loop/goal 방향�
 | **S9** | 논블로킹 라운드-이음새 데몬 v2 + 라이브 JSONL 스트림 | L | ✅ |
 | S10 | crossfire advisory → redirect/단락 | M | ✅ |
 | S11 | 승인-에스컬레이션 지속성 (sticky per run) | S | ✅ |
-| S12 | auto-mode 분류기 게이트 (implement↔apply) | M | ⬜ |
+| S12 | auto-mode 분류기 게이트 (implement↔apply) | M | ✅ |
 
 ### 🌊 Wave 3 — plan/goal 핸드오프 + fleet
 | Step | 항목 | effort | 상태 |
@@ -532,3 +532,51 @@ North star(S11, 반드시 유지): (1) 게이트 권위 = 인-메모리 `ApplyCo
   엔트리는 다음 spawn/shutdown까지 레지스트리에 남으므로 존재만으로 부족, `is_finished` 가드가 계약을 강제).
   테스트 `approve_grants_only_in_flight_runs`(finished→무grant·consent불변, unknown→무grant, in-flight→grant·
   consent flip) 추가(cli 51→52).
+
+### S12 — auto-mode 분류기 게이트 (implement↔apply) (✅ DONE, 2026-06-17)
+
+Codex "auto" 승인 모드 / Claude Code plan↔auto-accept 벤치마크. 운영자가 매 run마다 dry-run(implement)
+vs apply를 손으로 고르는 대신, **결정론적 분류기**가 최종 패치의 위험도를 보고 모드를 정한다. 단,
+north star를 지키도록 **거부-방향/단조(monotone)** 로만: 분류기는 would-be apply를 dry-run으로 **내릴**
+수만 있고(위험 패치 veto), dry-run을 apply로 **절대 올리지 못하며**, `blocked`/`goal_satisfied`를 절대
+건드리지 않는다. 기본값 **Off** → S12 이전과 byte-identical.
+
+**핵심 설계 결정**: LLM 분류기(위험 의견으로 apply 자동 승급 = anti-pattern #1 + "LLM 의견은 게이트
+아님" 위반)를 **기각**하고 **결정론적 패치-위험 분류기**를 채택. 최종 패치(`NvPatch`)만 읽어 결정 —
+(1) non-noop 파일 수 > `max_files`, (2) 총 변경 라인(+/- from unified diff) > `max_lines`, (3) `risky_path_globs`
+(globset; lockfile/CI/.github/.env/Dockerfile/Makefile 기본) 매칭, (4) `flag_destructive_ops`면 Delete/Rename.
+하나라도 걸리면 High. LLM 호출 없음 → 비용·지연 0, 완전 테스트 가능. 오분류는 **과보호**(운영자가 수동
+재적용)일 뿐 절대 날조 apply 불가.
+
+**불변식(load-bearing, codex가 적대 검증)**: `apply_classifier_decision(want_apply, patch, cfg) ->
+(allow_apply, classification)`에서 **`allow_apply <= want_apply` 항상 성립**(allow ⇒ want; 절대 업그레이드
+없음). `want_apply`는 기존 `options.apply_consented() && !blocked` 그대로; 분류기는 그 위에 AND로만 얹힘.
+- Off → `(want_apply, None)` byte-identical.
+- Advisory → `(want_apply, Some(..))` 텔레메트리만(게이트 불변; High여도 veto 안 함).
+- Enforce → `want_apply && High`일 때만 veto(`allow_apply=false`, `downgraded=true`); 그 외 결정 불변.
+  `want_apply=false`(dry-run/blocked)면 High여도 그대로 false(내릴 게 없음, `downgraded=false`).
+
+- `nerve-config`: `ApplyClassifierMode { Off(기본) | Advisory | Enforce }`(snake_case) + `classifies()`
+  (Advisory|Enforce) / `enforces()`(Enforce) 헬퍼. `ApplyClassifierConfig { mode, max_files(25), max_lines(800),
+  risky_path_globs(기본 9개), flag_destructive_ops(true) }`(`deny_unknown_fields`) + `validate()`(enabled인데
+  max_files·max_lines 둘 다 0이면 reject). `Orchestration.apply_classifier`(`#[serde(default)]`) + Config.validate
+  배선. 테스트 config 49→53(defaults-off / 3-variant round-trip / deny_unknown / validate-both-zero).
+- `nerve-core`: `globset.workspace=true` 추가. `ApplyRisk { Low | High }`, `ApplyClassification { risk, reasons,
+  files_touched, lines_changed, downgraded }`(`is_high()`), `RunReport.apply_classification: Option<..>`
+  (`#[serde(default)]` → 구버전 리포트 byte-identical). 순수 fn `classify_apply`(None/noop=Low),
+  `changed_line_count`(unified diff +/- 카운트), `build_risky_glob_set`(불량 glob은 자기만 skip, 전체 apply 경로
+  안 죽임), `apply_classifier_decision`(불변식 보유). **두 apply 사이트**(consensus+tournament) `want_apply` 계산
+  후 `apply_classifier_decision`로 `allow_apply` 도출 → `apply_final_patch(..., allow_apply, ...)`. 테스트
+  core 175→185(None/noop=Low / small=Low / 각 위험신호 High[files·lines·glob(`**/Cargo.lock`이 bare `Cargo.lock`
+  매칭 검증)·.github·delete] / off-byte-identical / advisory-no-veto / enforce-downgrades-only-would-be-apply /
+  **never-exceeds-want_apply**(전 모드·임계·patch 조합 불변식) / e2e enforce-downgrade[**!blocked && !applied**=수락
+  불변·apply만 veto] / e2e off-applies / e2e advisory-applies).
+- `nerve-patch`: `FilePatch::is_noop()` pub 승격(분류기가 non-noop 파일만 세도록; 단일 출처).
+- `nerve-cli`: `session.ended` envelope에 additive `apply_downgraded`(스키마 bump 아님) — 분류기가 apply를
+  dry-run으로 내렸는지(수락은 됐으나 패치는 수동 검토 대기). 헬퍼 `apply_downgraded(report)`. 사람용 요약에
+  `auto-mode: {risk} risk (N files, M lines): reasons` + 다운그레이드 시 "kept as dry-run … /diff 또는 /apply"
+  안내. (레거시 `session_end` 라인은 v0.3.0 동결 — 안 건드림.) 테스트 cli 52→53(apply_downgraded None/advisory/
+  enforce).
+- 검증: `cargo build --workspace` clean, `cargo test --workspace` green (config 53, core 185, cli 53, adapter 92,
+  types 25, tui 13), `cargo clippy --workspace --all-targets -- -D warnings` exit 0. 불변식 `allow<=want` 전수
+  테스트로 확인, Off byte-identical 확인, e2e에서 enforce가 수락(`!blocked`)을 유지한 채 apply만 veto함 확인.

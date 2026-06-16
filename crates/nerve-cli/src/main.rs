@@ -2970,8 +2970,26 @@ fn print_interactive_result(report: &RunReport, apply_requested: bool) {
 
     if let Some(patch) = &report.final_patch {
         lines.push(format!("patch {}  files={}", patch.id, patch.files.len()));
+        if let Some(classification) = report.apply_classification.as_ref() {
+            // S12: surface the deterministic auto-mode classification.
+            let risk = if classification.is_high() { "high" } else { "low" };
+            let detail = if classification.reasons.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", classification.reasons.join("; "))
+            };
+            lines.push(format!(
+                "auto-mode: {risk} risk ({} files, {} lines){detail}",
+                classification.files_touched, classification.lines_changed
+            ));
+        }
         if report.applied {
             lines.push("Applied patch. Use /rollback to undo the last patch.".to_string());
+        } else if apply_downgraded(report) {
+            lines.push(
+                "auto-mode kept this as a dry-run (high-risk patch). Use /diff to inspect or /apply to apply it."
+                    .to_string(),
+            );
         } else if !apply_requested && !report.blocked {
             lines.push(
                 "reviewed patch ready. Use /diff to inspect or /apply to apply it.".to_string(),
@@ -4498,6 +4516,16 @@ fn checkpoint_status_envelope(checkpoint: &RunCheckpoint) -> RpcEnvelope {
 /// round seams, which v2 now streams live). Preserves full v1 parity: the
 /// legacy flat-JSON batch, the typed agent stdout chunks, and the typed
 /// budget / patch / session.ended envelopes plus the legacy `session_end` line.
+/// S12: whether the auto-mode classifier downgraded an operator-consented apply
+/// to a dry-run for this run (High-risk patch under `Enforce`). False when the
+/// classifier is off/advisory or the patch was Low risk.
+fn apply_downgraded(report: &RunReport) -> bool {
+    report
+        .apply_classification
+        .as_ref()
+        .is_some_and(|classification| classification.downgraded)
+}
+
 fn emit_terminal_envelopes(report: &RunReport, bus: &RpcBus) -> Result<()> {
     use nerve_types::rpc_kinds;
 
@@ -4552,6 +4580,11 @@ fn emit_terminal_envelopes(report: &RunReport, bus: &RpcBus) -> Result<()> {
             // S10: additive field naming the live-crossfire-Block reason behind a
             // blocked run (Halt action). Additive payload key, no schema bump.
             "crossfire_halted": report.crossfire_halted,
+            // S12: additive field — true when the auto-mode classifier downgraded
+            // an operator-consented apply to a dry-run because the patch was High
+            // risk (Enforce). The run was NOT blocked (acceptance is unchanged);
+            // the patch is staged for manual review. Additive key, no schema bump.
+            "apply_downgraded": apply_downgraded(report),
             "patch_id": report.final_patch.as_ref().map(|patch| patch.id.clone()),
         }),
     );
@@ -5940,11 +5973,71 @@ mod tests {
             goal_satisfied: None,
             applied: false,
             blocked: false,
+            apply_classification: None,
         };
         let mut state = InteractiveState::new(false, true, None);
         state.last_report = Some(report);
 
         assert_eq!(state.last_verdict_label(), "nits");
+    }
+
+    // --- S12: auto-mode classifier telemetry surface -------------------------
+
+    fn report_with_classification(
+        classification: Option<nerve_core::ApplyClassification>,
+    ) -> RunReport {
+        RunReport {
+            task: nerve_types::Task::new("t", std::path::Path::new(".")),
+            selection: nerve_config::ProfileSelection {
+                id: None,
+                lead: "lead".to_string(),
+                reviewer: "reviewer".to_string(),
+                review_strictness: nerve_config::ReviewStrictness::Normal,
+                max_refinement_rounds: 1,
+                plan_strategy: PlanStrategy::Single,
+                plan_system_prompt_override: None,
+            },
+            rounds: Vec::new(),
+            crossfire_feedback: Vec::new(),
+            final_output: nerve_types::AgentOutput::text("lead", "done"),
+            final_feedback: nerve_types::ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            final_patch: None,
+            events: Vec::new(),
+            usage: Default::default(),
+            budget_exceeded: false,
+            no_progress_exceeded: false,
+            crossfire_halted: false,
+            goal_satisfied: None,
+            applied: false,
+            blocked: false,
+            apply_classification: classification,
+        }
+    }
+
+    #[test]
+    fn apply_downgraded_reflects_classification() {
+        // No classification (Off) ⇒ not downgraded.
+        assert!(!apply_downgraded(&report_with_classification(None)));
+        // High-risk but not downgraded (Advisory) ⇒ not downgraded.
+        assert!(!apply_downgraded(&report_with_classification(Some(
+            nerve_core::ApplyClassification {
+                risk: nerve_core::ApplyRisk::High,
+                reasons: vec!["touches 99 files".to_string()],
+                files_touched: 99,
+                lines_changed: 10,
+                downgraded: false,
+            }
+        ))));
+        // Downgraded (Enforce vetoed the apply) ⇒ true.
+        assert!(apply_downgraded(&report_with_classification(Some(
+            nerve_core::ApplyClassification {
+                risk: nerve_core::ApplyRisk::High,
+                reasons: vec!["touches 99 files".to_string()],
+                files_touched: 99,
+                lines_changed: 10,
+                downgraded: true,
+            }
+        ))));
     }
 
     #[test]
@@ -6566,6 +6659,7 @@ mod tests {
             goal_satisfied: None,
             applied: false,
             blocked: false,
+            apply_classification: None,
         };
         NerveStore::new(dir.path()).save_report(&report).unwrap();
 

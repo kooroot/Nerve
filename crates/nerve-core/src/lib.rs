@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use nerve_adapter::ModelAdapter;
 use nerve_config::{
-    Config, ConflictPolicy, GoalSpec, Orchestration, ProfileSelection, ReviewStrictness, Strategy,
+    ApplyClassifierConfig, Config, ConflictPolicy, GoalSpec, Orchestration, ProfileSelection,
+    ReviewStrictness, Strategy,
 };
 use nerve_patch::{FileOperation, FilePatch, NvPatch};
 use nerve_types::{
@@ -127,6 +128,166 @@ pub struct RunReport {
     pub goal_satisfied: Option<bool>,
     pub applied: bool,
     pub blocked: bool,
+    // S12: the deterministic auto-mode classification of the final patch, when
+    // the classifier is enabled (Advisory/Enforce). `None` when the classifier is
+    // Off, keeping older persisted reports byte-identical. Telemetry only — when
+    // `downgraded` is true the run was kept as a dry-run despite operator consent
+    // because the patch was High risk; this NEVER affects `blocked`/`goal_satisfied`.
+    #[serde(default)]
+    pub apply_classification: Option<ApplyClassification>,
+}
+
+/// S12: deterministic apply-risk level for the auto-mode classifier.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyRisk {
+    /// The patch is small/contained — no risk signal tripped.
+    Low,
+    /// At least one risk signal tripped (size / risky path / destructive op).
+    High,
+}
+
+/// S12: the deterministic classification of a run's final patch (file/line size,
+/// risky touched paths, destructive ops). Pure telemetry attached to the report;
+/// in `Enforce` mode a `High` classification additionally DOWNGRADES a
+/// would-be apply to a dry-run (recorded in `downgraded`), but it NEVER touches
+/// the deterministic acceptance gate (`blocked` / `goal_satisfied`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApplyClassification {
+    pub risk: ApplyRisk,
+    /// Human-readable reasons the patch was rated `High` (empty when `Low`).
+    pub reasons: Vec<String>,
+    /// Number of files the patch touches that effect a real change (non-noop).
+    pub files_touched: usize,
+    /// Total changed lines (added + removed) across the patch.
+    pub lines_changed: usize,
+    /// True when an operator-consented apply was kept as a dry-run because the
+    /// patch was `High` risk and the classifier was in `Enforce` mode. Telemetry
+    /// only — this is a *downgrade*, never an escalation.
+    pub downgraded: bool,
+}
+
+impl ApplyClassification {
+    pub fn is_high(&self) -> bool {
+        matches!(self.risk, ApplyRisk::High)
+    }
+}
+
+/// S12: count changed lines (added + removed) in one file patch, from its unified
+/// diff, excluding the `+++`/`---` file headers. Deterministic churn measure.
+fn changed_line_count(file: &FilePatch) -> usize {
+    file.to_unified_diff()
+        .lines()
+        .filter(|line| {
+            (line.starts_with('+') && !line.starts_with("+++"))
+                || (line.starts_with('-') && !line.starts_with("---"))
+        })
+        .count()
+}
+
+/// S12: compile risky-path globs into a matcher, skipping any individual pattern
+/// that fails to compile (a malformed operator glob disables only itself, never
+/// the whole apply path). Recompiled per `classify_apply` call — classification
+/// runs once per run at the single apply seam, so this is not a hot path.
+fn build_risky_glob_set(globs: &[String]) -> globset::GlobSet {
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in globs {
+        if let Ok(glob) = globset::Glob::new(pattern) {
+            builder.add(glob);
+        }
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| globset::GlobSet::empty())
+}
+
+/// S12: deterministically classify a run's final patch for apply risk. PURE
+/// function of the patch + config — no LLM, no side effects, no I/O. A `None`,
+/// empty, or all-noop patch is `Low` (nothing meaningful to apply). The result's
+/// `downgraded` is always false here; the caller sets it iff an apply is vetoed.
+fn classify_apply(patch: Option<&NvPatch>, cfg: &ApplyClassifierConfig) -> ApplyClassification {
+    let files: Vec<&FilePatch> = patch
+        .map(|p| p.files.iter().filter(|f| !f.is_noop()).collect())
+        .unwrap_or_default();
+    let files_touched = files.len();
+    let lines_changed: usize = files.iter().map(|f| changed_line_count(f)).sum();
+
+    let mut reasons = Vec::new();
+    if files_touched > cfg.max_files {
+        reasons.push(format!(
+            "touches {files_touched} files (> max_files {})",
+            cfg.max_files
+        ));
+    }
+    if lines_changed > cfg.max_lines {
+        reasons.push(format!(
+            "changes {lines_changed} lines (> max_lines {})",
+            cfg.max_lines
+        ));
+    }
+    if cfg.flag_destructive_ops {
+        for file in &files {
+            match &file.operation {
+                FileOperation::Delete => {
+                    reasons.push(format!("deletes {}", file.path.display()));
+                }
+                FileOperation::Rename { from } => {
+                    reasons.push(format!(
+                        "renames {} -> {}",
+                        from.display(),
+                        file.path.display()
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    let matcher = build_risky_glob_set(&cfg.risky_path_globs);
+    for file in &files {
+        if matcher.is_match(&file.path) {
+            reasons.push(format!("touches risky path {}", file.path.display()));
+        }
+    }
+
+    let risk = if reasons.is_empty() {
+        ApplyRisk::Low
+    } else {
+        ApplyRisk::High
+    };
+    ApplyClassification {
+        risk,
+        reasons,
+        files_touched,
+        lines_changed,
+        downgraded: false,
+    }
+}
+
+/// S12: the auto-mode classifier gate. Given the pre-classifier apply decision
+/// `want_apply` (which already ANDs operator consent with the deterministic
+/// `!blocked`), return `(allow_apply, classification)`.
+///
+/// INVARIANT (the load-bearing safety property): `allow_apply <= want_apply`
+/// ALWAYS. The classifier is monotone in the rejection direction — it can turn a
+/// would-be apply OFF (downgrade to dry-run) but can NEVER turn a dry-run into an
+/// apply, and it never reads or writes `blocked`/`goal_satisfied`. So:
+/// - `Off`      → `(want_apply, None)` — byte-identical to pre-S12.
+/// - `Advisory` → `(want_apply, Some(..))` — telemetry only; gate unchanged.
+/// - `Enforce`  → vetoes (`allow_apply=false`, `downgraded=true`) ONLY when
+///   `want_apply` was already true AND the patch is `High` risk; otherwise the
+///   decision is unchanged.
+fn apply_classifier_decision(
+    want_apply: bool,
+    patch: Option<&NvPatch>,
+    cfg: &ApplyClassifierConfig,
+) -> (bool, Option<ApplyClassification>) {
+    if !cfg.mode.classifies() {
+        return (want_apply, None);
+    }
+    let mut classification = classify_apply(patch, cfg);
+    let veto = cfg.mode.enforces() && want_apply && classification.is_high();
+    classification.downgraded = veto;
+    (want_apply && !veto, Some(classification))
 }
 
 /// S11: a shared, daemon-controlled handle for escalating a SPECIFIC in-flight
@@ -657,10 +818,21 @@ async fn run_synaptic_loop_inner(
     // escalation grant) AND the run is not blocked. `apply_consented()` is
     // rejection-direction only; `!blocked` is the unchanged deterministic gate,
     // so a granted-but-blocked run still never applies.
+    let want_apply = options.apply_consented() && !blocked;
+    // S12: the auto-mode classifier may DOWNGRADE a would-be apply to a dry-run
+    // when the final patch is High risk (Enforce mode). It is monotone —
+    // `allow_apply <= want_apply` — so it never fabricates an apply and never
+    // reads or writes `blocked`/`goal_satisfied`. Off/Advisory leave `allow_apply
+    // == want_apply` (byte-identical apply decision).
+    let (allow_apply, apply_classification) = apply_classifier_decision(
+        want_apply,
+        final_patch.as_ref(),
+        &config.orchestration.apply_classifier,
+    );
     let applied = apply_final_patch(
         &task,
         final_patch.as_ref(),
-        options.apply_consented() && !blocked,
+        allow_apply,
         resolve_worktree_apply(&options, &config.orchestration),
     )
     .await?;
@@ -693,6 +865,7 @@ async fn run_synaptic_loop_inner(
         goal_satisfied,
         applied,
         blocked,
+        apply_classification,
     })
 }
 
@@ -825,10 +998,21 @@ async fn run_tournament_strategy(
     // escalation grant) AND the run is not blocked. `apply_consented()` is
     // rejection-direction only; `!blocked` is the unchanged deterministic gate,
     // so a granted-but-blocked run still never applies.
+    let want_apply = options.apply_consented() && !blocked;
+    // S12: the auto-mode classifier may DOWNGRADE a would-be apply to a dry-run
+    // when the final patch is High risk (Enforce mode). It is monotone —
+    // `allow_apply <= want_apply` — so it never fabricates an apply and never
+    // reads or writes `blocked`/`goal_satisfied`. Off/Advisory leave `allow_apply
+    // == want_apply` (byte-identical apply decision).
+    let (allow_apply, apply_classification) = apply_classifier_decision(
+        want_apply,
+        final_patch.as_ref(),
+        &config.orchestration.apply_classifier,
+    );
     let applied = apply_final_patch(
         &task,
         final_patch.as_ref(),
-        options.apply_consented() && !blocked,
+        allow_apply,
         resolve_worktree_apply(&options, &config.orchestration),
     )
     .await?;
@@ -859,6 +1043,7 @@ async fn run_tournament_strategy(
         goal_satisfied,
         applied,
         blocked,
+        apply_classification,
     })
 }
 
@@ -2991,6 +3176,252 @@ mod tests {
         assert!(report.blocked);
         assert!(!report.applied);
         assert!(!dir.path().join("mock-output.txt").exists());
+    }
+
+    // --- S12: auto-mode classifier gate (implement↔apply) --------------------
+
+    fn classifier_cfg(
+        mode: nerve_config::ApplyClassifierMode,
+        max_files: usize,
+        max_lines: usize,
+    ) -> ApplyClassifierConfig {
+        ApplyClassifierConfig {
+            mode,
+            max_files,
+            max_lines,
+            risky_path_globs: vec!["**/Cargo.lock".to_string(), "**/.github/**".to_string()],
+            flag_destructive_ops: true,
+        }
+    }
+
+    #[test]
+    fn classify_apply_none_or_noop_patch_is_low() {
+        let cfg = classifier_cfg(nerve_config::ApplyClassifierMode::Enforce, 25, 800);
+        let none = classify_apply(None, &cfg);
+        assert_eq!(none.risk, ApplyRisk::Low);
+        assert_eq!(none.files_touched, 0);
+        assert_eq!(none.lines_changed, 0);
+        assert!(none.reasons.is_empty());
+        assert!(!none.downgraded);
+        // A patch whose only file is a no-op (identical content) is also Low.
+        let noop = NvPatch::single("a.txt", "same\n", "same\n");
+        let c = classify_apply(Some(&noop), &cfg);
+        assert_eq!(c.risk, ApplyRisk::Low);
+        assert_eq!(c.files_touched, 0);
+    }
+
+    #[test]
+    fn classify_apply_low_for_small_contained_patch() {
+        let cfg = classifier_cfg(nerve_config::ApplyClassifierMode::Enforce, 25, 800);
+        let patch = NvPatch::single("src/small.rs", "fn a() {}\n", "fn a() { b(); }\n");
+        let c = classify_apply(Some(&patch), &cfg);
+        assert_eq!(c.risk, ApplyRisk::Low);
+        assert_eq!(c.files_touched, 1);
+        assert!(c.reasons.is_empty());
+    }
+
+    #[test]
+    fn classify_apply_high_on_each_risk_signal() {
+        // Too many files.
+        let cfg_files = classifier_cfg(nerve_config::ApplyClassifierMode::Enforce, 1, 800);
+        let many = NvPatch::new(vec![
+            FilePatch::new("a.rs", "x\n", "y\n"),
+            FilePatch::new("b.rs", "x\n", "y\n"),
+        ]);
+        let c = classify_apply(Some(&many), &cfg_files);
+        assert_eq!(c.risk, ApplyRisk::High);
+        assert_eq!(c.files_touched, 2);
+        assert!(c.reasons.iter().any(|r| r.contains("max_files")));
+
+        // Too many lines.
+        let cfg_lines = classifier_cfg(nerve_config::ApplyClassifierMode::Enforce, 25, 1);
+        let big = NvPatch::single("a.rs", "1\n2\n3\n", "1\n2x\n3x\n");
+        let c = classify_apply(Some(&big), &cfg_lines);
+        assert_eq!(c.risk, ApplyRisk::High);
+        assert!(c.reasons.iter().any(|r| r.contains("max_lines")));
+
+        // Risky path via glob — `**/Cargo.lock` must match a bare `Cargo.lock`.
+        let cfg = classifier_cfg(nerve_config::ApplyClassifierMode::Enforce, 25, 800);
+        let lock = NvPatch::single("Cargo.lock", "a = 1\n", "a = 2\n");
+        let c = classify_apply(Some(&lock), &cfg);
+        assert_eq!(c.risk, ApplyRisk::High);
+        assert!(c.reasons.iter().any(|r| r.contains("risky path")));
+        // Nested risky path via `**/.github/**`.
+        let ci = NvPatch::single(".github/workflows/ci.yml", "on: push\n", "on: pull\n");
+        assert!(classify_apply(Some(&ci), &cfg).is_high());
+
+        // Destructive op (delete) regardless of small size.
+        let del = NvPatch::new(vec![FilePatch::delete("src/gone.rs", "old\n")]);
+        let c = classify_apply(Some(&del), &cfg);
+        assert_eq!(c.risk, ApplyRisk::High);
+        assert!(c.reasons.iter().any(|r| r.contains("deletes")));
+
+        // Destructive ops can be disabled — then a small delete is Low.
+        let mut cfg_no_destruct = cfg.clone();
+        cfg_no_destruct.flag_destructive_ops = false;
+        assert_eq!(
+            classify_apply(Some(&del), &cfg_no_destruct).risk,
+            ApplyRisk::Low
+        );
+    }
+
+    #[test]
+    fn apply_classifier_decision_off_is_byte_identical() {
+        // Off never classifies and never changes the decision, for any patch/want.
+        let high = NvPatch::new(vec![
+            FilePatch::new("a", "x\n", "y\n"),
+            FilePatch::new("b", "x\n", "y\n"),
+        ]);
+        let cfg = classifier_cfg(nerve_config::ApplyClassifierMode::Off, 1, 1);
+        for want in [true, false] {
+            let (allow, cls) = apply_classifier_decision(want, Some(&high), &cfg);
+            assert_eq!(allow, want);
+            assert!(cls.is_none());
+        }
+    }
+
+    #[test]
+    fn apply_classifier_decision_advisory_classifies_but_never_vetoes() {
+        let high = NvPatch::new(vec![
+            FilePatch::new("a", "x\n", "y\n"),
+            FilePatch::new("b", "x\n", "y\n"),
+        ]);
+        let cfg = classifier_cfg(nerve_config::ApplyClassifierMode::Advisory, 1, 800);
+        for want in [true, false] {
+            let (allow, cls) = apply_classifier_decision(want, Some(&high), &cfg);
+            assert_eq!(allow, want); // gate unchanged
+            let cls = cls.expect("advisory records a classification");
+            assert!(cls.is_high());
+            assert!(!cls.downgraded);
+        }
+    }
+
+    #[test]
+    fn apply_classifier_decision_enforce_downgrades_only_a_would_be_apply() {
+        let high = NvPatch::new(vec![
+            FilePatch::new("a", "x\n", "y\n"),
+            FilePatch::new("b", "x\n", "y\n"),
+        ]);
+        let cfg = classifier_cfg(nerve_config::ApplyClassifierMode::Enforce, 1, 800);
+        // want_apply=true + High ⇒ vetoed (downgraded to dry-run).
+        let (allow, cls) = apply_classifier_decision(true, Some(&high), &cfg);
+        assert!(!allow);
+        assert!(cls.unwrap().downgraded);
+        // want_apply=false + High ⇒ stays false; NEVER upgraded, nothing downgraded.
+        let (allow, cls) = apply_classifier_decision(false, Some(&high), &cfg);
+        assert!(!allow);
+        assert!(!cls.unwrap().downgraded);
+
+        // Enforce + Low ⇒ never vetoes; allow == want.
+        let low = NvPatch::single("ok.rs", "a\n", "a b\n");
+        let cfg_low = classifier_cfg(nerve_config::ApplyClassifierMode::Enforce, 25, 800);
+        for want in [true, false] {
+            let (allow, cls) = apply_classifier_decision(want, Some(&low), &cfg_low);
+            assert_eq!(allow, want);
+            let cls = cls.unwrap();
+            assert!(!cls.is_high());
+            assert!(!cls.downgraded);
+        }
+    }
+
+    #[test]
+    fn apply_classifier_decision_never_exceeds_want_apply() {
+        // THE load-bearing invariant: allow_apply <= want_apply for EVERY mode,
+        // patch, threshold, and want value (allow implies want — never an upgrade).
+        let patches: [Option<NvPatch>; 3] = [
+            None,
+            Some(NvPatch::single("ok.rs", "a\n", "b\n")),
+            Some(NvPatch::new(vec![FilePatch::delete("x", "y\n")])),
+        ];
+        for mode in [
+            nerve_config::ApplyClassifierMode::Off,
+            nerve_config::ApplyClassifierMode::Advisory,
+            nerve_config::ApplyClassifierMode::Enforce,
+        ] {
+            for max_files in [0usize, 1, 25] {
+                for want in [true, false] {
+                    for patch in &patches {
+                        let cfg = classifier_cfg(mode, max_files, 800);
+                        let (allow, _) = apply_classifier_decision(want, patch.as_ref(), &cfg);
+                        assert!(!allow || want, "allow_apply must imply want_apply");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn enforce_downgrades_a_high_risk_apply() {
+        // Operator passed --apply and the run is accepted, but Enforce + a High-
+        // risk patch (max_files 0 ⇒ any non-empty patch is High) keeps it a
+        // dry-run. The deterministic gate is untouched; this is a pure downgrade.
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("enforce downgrade", dir.path());
+        let mut config = consensus_config();
+        config.orchestration.apply_classifier =
+            classifier_cfg(nerve_config::ApplyClassifierMode::Enforce, 0, 100_000);
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(true))
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
+        assert!(!report.blocked); // NOT blocked — the gate accepted it
+        assert!(!report.applied); // ...but the classifier downgraded the apply
+        let cls = report.apply_classification.expect("classification recorded");
+        assert!(cls.is_high());
+        assert!(cls.downgraded);
+        assert!(!dir.path().join("mock-output.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn off_classifier_keeps_apply_byte_identical() {
+        // With the classifier Off (the default), an accepted --apply run applies
+        // exactly as before and records no classification.
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("classifier off", dir.path());
+        let config = consensus_config(); // apply_classifier defaults to Off
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(true))
+            .await
+            .unwrap();
+
+        assert!(report.applied);
+        assert!(report.apply_classification.is_none());
+        assert!(dir.path().join("mock-output.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn advisory_classifies_but_does_not_block_apply() {
+        // Advisory surfaces the High-risk classification but never vetoes — the
+        // accepted --apply run still applies.
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("classifier advisory", dir.path());
+        let mut config = consensus_config();
+        config.orchestration.apply_classifier =
+            classifier_cfg(nerve_config::ApplyClassifierMode::Advisory, 0, 100_000);
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+
+        let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(true))
+            .await
+            .unwrap();
+
+        assert!(report.applied); // advisory never vetoes
+        let cls = report.apply_classification.expect("classification recorded");
+        assert!(cls.is_high());
+        assert!(!cls.downgraded);
+        assert!(dir.path().join("mock-output.txt").exists());
     }
 
     #[tokio::test]
