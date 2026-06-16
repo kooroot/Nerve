@@ -292,10 +292,21 @@ pub async fn run_synaptic_loop(
             break;
         }
 
-        // ma-6 decision table: stop iff reviewer says LGTM AND check_result is Pass/Skipped.
-        let reviewer_success = final_feedback.verdict.is_terminal_success();
-        let check_success = matches!(check_result, CheckResult::Pass | CheckResult::Skipped);
-        if reviewer_success && check_success {
+        // ma-6 decision table: stop iff the reviewer accepts AND the
+        // deterministic check is green. `Lgtm` accepts on Pass OR Skipped
+        // (unchanged behavior). `AcceptWithNits` is the weaker "accept the
+        // known nits" verdict, so it requires a REAL green check (Pass, never
+        // Skipped) — it must never accept on reviewer opinion alone — and it
+        // only terminates when strictness permits nits (High forces a round).
+        let terminal = match &final_feedback.verdict {
+            Verdict::Lgtm => matches!(check_result, CheckResult::Pass | CheckResult::Skipped),
+            Verdict::AcceptWithNits => {
+                selection.review_strictness.permits_nits()
+                    && matches!(check_result, CheckResult::Pass)
+            }
+            _ => false,
+        };
+        if terminal {
             break;
         }
 
@@ -303,9 +314,13 @@ pub async fn run_synaptic_loop(
             break;
         }
 
-        // ma-1 no-progress guard: identical patch hash + RequestChanges in a row.
+        // ma-1 no-progress guard: identical patch hash + RequestChanges (or a
+        // strict-mode stuck AcceptWithNits) in a row.
         if no_progress_max > 0
-            && matches!(final_feedback.verdict, Verdict::RequestChanges)
+            && matches!(
+                final_feedback.verdict,
+                Verdict::RequestChanges | Verdict::AcceptWithNits
+            )
             && let Some(current) = patch_sha.as_ref()
             && previous_patch_sha.as_deref() == Some(current.as_str())
         {
@@ -350,9 +365,19 @@ pub async fn run_synaptic_loop(
         &config.orchestration.conflict_policy,
     )?;
     let goal_check_failed = goal_check_failed(&options.goal, last_check.as_ref());
+    // Policy-independent verification gate for the weaker AcceptWithNits
+    // verdict: it is a genuine acceptance only when strictness permits nits AND
+    // the deterministic check really passed (Pass, never Skipped). Otherwise it
+    // is blocked under EVERY conflict policy — lead_priority included — so a
+    // nits verdict can never be auto-applied or persisted as accepted on
+    // reviewer opinion alone.
+    let nits_unverified = matches!(final_feedback.verdict, Verdict::AcceptWithNits)
+        && !(selection.review_strictness.permits_nits()
+            && matches!(last_check, Some(CheckResult::Pass)));
     let blocked = budget_exceeded
         || no_progress_exceeded
         || goal_check_failed
+        || nits_unverified
         || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
 
     let applied = apply_final_patch(
@@ -367,7 +392,9 @@ pub async fn run_synaptic_loop(
         matches!(
             last_check,
             Some(CheckResult::Pass) | Some(CheckResult::Skipped)
-        ) && final_feedback.verdict.is_terminal_success()
+        ) && final_feedback
+            .verdict
+            .accepts_under(selection.review_strictness.permits_nits())
             && !budget_exceeded
             && !no_progress_exceeded
     });
@@ -452,6 +479,8 @@ async fn run_tournament_strategy(
         accumulate_feedback_usage(&mut usage, &reviewer_review);
 
         budget_exceeded = exceeds_budget(&usage, &config.orchestration);
+        // S1: accept-with-nits is intentionally not auto-selected as the
+        // tournament winner — only LGTM auto-wins here.
         if budget_exceeded {
             budget_exceeded_feedback(reviewer.id(), &usage)
         } else if lead_review.verdict.is_terminal_success() {
@@ -496,8 +525,15 @@ async fn run_tournament_strategy(
         &config.orchestration.conflict_policy,
     )?;
     let goal_check_failed = goal_check_failed(&options.goal, Some(&check_result));
+    // See run_synaptic_loop: AcceptWithNits needs a real Pass + nits-permitting
+    // strictness to be a genuine acceptance, enforced policy-independently so it
+    // is never auto-applied on reviewer opinion alone under any conflict policy.
+    let nits_unverified = matches!(final_feedback.verdict, Verdict::AcceptWithNits)
+        && !(selection.review_strictness.permits_nits()
+            && matches!(check_result, CheckResult::Pass));
     let blocked = budget_exceeded
         || goal_check_failed
+        || nits_unverified
         || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
 
     let applied = apply_final_patch(
@@ -510,7 +546,9 @@ async fn run_tournament_strategy(
 
     let goal_satisfied = options.goal.as_ref().map(|_| {
         matches!(check_result, CheckResult::Pass | CheckResult::Skipped)
-            && final_feedback.verdict.is_terminal_success()
+            && final_feedback
+                .verdict
+                .accepts_under(selection.review_strictness.permits_nits())
             && !budget_exceeded
     });
 
@@ -974,7 +1012,15 @@ fn git_merge_file(base: &str, lead: &str, reviewer: &str) -> Result<String> {
 fn is_blocked(feedback: &ReviewerFeedback, policy: &ConflictPolicy) -> bool {
     match policy {
         ConflictPolicy::LeadPriority | ConflictPolicy::ReviewerPriority => false,
-        ConflictPolicy::AbortOnConflict => feedback.verdict != Verdict::Lgtm,
+        // Conflict-resolution axis only. `AcceptWithNits` is treated as an
+        // accept-class verdict here; whether it is a GENUINE acceptance (real
+        // Pass check + nits-permitting strictness) is enforced separately and
+        // policy-independently via the `nits_unverified` gate in the blocked
+        // chain, so it can never be auto-applied on opinion alone under ANY
+        // policy (including the reviewer-advisory lead_priority).
+        ConflictPolicy::AbortOnConflict => {
+            !matches!(feedback.verdict, Verdict::Lgtm | Verdict::AcceptWithNits)
+        }
         ConflictPolicy::MergeAttempt | ConflictPolicy::ReviewerBlock => {
             feedback.verdict == Verdict::Block
         }
@@ -2092,5 +2138,345 @@ mod tests {
 
         // No orphan dir yet → Ok (count == 0).
         assert_eq!(checks[2].status, DoctorStatus::Ok);
+    }
+
+    // ----- S1: accept-with-nits graduated verdict tests -----
+
+    /// Test-double reviewer/lead that always returns `AcceptWithNits` with a
+    /// single low-severity `Info` issue. As a lead it produces a stable patch
+    /// (identical content on implement and refine) so the no-progress guard
+    /// can observe an unchanged `patch_sha` across rounds.
+    #[derive(Debug)]
+    struct NitsAdapter {
+        id: &'static str,
+    }
+
+    impl NitsAdapter {
+        fn new(id: &'static str) -> Self {
+            Self { id }
+        }
+
+        fn stable_patch() -> NvPatch {
+            NvPatch::new(vec![FilePatch::create(
+                "nits-output.txt",
+                "Status: accepted-with-nits\n".to_string(),
+            )])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelAdapter for NitsAdapter {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        async fn implement(
+            &self,
+            _task: &Task,
+            _cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            Ok(AgentOutput::with_patch(
+                self.id,
+                "initial nits implementation",
+                Self::stable_patch(),
+            ))
+        }
+
+        async fn review(
+            &self,
+            _task: &Task,
+            _lead_output: &AgentOutput,
+            _cwd: &Path,
+            _strictness: &str,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<ReviewerFeedback> {
+            Ok(ReviewerFeedback::accept_with_nits(
+                self.id,
+                vec![Issue {
+                    severity: IssueSeverity::Info,
+                    message: "cosmetic: tighten variable naming".to_string(),
+                }],
+                "ACCEPT_WITH_NITS: cosmetic naming only",
+            ))
+        }
+
+        async fn refine(
+            &self,
+            _task: &Task,
+            _previous_output: &AgentOutput,
+            _feedback: &ReviewerFeedback,
+            _cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            // Identical patch each round so patch_sha never changes.
+            Ok(AgentOutput::with_patch(
+                self.id,
+                "refined nits implementation",
+                Self::stable_patch(),
+            ))
+        }
+    }
+
+    /// Consensus config whose matched profile pins `review_strictness` to the
+    /// supplied value. The task prompt must contain "nits" for the profile to
+    /// match (see `nits_task`).
+    fn nits_config(strictness: &str, conflict_policy: &str) -> Config {
+        Config::from_json_str(&format!(
+            r#"{{
+              "orchestration": {{
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "{conflict_policy}"
+              }},
+              "roles": {{
+                "architect": "nits-lead",
+                "reviewer": "nits-reviewer"
+              }},
+              "profiles": [
+                {{
+                  "id": "nits-profile",
+                  "match_rules": ["nits"],
+                  "lead": "nits-lead",
+                  "reviewer": "nits-reviewer",
+                  "review_strictness": "{strictness}"
+                }}
+              ]
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    fn nits_task(dir: &Path) -> Task {
+        Task::new("polish the nits in this patch", dir)
+    }
+
+    fn nits_adapters() -> Vec<Box<dyn ModelAdapter>> {
+        vec![
+            Box::new(NitsAdapter::new("nits-lead")) as Box<dyn ModelAdapter>,
+            Box::new(NitsAdapter::new("nits-reviewer")) as Box<dyn ModelAdapter>,
+        ]
+    }
+
+    fn nits_goal_spec(cmd: &[&str], no_progress_max: Option<u8>) -> GoalSpec {
+        GoalSpec {
+            id: "g-nits".into(),
+            check_cmd: cmd.iter().map(|s| (*s).to_string()).collect(),
+            timeout_secs: 5,
+            cwd: None,
+            env: std::collections::BTreeMap::new(),
+            no_progress_max,
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_with_nits_terminates_under_normal_strictness_with_green_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = nits_task(dir.path());
+        let config = nits_config("normal", "lead_priority");
+        let adapters = nits_adapters();
+
+        let options = RunOptions::new(false).with_goal(nits_goal_spec(&["true"], None));
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        // Round 0 accept-with-nits + green check terminates without a refine round.
+        assert_eq!(report.rounds.len(), 1);
+        assert_eq!(report.final_feedback.verdict, Verdict::AcceptWithNits);
+        assert_eq!(report.goal_satisfied, Some(true));
+        assert!(!report.blocked);
+        assert!(!report.no_progress_exceeded);
+    }
+
+    #[tokio::test]
+    async fn accept_with_nits_degrades_to_refine_under_high_strictness() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = nits_task(dir.path());
+        let config = nits_config("high", "lead_priority");
+        let adapters = nits_adapters();
+
+        // No no_progress guard so the loop runs the full refinement budget.
+        let options = RunOptions::new(false).with_goal(nits_goal_spec(&["true"], None));
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        // High strictness does not terminate on round 0; full budget runs
+        // (initial review + 2 refinement reviews = 3 rounds).
+        assert_eq!(report.rounds.len(), 3);
+        assert_eq!(report.final_feedback.verdict, Verdict::AcceptWithNits);
+    }
+
+    #[tokio::test]
+    async fn accept_with_nits_does_not_terminate_when_check_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = nits_task(dir.path());
+        let config = nits_config("normal", "lead_priority");
+        let adapters = nits_adapters();
+
+        // Green check is false → accept-with-nits cannot terminate the loop.
+        let options = RunOptions::new(false).with_goal(nits_goal_spec(&["false"], None));
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert_eq!(report.rounds.len(), 3);
+        assert_eq!(report.goal_satisfied, Some(false));
+        assert!(report.blocked);
+    }
+
+    #[tokio::test]
+    async fn accept_with_nits_no_progress_guard_reaps_strict_stuck_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = nits_task(dir.path());
+        // High strictness keeps refining; identical patch each round trips the
+        // no-progress guard at the first repeat (no_progress_max = 1).
+        let config = nits_config("high", "lead_priority");
+        let adapters = nits_adapters();
+
+        let options = RunOptions::new(false).with_goal(nits_goal_spec(&["true"], Some(1)));
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert!(report.no_progress_exceeded);
+        assert_eq!(report.final_feedback.verdict, Verdict::Block);
+    }
+
+    #[tokio::test]
+    async fn accept_with_nits_abort_on_conflict_not_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = nits_task(dir.path());
+        let config = nits_config("normal", "abort_on_conflict");
+        let adapters = nits_adapters();
+
+        let options = RunOptions::new(true).with_goal(nits_goal_spec(&["true"], None));
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        // accept-with-nits counts as an accept → abort_on_conflict does not block.
+        assert_eq!(report.final_feedback.verdict, Verdict::AcceptWithNits);
+        assert!(!report.blocked);
+        assert!(report.applied);
+        assert!(dir.path().join("nits-output.txt").exists());
+    }
+
+    /// Regression (codex BLOCKING #1): with NO goal the deterministic check is
+    /// `Skipped`, which must NOT let `AcceptWithNits` accept on reviewer
+    /// opinion alone. The loop must keep refining to the round budget instead
+    /// of breaking on the first review.
+    #[tokio::test]
+    async fn accept_with_nits_skipped_check_does_not_shortcut() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = nits_task(dir.path());
+        let config = nits_config("normal", "lead_priority");
+        let adapters = nits_adapters();
+
+        // No goal → CheckResult::Skipped every round.
+        let options = RunOptions::new(false);
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        // Ran the full budget (max_refinement_rounds = 2 → 3 rounds); did NOT
+        // shortcut on a nits-accept with no real check.
+        assert_eq!(report.rounds.len(), 3);
+        assert_eq!(report.final_feedback.verdict, Verdict::AcceptWithNits);
+    }
+
+    /// Regression (codex BLOCKING #2): under High strictness an
+    /// `AcceptWithNits` that exhausts the round budget must NOT be treated as
+    /// an acceptance at finalization — it is neither goal-satisfied nor applied
+    /// under `abort_on_conflict` (High degrades nits to a change request
+    /// end-to-end, not just at the stop edge).
+    #[tokio::test]
+    async fn accept_with_nits_high_strictness_not_satisfied_or_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = nits_task(dir.path());
+        let config = nits_config("high", "abort_on_conflict");
+        let adapters = nits_adapters();
+
+        // Green check + apply requested; High strictness must still refuse the nits.
+        let options = RunOptions::new(true).with_goal(nits_goal_spec(&["true"], None));
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::AcceptWithNits);
+        assert_eq!(report.rounds.len(), 3); // ran full budget, never accepted early
+        assert_eq!(report.goal_satisfied, Some(false));
+        assert!(report.blocked);
+        assert!(!report.applied);
+    }
+
+    /// Regression (codex round-2 BLOCKING): the apply gate must also require a
+    /// real check. With NO goal the check is `Skipped`, so even under Normal
+    /// strictness with `abort_on_conflict` and `--apply`, an `AcceptWithNits`
+    /// patch must be BLOCKED and never written — acceptance cannot rest on the
+    /// reviewer verdict alone.
+    #[tokio::test]
+    async fn accept_with_nits_skipped_check_blocks_abort_on_conflict_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = nits_task(dir.path());
+        let config = nits_config("normal", "abort_on_conflict");
+        let adapters = nits_adapters();
+
+        // No goal → Skipped check; apply requested.
+        let options = RunOptions::new(true);
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::AcceptWithNits);
+        assert!(report.blocked);
+        assert!(!report.applied);
+        assert!(!dir.path().join("nits-output.txt").exists());
+    }
+
+    /// Regression (codex round-3 BLOCKING): the verification gate is
+    /// policy-independent. Under the DEFAULT `lead_priority` (reviewer
+    /// advisory) a no-goal (Skipped) `AcceptWithNits` must still be blocked and
+    /// never applied — a permissive conflict policy must not let a nits verdict
+    /// be accepted on reviewer opinion alone.
+    #[tokio::test]
+    async fn accept_with_nits_skipped_check_blocks_lead_priority_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = nits_task(dir.path());
+        let config = nits_config("normal", "lead_priority");
+        let adapters = nits_adapters();
+
+        // No goal → Skipped check; apply requested; permissive policy.
+        let options = RunOptions::new(true);
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::AcceptWithNits);
+        assert!(report.blocked);
+        assert!(!report.applied);
+        assert!(!dir.path().join("nits-output.txt").exists());
+    }
+
+    /// Positive guard: a GENUINE accept-with-nits (real Pass check + permissive
+    /// strictness) IS applied under lead_priority — the verification gate must
+    /// not over-block legitimately accepted work.
+    #[tokio::test]
+    async fn accept_with_nits_pass_check_applies_under_lead_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = nits_task(dir.path());
+        let config = nits_config("normal", "lead_priority");
+        let adapters = nits_adapters();
+
+        let options = RunOptions::new(true).with_goal(nits_goal_spec(&["true"], None));
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::AcceptWithNits);
+        assert!(!report.blocked);
+        assert!(report.applied);
+        assert!(dir.path().join("nits-output.txt").exists());
     }
 }

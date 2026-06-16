@@ -117,12 +117,28 @@ impl ReviewerFeedback {
             raw_text: raw_text.into(),
         }
     }
+
+    pub fn accept_with_nits(
+        reviewer_id: impl Into<String>,
+        issues: Vec<Issue>,
+        raw_text: impl Into<String>,
+    ) -> Self {
+        Self {
+            reviewer_id: reviewer_id.into(),
+            verdict: Verdict::AcceptWithNits,
+            issues,
+            suggested_patch: None,
+            cost: None,
+            raw_text: raw_text.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     Lgtm,
+    AcceptWithNits,
     RequestChanges,
     Block,
 }
@@ -130,6 +146,18 @@ pub enum Verdict {
 impl Verdict {
     pub fn is_terminal_success(&self) -> bool {
         matches!(self, Self::Lgtm)
+    }
+
+    /// Whether this verdict counts as an acceptance, given whether the active
+    /// review strictness permits cosmetic nits. `Lgtm` always accepts;
+    /// `AcceptWithNits` accepts only when nits are permitted (High strictness
+    /// degrades it to a change request). Strictness gating lives in the caller.
+    pub fn accepts_under(&self, nits_permitted: bool) -> bool {
+        match self {
+            Self::Lgtm => true,
+            Self::AcceptWithNits => nits_permitted,
+            _ => false,
+        }
     }
 }
 
@@ -186,7 +214,7 @@ pub struct RoundRecord {
 ///
 /// Bumped on breaking schema changes. Minor compatible: unknown fields in
 /// payload or envelope must be silently ignored by older consumers.
-pub const RPC_SCHEMA_VERSION: &str = "1.0.0";
+pub const RPC_SCHEMA_VERSION: &str = "1.1.0";
 
 /// Versioned wire envelope used for RPC event streaming between the core
 /// runtime and external consumers (TUI, plugins, telemetry sinks).
@@ -868,5 +896,50 @@ mod tests {
         .to_string();
         let rec: RoundRecord = serde_json::from_str(&wire).expect("decode legacy round");
         assert!(rec.envelope_id.is_none());
+    }
+
+    #[test]
+    fn verdict_accept_with_nits_serde_round_trip() {
+        let wire = serde_json::to_string(&Verdict::AcceptWithNits).expect("serialize verdict");
+        assert_eq!(wire, "\"accept_with_nits\"");
+        let decoded: Verdict = serde_json::from_str(&wire).expect("decode verdict");
+        assert_eq!(decoded, Verdict::AcceptWithNits);
+    }
+
+    #[test]
+    fn accept_with_nits_is_not_terminal_success_but_accepts() {
+        assert!(!Verdict::AcceptWithNits.is_terminal_success());
+        // Strictness-aware acceptance: nits accept only when permitted.
+        assert!(Verdict::AcceptWithNits.accepts_under(true));
+        assert!(!Verdict::AcceptWithNits.accepts_under(false));
+        // Lgtm accepts regardless of strictness; failures never accept.
+        assert!(Verdict::Lgtm.accepts_under(true));
+        assert!(Verdict::Lgtm.accepts_under(false));
+        assert!(!Verdict::RequestChanges.accepts_under(true));
+        assert!(!Verdict::Block.accepts_under(true));
+    }
+
+    #[test]
+    fn round_record_with_accept_with_nits_round_trips() {
+        let rec = RoundRecord {
+            round: 2,
+            lead: AgentOutput::text("lead", "patch"),
+            reviewer: ReviewerFeedback::accept_with_nits(
+                "rev",
+                vec![Issue {
+                    severity: IssueSeverity::Info,
+                    message: "tighten naming".to_string(),
+                }],
+                "ACCEPT_WITH_NITS: tighten naming",
+            ),
+            check_result: Some(CheckResult::Pass),
+            patch_sha: Some("abc123".to_string()),
+            envelope_id: None,
+        };
+        let wire = serde_json::to_string(&rec).expect("serialize round");
+        let decoded: RoundRecord = serde_json::from_str(&wire).expect("decode round");
+        assert_eq!(decoded, rec);
+        assert_eq!(decoded.reviewer.verdict, Verdict::AcceptWithNits);
+        assert_eq!(decoded.reviewer.issues[0].severity, IssueSeverity::Info);
     }
 }

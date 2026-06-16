@@ -531,7 +531,7 @@ impl ModelAdapter for SubprocessAdapter {
         tx: mpsc::Sender<AgentEvent>,
     ) -> Result<ReviewerFeedback> {
         let prompt = format!(
-            "You are the Reviewer Agent for Nerve. Review the Lead output with {strictness} strictness. Start with LGTM, REQUEST_CHANGES, or BLOCK.\n\nTask:\n{}\n\nLead output:\n{}",
+            "You are the Reviewer Agent for Nerve. Review the Lead output with {strictness} strictness. Start with LGTM, ACCEPT_WITH_NITS, REQUEST_CHANGES, or BLOCK. Use ACCEPT_WITH_NITS only when remaining issues are cosmetic/low-severity and need no further changes.\n\nTask:\n{}\n\nLead output:\n{}",
             task.prompt, lead_output.raw_text
         );
         let raw = self.run_prompt(prompt, cwd, &tx).await?;
@@ -664,17 +664,20 @@ fn apply_adapter_limits(
 fn feedback_from_text(reviewer_id: &str, raw_text: String) -> ReviewerFeedback {
     let verdict = parse_verdict(&raw_text);
 
-    let issues = if verdict == Verdict::Lgtm {
-        Vec::new()
-    } else {
-        vec![Issue {
-            severity: if verdict == Verdict::Block {
-                IssueSeverity::Blocking
-            } else {
-                IssueSeverity::Warning
-            },
+    let issues = match verdict {
+        Verdict::Lgtm => Vec::new(),
+        Verdict::AcceptWithNits => vec![Issue {
+            severity: IssueSeverity::Info,
             message: issue_summary_from_text(&raw_text),
-        }]
+        }],
+        Verdict::RequestChanges => vec![Issue {
+            severity: IssueSeverity::Warning,
+            message: issue_summary_from_text(&raw_text),
+        }],
+        Verdict::Block => vec![Issue {
+            severity: IssueSeverity::Blocking,
+            message: issue_summary_from_text(&raw_text),
+        }],
     };
 
     ReviewerFeedback {
@@ -709,6 +712,10 @@ fn parse_verdict(raw_text: &str) -> Verdict {
     let upper = first_line.trim_start().to_uppercase();
     if has_verdict_prefix(&upper, "LGTM") {
         Verdict::Lgtm
+    } else if has_verdict_prefix(&upper, "ACCEPT_WITH_NITS")
+        || has_verdict_prefix(&upper, "ACCEPT WITH NITS")
+    {
+        Verdict::AcceptWithNits
     } else if has_verdict_prefix(&upper, "REQUEST_CHANGES")
         || has_verdict_prefix(&upper, "REQUEST CHANGES")
     {
@@ -756,7 +763,14 @@ fn issue_summary_from_text(raw_text: &str) -> String {
 
 fn strip_verdict_prefix(line: &str) -> Option<&str> {
     let trimmed = line.trim_start();
-    for prefix in ["REQUEST_CHANGES", "REQUEST CHANGES", "BLOCK", "LGTM"] {
+    for prefix in [
+        "ACCEPT WITH NITS",
+        "ACCEPT_WITH_NITS",
+        "REQUEST_CHANGES",
+        "REQUEST CHANGES",
+        "BLOCK",
+        "LGTM",
+    ] {
         if trimmed
             .get(..prefix.len())
             .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
@@ -1035,6 +1049,43 @@ Lead notes before the patch.
 
         assert_eq!(feedback.verdict, Verdict::RequestChanges);
         assert_eq!(feedback.issues[0].message, "Please fix the missing test.");
+    }
+
+    #[test]
+    fn parses_accept_with_nits_token() {
+        let feedback = feedback_from_text(
+            "codex",
+            "ACCEPT_WITH_NITS: minor naming could be tidier".to_string(),
+        );
+
+        assert_eq!(feedback.verdict, Verdict::AcceptWithNits);
+        assert_eq!(feedback.issues.len(), 1);
+        assert_eq!(feedback.issues[0].severity, IssueSeverity::Info);
+        assert_eq!(feedback.issues[0].message, "minor naming could be tidier");
+    }
+
+    #[test]
+    fn accept_with_nits_two_word_form() {
+        let feedback = feedback_from_text(
+            "codex",
+            "ACCEPT WITH NITS - consider renaming the helper".to_string(),
+        );
+
+        assert_eq!(feedback.verdict, Verdict::AcceptWithNits);
+        assert_eq!(feedback.issues.len(), 1);
+        assert_eq!(feedback.issues[0].severity, IssueSeverity::Info);
+        assert_eq!(feedback.issues[0].message, "consider renaming the helper");
+    }
+
+    #[test]
+    fn accept_with_nits_boundary_rejects_acceptance() {
+        let feedback = feedback_from_text(
+            "codex",
+            "ACCEPTANCE criteria are not yet met".to_string(),
+        );
+
+        assert_eq!(feedback.verdict, Verdict::RequestChanges);
+        assert_ne!(feedback.verdict, Verdict::AcceptWithNits);
     }
 
     #[test]

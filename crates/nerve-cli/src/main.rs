@@ -697,7 +697,10 @@ async fn run_pi_benchmark(iterations: u16, live: bool, mock: bool) -> Result<PiB
         let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false)).await?;
         store.save_report(&report)?;
         let patch_id = report.final_patch.as_ref().map(|patch| patch.id.clone());
-        let loop_ok = report.final_feedback.verdict == Verdict::Lgtm
+        let loop_ok = report
+            .final_feedback
+            .verdict
+            .accepts_under(report.selection.review_strictness.permits_nits())
             && !report.blocked
             && !report.rounds.is_empty()
             && patch_id.is_some();
@@ -2586,6 +2589,7 @@ impl InteractiveState {
         };
         match report.final_feedback.verdict {
             Verdict::Lgtm => "lgtm",
+            Verdict::AcceptWithNits => "nits",
             Verdict::RequestChanges => "changes",
             Verdict::Block => {
                 if report.budget_exceeded {
@@ -2765,6 +2769,7 @@ fn render_status_bar(state: &InteractiveState) -> String {
     let verdict_value = state.last_verdict_label();
     let verdict_label = match verdict_value {
         "lgtm" => success("ok"),
+        "nits" => warn("nits"),
         "changes" => warn("changes"),
         value if value.starts_with("block") => error_style("blocked"),
         _ => "-".to_string(),
@@ -5337,6 +5342,44 @@ mod tests {
         let suggestions = command_suggestions("/provider");
 
         assert!(suggestions.iter().any(|spec| spec.command == "/adapter"));
+    }
+
+    #[test]
+    fn interactive_state_labels_accept_with_nits_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("review accepted with nits", dir.path());
+        let report = RunReport {
+            task,
+            selection: nerve_config::ProfileSelection {
+                id: None,
+                lead: "lead".to_string(),
+                reviewer: "reviewer".to_string(),
+                review_strictness: nerve_config::ReviewStrictness::Normal,
+                max_refinement_rounds: 1,
+                plan_strategy: PlanStrategy::Single,
+                plan_system_prompt_override: None,
+            },
+            rounds: Vec::new(),
+            crossfire_feedback: Vec::new(),
+            final_output: nerve_types::AgentOutput::text("lead", "done"),
+            final_feedback: nerve_types::ReviewerFeedback::accept_with_nits(
+                "reviewer",
+                Vec::new(),
+                "Accepted with minor notes",
+            ),
+            final_patch: None,
+            events: Vec::new(),
+            usage: Default::default(),
+            budget_exceeded: false,
+            no_progress_exceeded: false,
+            goal_satisfied: None,
+            applied: false,
+            blocked: false,
+        };
+        let mut state = InteractiveState::new(false, true, None);
+        state.last_report = Some(report);
+
+        assert_eq!(state.last_verdict_label(), "nits");
     }
 
     #[test]

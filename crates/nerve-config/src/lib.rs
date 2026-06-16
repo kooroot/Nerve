@@ -536,6 +536,14 @@ pub enum ReviewStrictness {
     High,
 }
 
+impl ReviewStrictness {
+    /// Whether `AcceptWithNits` may terminate the loop; `High` forces a
+    /// refinement round even on cosmetic nits.
+    pub fn permits_nits(&self) -> bool {
+        matches!(self, Self::Low | Self::Normal)
+    }
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         Self::load_from(env::current_dir().context("failed to read current directory")?)
@@ -808,7 +816,7 @@ fn default_rpc_token_size_bytes() -> usize {
 }
 
 fn default_rpc_envelope_version() -> String {
-    "1.0.0".to_string()
+    "1.1.0".to_string()
 }
 
 fn default_true() -> bool {
@@ -1193,7 +1201,7 @@ mod tests {
         );
         assert_eq!(rpc.token_size_bytes, 32);
         assert!(!rpc.print_token);
-        assert_eq!(rpc.envelope_version, "1.0.0");
+        assert_eq!(rpc.envelope_version, "1.1.0");
 
         // DaemonConfig leaves `rpc` as None to preserve legacy serialized blobs.
         let daemon = DaemonConfig::default();
@@ -1695,5 +1703,12 @@ mod tests {
         let json = serde_json::to_string(&spec).unwrap();
         let back: nerve_types::McpServerSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn review_strictness_permits_nits() {
+        assert!(ReviewStrictness::Low.permits_nits());
+        assert!(ReviewStrictness::Normal.permits_nits());
+        assert!(!ReviewStrictness::High.permits_nits());
     }
 }
