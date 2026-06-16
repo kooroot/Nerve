@@ -5222,8 +5222,20 @@ fn summarize_auth_output(name: &str, text: &str, success: bool) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
-fn collect_context_paths(prompt: &str, cwd: &Path) -> Vec<PathBuf> {
+/// Result of scanning a prompt for referenced context paths.
+///
+/// `missing_explicit` holds tokens the user *unambiguously* meant as file
+/// references (they contain a path separator) but which do not exist on disk.
+/// These are surfaced loudly by [`collect_context_paths`] so the loop never
+/// runs against silently-dropped context (S3: fail-loud context loading).
+struct ContextScan {
+    paths: Vec<PathBuf>,
+    missing_explicit: Vec<PathBuf>,
+}
+
+fn scan_context_paths(prompt: &str, cwd: &Path) -> ContextScan {
     let mut paths = Vec::new();
+    let mut missing_explicit = Vec::new();
     for token in prompt.split_whitespace() {
         let token = token.trim_matches(|ch: char| {
             matches!(
@@ -5232,7 +5244,14 @@ fn collect_context_paths(prompt: &str, cwd: &Path) -> Vec<PathBuf> {
             )
         });
         if looks_like_path_token(token) {
-            push_unique_path(&mut paths, PathBuf::from(token));
+            let path = PathBuf::from(token);
+            // Only `/`-bearing tokens are treated as explicit, unambiguous file
+            // references worth warning about — a bare `config.json` or a version
+            // string like `v1.0.0` must not trigger a false "not found" alarm.
+            if token.contains('/') && !context_path_exists(cwd, &path) {
+                push_unique_path(&mut missing_explicit, path.clone());
+            }
+            push_unique_path(&mut paths, path);
         }
     }
 
@@ -5240,7 +5259,34 @@ fn collect_context_paths(prompt: &str, cwd: &Path) -> Vec<PathBuf> {
         push_unique_path(&mut paths, path);
     }
 
-    paths
+    ContextScan {
+        paths,
+        missing_explicit,
+    }
+}
+
+/// Resolve a referenced path against `cwd` (absolute paths checked as-is) and
+/// report whether it exists.
+fn context_path_exists(cwd: &Path, path: &Path) -> bool {
+    if path.is_absolute() {
+        path.exists()
+    } else {
+        cwd.join(path).exists()
+    }
+}
+
+fn collect_context_paths(prompt: &str, cwd: &Path) -> Vec<PathBuf> {
+    let scan = scan_context_paths(prompt, cwd);
+    for missing in &scan.missing_explicit {
+        eprintln!(
+            "{}",
+            warn(format!(
+                "⚠ referenced path not found: {} — context may be incomplete",
+                missing.display()
+            ))
+        );
+    }
+    scan.paths
 }
 
 fn looks_like_path_token(token: &str) -> bool {
@@ -5298,6 +5344,69 @@ mod tests {
         let paths = collect_context_paths("audit crates/nerve-core/src/lib.rs now", Path::new("."));
 
         assert!(paths.contains(&PathBuf::from("crates/nerve-core/src/lib.rs")));
+    }
+
+    #[test]
+    fn scan_flags_missing_explicit_path_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let scan = scan_context_paths("please fix src/missing/module.rs", dir.path());
+
+        // The slash-bearing reference is collected as context AND flagged missing.
+        assert!(
+            scan.paths
+                .contains(&PathBuf::from("src/missing/module.rs"))
+        );
+        assert!(
+            scan.missing_explicit
+                .contains(&PathBuf::from("src/missing/module.rs")),
+            "missing slash-path must be flagged: {:?}",
+            scan.missing_explicit
+        );
+    }
+
+    #[test]
+    fn scan_does_not_flag_existing_path_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
+
+        let scan = scan_context_paths("review src/lib.rs carefully", dir.path());
+
+        assert!(scan.paths.contains(&PathBuf::from("src/lib.rs")));
+        assert!(
+            scan.missing_explicit.is_empty(),
+            "existing path must not be flagged: {:?}",
+            scan.missing_explicit
+        );
+    }
+
+    #[test]
+    fn scan_does_not_false_alarm_on_dotted_non_path_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        // `v1.0.0` and bare `config.json` lack a path separator: even though
+        // they look path-ish, they must not raise a missing-context alarm.
+        let scan = scan_context_paths("bump to v1.0.0 and tweak config.json", dir.path());
+
+        assert!(
+            scan.missing_explicit.is_empty(),
+            "dotted non-slash tokens must not be flagged: {:?}",
+            scan.missing_explicit
+        );
+    }
+
+    #[test]
+    fn scan_flags_missing_absolute_path_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope/gone.rs");
+        let prompt = format!("inspect {}", missing.display());
+
+        let scan = scan_context_paths(&prompt, dir.path());
+
+        assert!(
+            scan.missing_explicit.contains(&missing),
+            "missing absolute path must be flagged: {:?}",
+            scan.missing_explicit
+        );
     }
 
     #[cfg(unix)]

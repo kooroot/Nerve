@@ -47,7 +47,7 @@ Claude Code와 Codex의 changelog를 벤치마킹해 Nerve의 loop/goal 방향�
 |---|---|---|---|
 | **S1** | accept-with-nits (등급제 verdict) | S | ✅ **DONE** (codex-verified) |
 | **S2** | 탄력적 어댑터 spawn 재시도 | S | ✅ **DONE** (codex-verified) |
-| S3 | fail-loud 컨텍스트 로딩 | S | ⬜ |
+| **S3** | fail-loud 컨텍스트 로딩 | S | ✅ **DONE** |
 
 ### 🌊 Wave 1 — 검증-게이트 코어 (north star)
 | Step | 항목 | effort | 상태 |
@@ -110,3 +110,14 @@ ENOENT/EACCES(바이너리 부재·권한)는 **fail-fast** — 깨진 어댑터
   (1) `ETXTBSY`는 `ResourceBusy`가 아니라 `ErrorKind::ExecutableFileBusy`로 매핑됨(codex가 `from_raw_os_error`로 실증) → 분류 누락 수정.
   (2) 무한 재시도 + `1u32 << attempt` 오버플로(attempt≥32 panic) + 백오프가 타임아웃 밖 → 재시도/백오프 상한(shift≤16, per-attempt≤2s) 추가.
 - 검증: `cargo test --workspace` green (어댑터 40 tests, +오버플로/클램프/errno 회귀 5개), `clippy -D warnings` clean.
+
+### S3 — fail-loud 컨텍스트 로딩 (✅ DONE, 2026-06-16)
+
+`collect_context_paths`가 프롬프트에서 **명시적 파일 참조**(경로 구분자 `/` 포함)를 실제 존재 여부로 검사 →
+없으면 노란색 경고를 stderr로 큰소리(`⚠ referenced path not found: … — context may be incomplete`).
+조용히 컨텍스트를 흘려서 루프가 잘못된 타깃에 "성공"하는 것을 차단(테제: 검증 게이트는 입력부터 신뢰 가능해야).
+
+- `scan_context_paths(prompt, cwd) -> ContextScan { paths, missing_explicit }` (순수·테스트 가능), `context_path_exists`(절대/상대 해석).
+- **오탐 방지**: `/` 없는 점-토큰(`v1.0.0`, 단독 `config.json`)은 경고 안 함 — 명시적 경로 참조만. git-derived 경로는 best-effort(경고 안 함).
+- 기존 동작 보존: missing 경로도 `paths`에는 그대로 포함(프로필 glob 매칭 불변), 경고만 추가.
+- 검증: `cargo test -p nerve-cli` green (+회귀 4개: missing/existing/오탐/절대경로), `clippy -D warnings` clean.
