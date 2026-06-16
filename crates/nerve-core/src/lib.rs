@@ -126,6 +126,13 @@ pub struct RunReport {
     // reports deserializable.
     #[serde(default)]
     pub crossfire_halted: bool,
+    // S15: set when the run was cancelled by the operator at a round seam.
+    // Additive + rejection-direction (mirrors `crossfire_halted`): it feeds
+    // `blocked` and forces `goal_satisfied` false, never the reverse, so a
+    // cancelled run is never applied or marked goal-satisfied.
+    // `#[serde(default)]` keeps older persisted reports deserializable.
+    #[serde(default)]
+    pub cancelled: bool,
     #[serde(default)]
     pub goal_satisfied: Option<bool>,
     pub applied: bool,
@@ -323,6 +330,37 @@ impl ApplyConsent {
     }
 }
 
+/// S15: a forge-proof, shared CANCELLATION handle for a single run. Like
+/// [`ApplyConsent`] it is owned by the daemon and clone-shared with the run task;
+/// the lead subprocess can never reach it, so the lead cannot cancel-then-claim
+/// nor forge a cancel.
+///
+/// REJECTION-SAFE: this can only ever STOP a run. It feeds `cancelled` ->
+/// `blocked` and forces `goal_satisfied=false` at the round seam — never the
+/// reverse — so a cancelled run is always reported blocked and is NEVER applied
+/// or marked goal-satisfied. It mirrors the S10 `crossfire_halted` path exactly
+/// and adds no new accept/apply surface.
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    /// A fresh, un-cancelled handle.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation of this run (idempotent). Honored at the next round
+    /// seam; it never interrupts an in-flight model subprocess mid-generation.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether cancellation has been requested for this run.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
     pub apply: bool,
@@ -343,6 +381,12 @@ pub struct RunOptions {
     /// When set, an operator can escalate THIS run to apply at a round seam; the
     /// gate independently re-judges the patch, so this never weakens acceptance.
     pub apply_grant: Option<ApplyConsent>,
+    /// S15: optional shared handle for mid-run operator CANCELLATION (see
+    /// [`CancelToken`]). `None` (the default) is byte-identical to pre-S15 — the
+    /// seam check is a no-op and `cancelled` is always false. When set, an
+    /// operator can cancel THIS run at a round seam; cancellation is
+    /// rejection-direction only (feeds `blocked`, forces `goal_satisfied=false`).
+    pub cancel_token: Option<CancelToken>,
 }
 
 impl RunOptions {
@@ -353,6 +397,7 @@ impl RunOptions {
             ulimit: None,
             worktree: None,
             apply_grant: None,
+            cancel_token: None,
         }
     }
 
@@ -378,6 +423,22 @@ impl RunOptions {
     pub fn with_apply_grant(mut self, grant: ApplyConsent) -> Self {
         self.apply_grant = Some(grant);
         self
+    }
+
+    /// S15: attach a shared cancel handle so the daemon can cancel this run
+    /// mid-flight at a round seam. See [`CancelToken`].
+    pub fn with_cancel_token(mut self, token: CancelToken) -> Self {
+        self.cancel_token = Some(token);
+        self
+    }
+
+    /// S15: whether this run has been CANCELLED by the operator. REJECTION-SAFE:
+    /// only ever stops a run — the caller feeds it into `cancelled`/`blocked` and
+    /// forces `goal_satisfied=false`, so it can never fabricate an acceptance.
+    fn is_cancelled(&self) -> bool {
+        self.cancel_token
+            .as_ref()
+            .is_some_and(CancelToken::is_cancelled)
     }
 
     /// S11: whether this run may APPLY its accepted patch — the invocation-time
@@ -639,6 +700,10 @@ async fn run_synaptic_loop_inner(
     // loop. Rejection-direction only — it feeds `blocked` and forces
     // `goal_satisfied=false`, mirroring `no_progress_exceeded`.
     let mut crossfire_halted = false;
+    // S15: set when the operator cancels this run at a round seam. Rejection-
+    // direction only — like `crossfire_halted` it feeds `blocked` and forces
+    // `goal_satisfied=false`; it never overrides an acceptance.
+    let mut cancelled = false;
     let mut last_check: Option<CheckResult> = None;
     // S7: best deterministic-check pass-ratio (permille) seen across rounds, so
     // the no-progress guard can also trip when the lead keeps producing DIFFERENT
@@ -701,6 +766,17 @@ async fn run_synaptic_loop_inner(
             _ => false,
         };
         if terminal {
+            break;
+        }
+
+        // S15: operator cancellation, honored at the round seam. Placed AFTER the
+        // terminal-accept check (like `crossfire_halted` below) so it can ONLY
+        // fire on a non-accepting round and never overrides an acceptance already
+        // returned. Rejection-direction: it sets `cancelled` -> `blocked` and
+        // forces `goal_satisfied=false`, so a cancelled run is never applied.
+        if options.is_cancelled() {
+            cancelled = true;
+            final_feedback = cancelled_feedback(reviewer.id());
             break;
         }
 
@@ -812,6 +888,7 @@ async fn run_synaptic_loop_inner(
     let blocked = budget_exceeded
         || no_progress_exceeded
         || crossfire_halted
+        || cancelled
         || goal_check_failed
         || nits_unverified
         || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
@@ -819,7 +896,8 @@ async fn run_synaptic_loop_inner(
     // S11: apply IFF the operator consented (invocation `--apply` OR a mid-run
     // escalation grant) AND the run is not blocked. `apply_consented()` is
     // rejection-direction only; `!blocked` is the unchanged deterministic gate,
-    // so a granted-but-blocked run still never applies.
+    // so a granted-but-blocked run still never applies. S15: a cancelled run is
+    // blocked, so it is never applied.
     let want_apply = options.apply_consented() && !blocked;
     // S12: the auto-mode classifier may DOWNGRADE a would-be apply to a dry-run
     // when the final patch is High risk (Enforce mode). It is monotone —
@@ -849,6 +927,7 @@ async fn run_synaptic_loop_inner(
             && !budget_exceeded
             && !no_progress_exceeded
             && !crossfire_halted
+            && !cancelled
     });
 
     Ok(RunReport {
@@ -864,6 +943,7 @@ async fn run_synaptic_loop_inner(
         budget_exceeded,
         no_progress_exceeded,
         crossfire_halted,
+        cancelled,
         goal_satisfied,
         applied,
         blocked,
@@ -991,7 +1071,13 @@ async fn run_tournament_strategy(
     let nits_unverified = matches!(final_feedback.verdict, Verdict::AcceptWithNits)
         && !(selection.review_strictness.permits_nits()
             && matches!(check_result, CheckResult::Pass));
+    // S15: operator cancellation. The tournament runs a single round whose
+    // generation has already completed by here, so this cannot interrupt the
+    // round mid-flight; it is apply-GATING — a cancelled tournament run is
+    // blocked and therefore never applied or marked goal-satisfied.
+    let cancelled = options.is_cancelled();
     let blocked = budget_exceeded
+        || cancelled
         || goal_check_failed
         || nits_unverified
         || is_blocked(&final_feedback, &config.orchestration.conflict_policy);
@@ -999,7 +1085,8 @@ async fn run_tournament_strategy(
     // S11: apply IFF the operator consented (invocation `--apply` OR a mid-run
     // escalation grant) AND the run is not blocked. `apply_consented()` is
     // rejection-direction only; `!blocked` is the unchanged deterministic gate,
-    // so a granted-but-blocked run still never applies.
+    // so a granted-but-blocked run still never applies. S15: a cancelled run is
+    // blocked, so it is never applied.
     let want_apply = options.apply_consented() && !blocked;
     // S12: the auto-mode classifier may DOWNGRADE a would-be apply to a dry-run
     // when the final patch is High risk (Enforce mode). It is monotone —
@@ -1025,6 +1112,7 @@ async fn run_tournament_strategy(
                 .verdict
                 .accepts_under(selection.review_strictness.permits_nits())
             && !budget_exceeded
+            && !cancelled
     });
 
     Ok(RunReport {
@@ -1042,6 +1130,7 @@ async fn run_tournament_strategy(
         // Tournament has no crossfire (single round, no scratch watcher), so it
         // can never be halted by a live crossfire Block.
         crossfire_halted: false,
+        cancelled,
         goal_satisfied,
         applied,
         blocked,
@@ -1170,6 +1259,23 @@ fn no_progress_feedback(reviewer_id: &str, count: u8) -> ReviewerFeedback {
         suggested_patch: None,
         cost: None,
         raw_text: format!("BLOCK: no-progress exceeded after {count} stalled rounds"),
+    }
+}
+
+/// S15: the rejection feedback recorded when an operator cancels a run at a round
+/// seam. A `Block` verdict (like `no_progress_feedback`/`budget_exceeded_feedback`)
+/// so a cancelled run is reported blocked and is never applied or goal-satisfied.
+fn cancelled_feedback(reviewer_id: &str) -> ReviewerFeedback {
+    ReviewerFeedback {
+        reviewer_id: reviewer_id.to_string(),
+        verdict: Verdict::Block,
+        issues: vec![Issue {
+            severity: IssueSeverity::Blocking,
+            message: "Run cancelled by operator".to_string(),
+        }],
+        suggested_patch: None,
+        cost: None,
+        raw_text: "BLOCK: run cancelled by operator".to_string(),
     }
 }
 
@@ -2407,6 +2513,142 @@ mod tests {
             .unwrap();
 
         assert!(!report.crossfire_halted);
+    }
+
+    // --- S15: operator cancellation (round-seam, rejection-direction) ---------
+
+    #[tokio::test]
+    async fn cancel_at_seam_blocks_and_never_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("cancel path", dir.path());
+        let config = crossfire_config("redirect");
+        let lead = CrossfireLeadAdapter::new();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(lead.clone()),
+            // review is RequestChanges (non-accepting AND not Block), and crossfire
+            // never blocks — so the ONLY thing that can stop the loop at round 0 is
+            // the operator cancel. This isolates the cancel as the cause.
+            Box::new(CrossfireReviewerAdapter {
+                review_verdict: Verdict::RequestChanges,
+                crossfire_verdict: Verdict::RequestChanges,
+            }),
+        ];
+
+        // Operator cancelled before the first seam. apply=true proves the cancel's
+        // `blocked` gate prevents application (the load-bearing N1 guard).
+        let token = CancelToken::new();
+        token.cancel();
+        let options = RunOptions::new(true).with_cancel_token(token);
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert!(report.cancelled, "run must be marked cancelled");
+        assert!(report.blocked, "cancelled run must be blocked");
+        assert!(!report.applied, "cancelled run must NEVER apply");
+        assert_ne!(
+            report.goal_satisfied,
+            Some(true),
+            "cancelled run must never be goal-satisfied"
+        );
+        assert_eq!(report.final_feedback.verdict, Verdict::Block);
+        // Cancel short-circuits at round 0 → no refine ever runs.
+        assert!(lead.captured().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_never_overrides_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("accept path", dir.path());
+        let config = crossfire_config("redirect");
+        let lead = CrossfireLeadAdapter::new();
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(lead.clone()),
+            // review ACCEPTS (Lgtm) → round 0 is terminal. The terminal-accept
+            // check precedes the cancel check, so a cancel can NEVER override an
+            // acceptance already returned (rejection-direction only — N2 guard).
+            Box::new(CrossfireReviewerAdapter {
+                review_verdict: Verdict::Lgtm,
+                crossfire_verdict: Verdict::RequestChanges,
+            }),
+        ];
+
+        // Cancel is SET, but round 0 already accepts → acceptance wins.
+        let token = CancelToken::new();
+        token.cancel();
+        let options = RunOptions::new(false).with_cancel_token(token);
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
+        assert!(!report.cancelled);
+        assert!(!report.blocked);
+    }
+
+    #[tokio::test]
+    async fn cancel_token_uncancelled_is_inert() {
+        // An ATTACHED but un-cancelled token must change nothing: the run reaches
+        // its normal acceptance and is not marked cancelled (N4 byte-identical).
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("inert token", dir.path());
+        let config = crossfire_config("redirect");
+        let adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(CrossfireLeadAdapter::new()),
+            Box::new(CrossfireReviewerAdapter {
+                review_verdict: Verdict::Lgtm,
+                crossfire_verdict: Verdict::RequestChanges,
+            }),
+        ];
+
+        let token = CancelToken::new(); // never cancelled
+        let options = RunOptions::new(false).with_cancel_token(token);
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert!(!report.cancelled);
+        assert_eq!(report.final_feedback.verdict, Verdict::Lgtm);
+    }
+
+    #[tokio::test]
+    async fn tournament_cancel_blocks_and_never_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("cancel tournament", dir.path());
+        let config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "tournament",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": {
+                "architect": "candidate-a",
+                "reviewer": "candidate-b"
+              },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        let adapters = vec![
+            Box::new(TournamentAdapter::new("candidate-a")) as Box<dyn ModelAdapter>,
+            Box::new(TournamentAdapter::new("candidate-b")) as Box<dyn ModelAdapter>,
+        ];
+
+        // The tournament's single round completes (a winner is chosen), but the
+        // operator cancelled — so the run is blocked and never applied even though
+        // a candidate would otherwise have been accepted (apply-gating).
+        let token = CancelToken::new();
+        token.cancel();
+        let options = RunOptions::new(true).with_cancel_token(token);
+        let report = run_synaptic_loop(task, &config, &adapters, options)
+            .await
+            .unwrap();
+
+        assert!(report.cancelled, "tournament run must be marked cancelled");
+        assert!(report.blocked, "cancelled tournament run must be blocked");
+        assert!(!report.applied, "cancelled tournament run must NEVER apply");
+        assert_ne!(report.goal_satisfied, Some(true));
     }
 
     #[test]

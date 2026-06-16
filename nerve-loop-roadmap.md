@@ -71,7 +71,7 @@ Claude Code와 Codex의 changelog를 벤치마킹해 Nerve의 loop/goal 방향�
 |---|---|---|---|
 | S13 | 실행형 plan → loop 핸드오프 (Steps → Task/PatrolTask) | L | ✅ |
 | S14 | Agent-Teams 조율 원장 (공유 task 원장 + mailbox + 파일락 claim) | L | ✅ |
-| S15 | Conductor 라이브 상태 + 일괄 cancel (S9 의존) | L | ⬜ |
+| S15 | Conductor 라이브 상태 + 일괄 cancel (S9 의존) | L | ✅ |
 
 ---
 
@@ -689,3 +689,46 @@ apply consent는 lead가 위조 불가).
   { return Ok(Vec::new()); }` early-return 추가(`send_mail`/`mutate_ledger`와 동일 가드, FS 접근 전) + 비활성
   drain이 기존 파일을 안 읽고 안 지우는 회귀 테스트 + traversal 테스트를 `\`/탭/NUL/129바이트로 강화(codex nit).
   동일 clean HEAD에서 연속 2회 no-blocking 리뷰로 LAND.
+
+### S15 — Conductor 라이브 상태 + 일괄 cancel (S9 의존) (✅ DONE, 2026-06-17)
+
+S9 데몬은 라운드 이음새를 **라이브** 스트리밍하지만 in-flight run을 **중단**할 길이 없었다(라운드-이음새
+cancel-token을 S9에서 S15로 의도적 연기). S15는 (1) **일괄 cancel** — 라운드-이음새 cancel-token + per-run 및
+bulk cancel RPC — 과 (2) **Conductor 라이브 상태**(인-메모리 레지스트리 스냅샷 RPC)를 더한다. 마지막 스텝.
+
+**North star(반드시 유지)**: (N1) cancel은 **절대 수락/apply를 위조하지 않음** — 거부-방향 전용 신호. `cancelled`를
+기존 `blocked` OR-체인에 항 하나로 추가(consensus `lib.rs`, tournament `lib.rs`)하고 `goal_satisfied`에서 AND-NOT.
+apply는 `apply_consented() && !blocked`(S11)이므로 cancelled⇒blocked⇒**apply 불가** + goal_satisfied=false.
+S10 `crossfire_halted` 경로를 그대로 재사용 — 새 수락/apply 표면 없음. (N2) **라운드 이음새에서만** — cancel은
+`synapse.record_round(...)` **직후**, 그리고 **terminal-accept 체크 이후**에 검사(=crossfire_halted와 동일 위치)라
+**비수락 라운드에서만** 발화하고 이미 반환된 수락을 절대 못 뒤집는다. 생성 중간엔 안 됨(lead 모델 서브프로세스는
+kill_on_drop 아님). (N3) **데몬 소유·lead 도달 불가**(S11 ApplyConsent 미러): `CancelToken`=`Arc<AtomicBool>`
+newtype, 데몬이 레지스트리에 한 clone, run 태스크가 RunOptions로 다른 clone — lead 서브프로세스는 절대 도달/위조
+불가. (N4) **무-토큰 byte-identical**: `RunOptions.cancel_token: Option<CancelToken>` Default=None ⇒ 이음새 검사
+no-op, `cancelled` 항상 false ⇒ S15 이전과 비트 동일. (N5) **bulk cancel = 명시적 운영자 opt-in**: RPC 전용,
+`all:true` 명시 필요, 끝난 run은 no-op(`grant_in_flight`의 `!is_finished` 가드 미러). (N6) Conductor 라이브
+상태는 **관측 전용**(S14 원장 미러) — liveness/진행만 보고, applied/blocked/goal_satisfied 키 부재.
+
+- `nerve-core/lib.rs`: `CancelToken(Arc<AtomicBool>)` newtype(`new`/`cancel`/`is_cancelled`, SeqCst, Clone=공유
+  핸들) — ApplyConsent와 동형, 거부-안전 doc. `RunOptions.cancel_token` + `with_cancel_token` + private
+  `is_cancelled()`. `RunReport.cancelled: bool`(`#[serde(default)]`, crossfire_halted 옆 — 가산·구버전 역직렬화
+  유지). `cancelled_feedback`(Block verdict, no_progress_feedback 미러). **consensus 루프**: `cancelled` 플래그를
+  이음새(record_round 직후, terminal break 뒤·Block break 앞)에서 검사→break, `blocked |= cancelled`,
+  goal_satisfied `&& !cancelled`, RunReport에 `cancelled`. **tournament**(단일 라운드): record_round 후
+  `let cancelled = options.is_cancelled();` → 동일하게 blocked/goal_satisfied/RunReport 반영(생성은 이미 끝났으니
+  apply-게이팅 — cancelled tournament run은 blocked·미적용, 단 라운드 중간 중단은 불가, 정직히 명시).
+- `nerve-core/store.rs`: 3개 테스트 픽스처 RunReport에 `cancelled: false` 추가(가산 필드).
+- `nerve-cli/main.rs`: `TrackedRun{join,consent,cancel: CancelToken}`. `cancel_in_flight`(grant_in_flight 미러 —
+  부재/끝난 run no-op) + `cancel_all_in_flight`(끝난 run 제외, 취소 수 반환). `spawn_streaming_run`이 토큰 생성→
+  run options(`with_cancel_token`)+레지스트리에 clone. RPC **`cancel`**(`all:true`면 bulk `cancel_all_ack{count}`,
+  아니면 `run_id`→`cancel_ack{run_id,cancelled}`; **디스크 쓰기 없음**) + RPC **`conductor`**(레지스트리 prune 후
+  per-run `conductor_run{run_id,running,cancelled}` + `conductor_end{live}`, **수락 키 부재**). `session.ended`
+  엔벨로프에 가산 `"cancelled"` 키(스키마 bump 아님).
+- 검증: `cargo build --workspace` clean, `cargo test --workspace` green (core 208→212 [+4: cancel-at-seam
+  blocks&never-applies / cancel-never-overrides-acceptance(N2) / uncancelled-token-inert(N4) / tournament-cancel-
+  blocks&never-applies], cli 63→65 [+2: cancel-targets-only-in-flight / cancel-all-cancels-live-only],
+  config 53, adapter 92, patch 20, types 25, tui 13, integration 16+4),
+  `cargo clippy --workspace --all-targets -- -D warnings` exit 0.
+- DOUBLE 리뷰: codex 독립 리뷰(자체 `CARGO_TARGET_DIR`로 build/test/clippy 재실행 + N1-N6를 REFUTE 시도 —
+  특히 N1 cancelled⇒blocked⇒미적용/goal_satisfied=false, N2 수락 미오버라이드, N3 lead 도달 불가, N4 무-토큰
+  바이트 동일, N6 conductor 관측-전용). 동일 clean HEAD에서 연속 2회 no-blocking 리뷰로 LAND.

@@ -11,8 +11,8 @@ use nerve_config::{
 use nerve_core::session_fork::{ForkOptions as CoreForkOptions, SessionTree};
 use nerve_core::store::{ApprovalGrant, NerveStore, RunCheckpoint};
 use nerve_core::{
-    ApplyConsent, AuditChainState, BudgetAuditEntry, BudgetSnapshot, ChainStatus, DoctorCheck,
-    DoctorStatus, ForkConfig as CoreForkConfig, GoalIntentConverter, Mayor,
+    ApplyConsent, AuditChainState, BudgetAuditEntry, BudgetSnapshot, CancelToken, ChainStatus,
+    DoctorCheck, DoctorStatus, ForkConfig as CoreForkConfig, GoalIntentConverter, Mayor,
     PROJECT_VERIFIER_CONSENT_ENV, Patrol, PatrolTask, PlanError, PlanRunOptions, RpcBus,
     RunOptions, RunReport, SessionForker, append_budget_audit_entry, doctor_checks,
     format_chain_broken, is_valid_queue_id, parse_plan_steps_from_markdown,
@@ -4744,14 +4744,16 @@ fn rpc_envelope(kind: &str, payload: serde_json::Value) -> RpcEnvelope {
     RpcEnvelope::new(kind, payload).with_fresh_metadata()
 }
 
-/// S9/S11: a tracked in-flight run — its join handle (for graceful shutdown)
-/// plus its S11 [`ApplyConsent`] handle (so the operator can escalate THIS run
-/// to apply mid-flight via the `approve` command). The consent handle is held
-/// in the daemon's memory and is unreachable by the lead subprocess, which is
-/// what makes it a forge-proof consent signal (see `ApplyConsent`).
+/// S9/S11/S15: a tracked in-flight run — its join handle (for graceful shutdown),
+/// its S11 [`ApplyConsent`] handle (so the operator can escalate THIS run to apply
+/// mid-flight via `approve`), and its S15 [`CancelToken`] (so the operator can
+/// cancel THIS run via `cancel`). Both handles are held in the daemon's memory and
+/// are unreachable by the lead subprocess, which is what makes consent forge-proof
+/// and cancellation un-spoofable (see `ApplyConsent` / `CancelToken`).
 struct TrackedRun {
     join: JoinHandle<()>,
     consent: ApplyConsent,
+    cancel: CancelToken,
 }
 
 /// S11: grant apply-consent to an in-flight run, returning whether a grant was
@@ -4769,6 +4771,36 @@ fn grant_in_flight(reg: &HashMap<String, TrackedRun>, run_id: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// S15: cancel a specific in-flight run, returning whether a cancel was sent. Like
+/// [`grant_in_flight`], a run-id that is ABSENT *or already FINISHED* returns
+/// `false` and flips nothing — a finished run has already passed its last round
+/// seam, so cancelling it would do nothing but report a misleading success. The
+/// flip is rejection-direction only: it can never apply or accept a run, only stop
+/// one (the cancelled run is reported blocked, never applied).
+fn cancel_in_flight(reg: &HashMap<String, TrackedRun>, run_id: &str) -> bool {
+    match reg.get(run_id) {
+        Some(run) if !run.join.is_finished() => {
+            run.cancel.cancel();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// S15: bulk-cancel EVERY in-flight run, returning the count cancelled. Only
+/// not-yet-finished runs are flipped (finished ones are no-ops). Explicit operator
+/// opt-in (`cancel` with `all:true`); rejection-direction only.
+fn cancel_all_in_flight(reg: &HashMap<String, TrackedRun>) -> usize {
+    let mut count = 0;
+    for run in reg.values() {
+        if !run.join.is_finished() {
+            run.cancel.cancel();
+            count += 1;
+        }
+    }
+    count
 }
 
 /// S9: tracks in-flight (nonblocking) run tasks by run-id so the daemon read
@@ -4884,6 +4916,10 @@ fn emit_terminal_envelopes(report: &RunReport, bus: &RpcBus) -> Result<()> {
             // S10: additive field naming the live-crossfire-Block reason behind a
             // blocked run (Halt action). Additive payload key, no schema bump.
             "crossfire_halted": report.crossfire_halted,
+            // S15: additive field — true when the run was cancelled by the
+            // operator at a round seam (rejection-direction; the run is blocked
+            // and never applied). Additive payload key, no schema bump.
+            "cancelled": report.cancelled,
             // S12: additive field — true when the auto-mode classifier downgraded
             // an operator-consented apply to a dry-run because the patch was High
             // risk (Enforce). The run was NOT blocked (acceptance is unchanged);
@@ -4957,6 +4993,11 @@ fn spawn_streaming_run(
     // by the lead subprocess.
     let consent = ApplyConsent::new();
     let run_consent = consent.clone();
+    // S15: the shared cancel handle for THIS run. Same ownership model — the run
+    // task holds one clone (checked at each round seam); the registry holds
+    // another so the operator can `cancel` this run-id mid-flight.
+    let cancel = CancelToken::new();
+    let run_cancel = cancel.clone();
 
     let (round_tx, mut round_rx) = mpsc::unbounded_channel::<RoundRecord>();
 
@@ -4978,7 +5019,9 @@ fn spawn_streaming_run(
     let run_bus = bus.clone();
     let run_id_for_task = run_id.clone();
     let handle = tokio::spawn(async move {
-        let mut options = RunOptions::new(apply).with_apply_grant(run_consent);
+        let mut options = RunOptions::new(apply)
+            .with_apply_grant(run_consent)
+            .with_cancel_token(run_cancel);
         if let Some(spec) = config.orchestration.check_ulimit.as_ref()
             && !spec.is_empty()
         {
@@ -5031,6 +5074,7 @@ fn spawn_streaming_run(
             TrackedRun {
                 join: handle,
                 consent,
+                cancel,
             },
         );
     }
@@ -5141,6 +5185,84 @@ async fn handle_rpc_command(
                     "type": "approve_ack",
                     "run_id": run_id,
                     "granted": granted,
+                })
+            );
+        }
+        "cancel" => {
+            // S15: cancel in-flight run(s). `all:true` cancels EVERY in-flight run
+            // (explicit operator opt-in for bulk); otherwise `run_id` names a
+            // single run. Flips the IN-MEMORY `CancelToken` the lead cannot reach;
+            // honored at the next round seam. Rejection-direction only — a
+            // cancelled run is reported blocked and is NEVER applied, so this can
+            // never weaken acceptance. No disk write: the cancelled run's blocked
+            // report is persisted by the normal finalize path.
+            let all = value
+                .get("all")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if all {
+                let count = match registry.lock() {
+                    Ok(reg) => cancel_all_in_flight(&reg),
+                    Err(_) => 0,
+                };
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "cancel_all_ack",
+                        "count": count,
+                    })
+                );
+            } else {
+                let run_id = value
+                    .get("run_id")
+                    .or_else(|| value.get("session_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .context("missing string field `run_id` (or `all: true`)")?;
+                // Only an in-flight run can still reach a round seam, so only it
+                // can be cancelled; a finished/unknown run-id is a no-op.
+                let cancelled = match registry.lock() {
+                    Ok(reg) => cancel_in_flight(&reg, run_id),
+                    Err(_) => false,
+                };
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "cancel_ack",
+                        "run_id": run_id,
+                        "cancelled": cancelled,
+                    })
+                );
+            }
+        }
+        "conductor" => {
+            // S15: Conductor LIVE state — a snapshot of the in-memory run registry
+            // (this daemon process only; unlike `status` it is not restored from
+            // on-disk checkpoints). OBSERVABILITY ONLY: it reports liveness, never
+            // acceptance — the payload deliberately carries NO
+            // applied/blocked/goal_satisfied keys (mirrors S9 `status` and the S14
+            // ledger's non-authoritative contract).
+            let mut live = 0usize;
+            if let Ok(mut reg) = registry.lock() {
+                // Prune finished entries so the snapshot reflects live runs.
+                reg.retain(|_, run| !run.join.is_finished());
+                for (run_id, run) in reg.iter() {
+                    live += 1;
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "conductor_run",
+                            "run_id": run_id,
+                            "running": true,
+                            "cancelled": run.cancel.is_cancelled(),
+                        })
+                    );
+                }
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "conductor_end",
+                    "live": live,
                 })
             );
         }
@@ -6075,6 +6197,7 @@ mod tests {
             TrackedRun {
                 join: finished,
                 consent: finished_consent.clone(),
+                cancel: CancelToken::new(),
             },
         );
 
@@ -6086,6 +6209,7 @@ mod tests {
             TrackedRun {
                 join: inflight,
                 consent: inflight_consent.clone(),
+                cancel: CancelToken::new(),
             },
         );
 
@@ -6097,6 +6221,97 @@ mod tests {
         // In-flight run: granted, consent flipped.
         assert!(grant_in_flight(&reg, "inflight"));
         assert!(inflight_consent.is_granted());
+    }
+
+    // --- S15: bulk cancel (in-memory, rejection-direction) --------------------
+
+    #[tokio::test]
+    async fn cancel_targets_only_in_flight_runs() {
+        // Mirrors `approve_grants_only_in_flight_runs`: a finished/unknown run-id
+        // is a no-op, only a live run is flipped. Cancelling can only ever STOP a
+        // run (the cancelled run is reported blocked, never applied).
+        let mut reg: HashMap<String, TrackedRun> = HashMap::new();
+
+        let finished = tokio::spawn(async {});
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let finished_cancel = CancelToken::new();
+        reg.insert(
+            "finished".to_string(),
+            TrackedRun {
+                join: finished,
+                consent: ApplyConsent::new(),
+                cancel: finished_cancel.clone(),
+            },
+        );
+
+        let inflight = tokio::spawn(std::future::pending::<()>());
+        let inflight_cancel = CancelToken::new();
+        reg.insert(
+            "inflight".to_string(),
+            TrackedRun {
+                join: inflight,
+                consent: ApplyConsent::new(),
+                cancel: inflight_cancel.clone(),
+            },
+        );
+
+        // Finished run: not cancelled (token untouched).
+        assert!(!cancel_in_flight(&reg, "finished"));
+        assert!(!finished_cancel.is_cancelled());
+        // Unknown run-id: not cancelled.
+        assert!(!cancel_in_flight(&reg, "does-not-exist"));
+        // In-flight run: cancelled, token flipped.
+        assert!(cancel_in_flight(&reg, "inflight"));
+        assert!(inflight_cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancel_all_cancels_live_runs_only() {
+        let mut reg: HashMap<String, TrackedRun> = HashMap::new();
+
+        let finished = tokio::spawn(async {});
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let finished_cancel = CancelToken::new();
+        reg.insert(
+            "finished".to_string(),
+            TrackedRun {
+                join: finished,
+                consent: ApplyConsent::new(),
+                cancel: finished_cancel.clone(),
+            },
+        );
+
+        let a = tokio::spawn(std::future::pending::<()>());
+        let a_cancel = CancelToken::new();
+        reg.insert(
+            "a".to_string(),
+            TrackedRun {
+                join: a,
+                consent: ApplyConsent::new(),
+                cancel: a_cancel.clone(),
+            },
+        );
+        let b = tokio::spawn(std::future::pending::<()>());
+        let b_cancel = CancelToken::new();
+        reg.insert(
+            "b".to_string(),
+            TrackedRun {
+                join: b,
+                consent: ApplyConsent::new(),
+                cancel: b_cancel.clone(),
+            },
+        );
+
+        // Bulk cancel flips BOTH live runs and leaves the finished one untouched.
+        let count = cancel_all_in_flight(&reg);
+        assert_eq!(count, 2);
+        assert!(a_cancel.is_cancelled());
+        assert!(b_cancel.is_cancelled());
+        assert!(!finished_cancel.is_cancelled());
     }
 
     // --- S9: live round-seam stream + status helpers --------------------------
@@ -6301,6 +6516,7 @@ mod tests {
             budget_exceeded: false,
             no_progress_exceeded: false,
             crossfire_halted: false,
+            cancelled: false,
             goal_satisfied: None,
             applied: false,
             blocked: false,
@@ -6338,6 +6554,7 @@ mod tests {
             budget_exceeded: false,
             no_progress_exceeded: false,
             crossfire_halted: false,
+            cancelled: false,
             goal_satisfied: None,
             applied: false,
             blocked: false,
@@ -7191,6 +7408,7 @@ mod tests {
             budget_exceeded: false,
             no_progress_exceeded: false,
             crossfire_halted: false,
+            cancelled: false,
             goal_satisfied: None,
             applied: false,
             blocked: false,
