@@ -85,6 +85,7 @@ impl GoalEvaluator {
             Ok(result) => result,
             Err(err) => CheckResult::Fail {
                 reason: err.to_string(),
+                progress: None,
             },
         }
     }
@@ -152,6 +153,7 @@ impl GoalEvaluator {
                 let _ = child.wait().await;
                 return Ok(CheckResult::Fail {
                     reason: format!("timeout after {}s", self.goal.timeout_secs),
+                    progress: None,
                 });
             }
         };
@@ -161,6 +163,7 @@ impl GoalEvaluator {
             Err(err) => {
                 return Ok(CheckResult::Fail {
                     reason: format!("failed to await check_cmd: {err}"),
+                    progress: None,
                 });
             }
         };
@@ -169,17 +172,23 @@ impl GoalEvaluator {
         if let Err(OutputCapExceeded(byte_cap)) = stdout_res {
             return Ok(CheckResult::Fail {
                 reason: format!("stdout exceeded {byte_cap} bytes"),
+                progress: None,
             });
         }
         if let Err(OutputCapExceeded(byte_cap)) = stderr_res {
             return Ok(CheckResult::Fail {
                 reason: format!("stderr exceeded {byte_cap} bytes"),
+                progress: None,
             });
         }
 
         if status.success() {
             Ok(CheckResult::Pass)
         } else {
+            // Both reads are `Ok` here — the cap checks above returned early on
+            // `Err`. The pass-ratio (S7 progress) comes from whichever stream
+            // carried the test summary; tools print it to stdout or stderr.
+            let stdout_text = stdout_res.unwrap_or_default();
             let stderr_text = stderr_res.unwrap_or_default();
             let tail = tail_for_reason(&stderr_text);
             let reason = if tail.is_empty() {
@@ -187,7 +196,8 @@ impl GoalEvaluator {
             } else {
                 format!("status {status}: {tail}")
             };
-            Ok(CheckResult::Fail { reason })
+            let progress = parse_progress(&stdout_text, &stderr_text);
+            Ok(CheckResult::Fail { reason, progress })
         }
     }
 }
@@ -229,6 +239,69 @@ fn tail_for_reason(text: &str) -> String {
         start += 1;
     }
     trimmed[start..].to_string()
+}
+
+/// S7 best-effort distance-to-goal: the pass-ratio of a recognizable test
+/// summary in the failed check's output, in PERMILLE (0..=1000). Recognizes
+/// libtest (`N passed; M failed; ...`) and pytest (`M failed, N passed in ...`)
+/// summaries in either stream, preferring the LAST such line (the final summary).
+/// Returns `None` when nothing is recognized — progress is additive telemetry and
+/// a stall hint, never an acceptance signal, so an unparsed check just lacks it.
+///
+/// When BOTH streams carry a recognizable summary, take the most pessimistic
+/// (minimum) ratio rather than letting either stream win by position. The lead
+/// controls the check's output, so a forged `1000 passed; 0 failed` on one stream
+/// must not be able to mask a real failure summary on the other. Reporting the
+/// worst ratio only ever feeds MORE stall pressure (toward abort), never less —
+/// consistent with progress being a reject-only signal.
+fn parse_progress(stdout: &str, stderr: &str) -> Option<u16> {
+    match (parse_progress_in(stdout), parse_progress_in(stderr)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (only, None) | (None, only) => only,
+    }
+}
+
+/// Last recognizable test-summary pass-ratio (permille) in one stream.
+fn parse_progress_in(text: &str) -> Option<u16> {
+    text.lines().filter_map(progress_from_line).next_back()
+}
+
+/// Pass-ratio (permille) of a single line, if it carries `passed`/`failed`
+/// counts. Either count may be absent (treated as 0); a line with neither, or a
+/// zero total, yields `None`.
+fn progress_from_line(line: &str) -> Option<u16> {
+    let passed = count_before_word(line, "passed");
+    let failed = count_before_word(line, "failed");
+    let (passed, failed) = match (passed, failed) {
+        (None, None) => return None,
+        (p, f) => (p.unwrap_or(0), f.unwrap_or(0)),
+    };
+    let total = passed.checked_add(failed)?;
+    if total == 0 {
+        return None;
+    }
+    // passed <= total, so this is <= 1000 and fits in u16; `.min` is belt-and-braces.
+    Some((passed.saturating_mul(1000) / total).min(1000) as u16)
+}
+
+/// The integer token immediately preceding a whole-word `word` on the line (the
+/// LAST such pair if several), e.g. `3` in `3 passed`. Splitting on whitespace
+/// and `;,:` isolates libtest/pytest count tokens while ignoring prose, so a bare
+/// word like "passed" with no leading number is not miscounted.
+fn count_before_word(line: &str, word: &str) -> Option<u64> {
+    let tokens: Vec<&str> = line
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | ',' | ':'))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut found = None;
+    for pair in tokens.windows(2) {
+        if pair[1].trim_end_matches('.') == word
+            && let Ok(n) = pair[0].parse::<u64>()
+        {
+            found = Some(n);
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -286,7 +359,7 @@ mod tests {
         .unwrap();
         let result = evaluator.evaluate().await;
         match result {
-            CheckResult::Fail { reason } => {
+            CheckResult::Fail { reason, .. } => {
                 assert!(reason.contains("timeout"), "reason = {reason}")
             }
             other => panic!("expected timeout fail, got {other:?}"),
@@ -305,7 +378,7 @@ mod tests {
         .unwrap();
         let result = evaluator.evaluate().await;
         match result {
-            CheckResult::Fail { reason } => {
+            CheckResult::Fail { reason, .. } => {
                 assert!(reason.contains("exceeded"), "reason = {reason}")
             }
             other => panic!("expected output cap fail, got {other:?}"),
@@ -334,5 +407,105 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, GoalError::InvalidSpec(_)));
+    }
+
+    #[test]
+    fn parse_progress_libtest_summary() {
+        // libtest separates counts with `;`; 3/4 passed = 750 permille.
+        let out = "running 4 tests\n....\n\
+            test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+        assert_eq!(parse_progress(out, ""), Some(750));
+    }
+
+    #[test]
+    fn parse_progress_pytest_summary_in_stderr() {
+        // pytest writes `M failed, N passed` (failed first); may land in stderr.
+        let err = "===== 1 failed, 3 passed in 0.12s =====\n";
+        assert_eq!(parse_progress("", err), Some(750));
+    }
+
+    #[test]
+    fn parse_progress_all_failed_is_zero() {
+        assert_eq!(
+            parse_progress("test result: FAILED. 0 passed; 2 failed; 0 ignored\n", ""),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn parse_progress_unrecognized_is_none() {
+        assert_eq!(parse_progress("error[E0382]: borrow of moved value\n", ""), None);
+        // Prose that mentions the words without leading counts must not be parsed.
+        assert_eq!(
+            parse_progress("the lint check passed but the build failed\n", ""),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_progress_prefers_last_summary_line() {
+        // With several test binaries, the final summary wins (1/4 = 250 permille).
+        let out = "test result: ok. 2 passed; 0 failed\n\
+            test result: FAILED. 1 passed; 3 failed\n";
+        assert_eq!(parse_progress(out, ""), Some(250));
+    }
+
+    #[test]
+    fn parse_progress_takes_worst_across_streams() {
+        // The lead controls both streams; a forged all-pass summary on one must not
+        // mask a real failure summary on the other. The pessimistic (min) ratio wins,
+        // so this only ever feeds MORE stall pressure, never a rosier signal.
+        let stdout = "test result: ok. 10 passed; 0 failed\n";
+        let stderr = "===== 1 failed, 0 passed in 0.01s =====\n";
+        assert_eq!(parse_progress(stdout, stderr), Some(0));
+        // Order-independent: same worst-case regardless of which stream is rosy.
+        assert_eq!(parse_progress(stderr, stdout), Some(0));
+    }
+
+    #[test]
+    fn check_result_progress_accessor() {
+        assert_eq!(CheckResult::Pass.progress(), Some(1.0));
+        assert_eq!(CheckResult::Skipped.progress(), None);
+        assert_eq!(
+            CheckResult::Fail {
+                reason: "x".into(),
+                progress: Some(750),
+            }
+            .progress(),
+            Some(0.75)
+        );
+        assert_eq!(
+            CheckResult::Fail {
+                reason: "x".into(),
+                progress: None,
+            }
+            .progress(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_evaluator_fail_carries_parsed_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let evaluator = GoalEvaluator::new(
+            spec_with_cmd(
+                vec![
+                    "sh",
+                    "-c",
+                    "echo 'test result: FAILED. 3 passed; 1 failed; 0 ignored'; exit 1",
+                ],
+                5,
+            ),
+            Vec::new(),
+            4096,
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        let result = evaluator.evaluate().await;
+        assert_eq!(result.progress(), Some(0.75), "got {result:?}");
+        match result {
+            CheckResult::Fail { progress, .. } => assert_eq!(progress, Some(750)),
+            other => panic!("expected fail with progress, got {other:?}"),
+        }
     }
 }

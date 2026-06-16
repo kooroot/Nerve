@@ -261,6 +261,10 @@ pub async fn run_synaptic_loop(
     let mut no_progress_count: u8 = 0;
     let mut no_progress_exceeded = false;
     let mut last_check: Option<CheckResult> = None;
+    // S7: best deterministic-check pass-ratio (permille) seen across rounds, so
+    // the no-progress guard can also trip when the lead keeps producing DIFFERENT
+    // patches that never get closer to green.
+    let mut best_progress: Option<u16> = None;
 
     for round_index in 0..=max_refinement_rounds {
         if budget_exceeded {
@@ -325,15 +329,26 @@ pub async fn run_synaptic_loop(
             break;
         }
 
-        // ma-1 no-progress guard: identical patch hash + RequestChanges (or a
-        // strict-mode stuck AcceptWithNits) in a row.
+        // no-progress guard (ma-1 + S7): a refinement round that fails to move
+        // toward the goal. `round_is_stalled` trips on an identical patch hash
+        // (the original guard) for a RequestChanges / strict-mode-stuck
+        // AcceptWithNits round, OR — when the check exposes a measurable
+        // pass-ratio — on a DIFFERENT patch that still doesn't beat the best
+        // progress seen so far (a lead churning without getting closer to green).
+        // This only ever ABORTS the loop (a give-up that blocks acceptance) — it
+        // can never turn a non-accepting round into an acceptance.
+        let round_progress = check_result_progress(&check_result);
         if no_progress_max > 0
             && matches!(
                 final_feedback.verdict,
                 Verdict::RequestChanges | Verdict::AcceptWithNits
             )
-            && let Some(current) = patch_sha.as_ref()
-            && previous_patch_sha.as_deref() == Some(current.as_str())
+            && round_is_stalled(
+                previous_patch_sha.as_deref(),
+                patch_sha.as_deref(),
+                best_progress,
+                round_progress,
+            )
         {
             no_progress_count = no_progress_count.saturating_add(1);
             if no_progress_count >= no_progress_max {
@@ -343,6 +358,9 @@ pub async fn run_synaptic_loop(
             }
         } else {
             no_progress_count = 0;
+        }
+        if let Some(p) = round_progress {
+            best_progress = Some(best_progress.map_or(p, |b| b.max(p)));
         }
         previous_patch_sha = patch_sha;
 
@@ -655,17 +673,52 @@ fn goal_check_failed(goal: &Option<GoalSpec>, check_result: Option<&CheckResult>
     goal.is_some() && !matches!(check_result, Some(CheckResult::Pass | CheckResult::Skipped))
 }
 
+/// The deterministic check's pass-ratio in permille for the no-progress guard:
+/// `Pass` is fully satisfied (1000), `Skipped` carries no signal, and `Fail`
+/// reports the parsed ratio when the check exposed a recognizable test summary
+/// (S7). Used only for stall detection, never for the acceptance gate.
+fn check_result_progress(check: &CheckResult) -> Option<u16> {
+    match check {
+        CheckResult::Pass => Some(1000),
+        CheckResult::Skipped => None,
+        CheckResult::Fail { progress, .. } => *progress,
+    }
+}
+
+/// Whether a refinement round failed to move the loop toward its goal (S7).
+///
+/// Stalled when the lead re-submitted the SAME patch as the previous round (the
+/// original ma-1 guard) OR — when the check exposes a measurable pass-ratio — a
+/// DIFFERENT patch still did not beat the best progress seen so far (`best`
+/// reflects rounds strictly before this one). The progress dimension is purely
+/// additive: with no comparable ratio it reduces to the original identical-hash
+/// behaviour, and a missing hash on either side never counts as a stall.
+fn round_is_stalled(
+    prev_sha: Option<&str>,
+    cur_sha: Option<&str>,
+    best: Option<u16>,
+    current: Option<u16>,
+) -> bool {
+    match (prev_sha, cur_sha) {
+        (Some(prev), Some(cur)) if prev == cur => true,
+        (Some(_), Some(_)) => matches!((current, best), (Some(now), Some(b)) if now <= b),
+        _ => false,
+    }
+}
+
 fn no_progress_feedback(reviewer_id: &str, count: u8) -> ReviewerFeedback {
     ReviewerFeedback {
         reviewer_id: reviewer_id.to_string(),
         verdict: Verdict::Block,
         issues: vec![Issue {
             severity: IssueSeverity::Blocking,
-            message: format!("No progress for {count} consecutive rounds (identical patch hash)"),
+            message: format!(
+                "No progress for {count} consecutive rounds (no closer to a green check)"
+            ),
         }],
         suggested_patch: None,
         cost: None,
-        raw_text: format!("BLOCK: no-progress exceeded after {count} identical rounds"),
+        raw_text: format!("BLOCK: no-progress exceeded after {count} stalled rounds"),
     }
 }
 
@@ -2396,6 +2449,47 @@ mod tests {
 
         assert!(report.no_progress_exceeded);
         assert_eq!(report.final_feedback.verdict, Verdict::Block);
+    }
+
+    #[test]
+    fn round_is_stalled_legacy_and_progress_dimensions() {
+        // Legacy ma-1: identical patch hash is a stall regardless of progress.
+        assert!(round_is_stalled(Some("a"), Some("a"), None, None));
+        assert!(round_is_stalled(Some("a"), Some("a"), Some(900), Some(900)));
+
+        // Different patch, no measurable progress → not stalled (legacy reset).
+        assert!(!round_is_stalled(Some("a"), Some("b"), None, None));
+
+        // S7: different patch but progress flat or regressed vs best → stalled.
+        assert!(round_is_stalled(Some("a"), Some("b"), Some(700), Some(700)));
+        assert!(round_is_stalled(Some("a"), Some("b"), Some(700), Some(500)));
+
+        // S7: different patch and progress improved over best → not stalled.
+        assert!(!round_is_stalled(Some("a"), Some("b"), Some(700), Some(800)));
+
+        // A missing hash on either side never counts as a stall (legacy).
+        assert!(!round_is_stalled(None, Some("b"), Some(700), Some(700)));
+        assert!(!round_is_stalled(Some("a"), None, Some(700), Some(700)));
+    }
+
+    #[test]
+    fn check_result_progress_maps_variants() {
+        assert_eq!(check_result_progress(&CheckResult::Pass), Some(1000));
+        assert_eq!(check_result_progress(&CheckResult::Skipped), None);
+        assert_eq!(
+            check_result_progress(&CheckResult::Fail {
+                reason: "x".into(),
+                progress: Some(420),
+            }),
+            Some(420)
+        );
+        assert_eq!(
+            check_result_progress(&CheckResult::Fail {
+                reason: "x".into(),
+                progress: None,
+            }),
+            None
+        );
     }
 
     #[tokio::test]

@@ -55,7 +55,7 @@ Claude Code와 Codex의 changelog를 벤치마킹해 Nerve의 loop/goal 방향�
 | **S4** | 상시 빌트인 Verifier 게이트 (test/build/lint/patch-applies) | M | ✅ **DONE** (codex-verified) |
 | S5 | OS 실행 샌드박스 (Seatbelt / bwrap+seccomp+Landlock) — S4 안전 의존성 | M~L | ⬜ |
 | S6 | 스키마 강제 verdict 객체 (free-text LGTM 파싱 폐기) | M | ✅ |
-| S7 | distance-to-goal 진행 신호 (CheckResult에 score) | M | ⬜ |
+| S7 | distance-to-goal 진행 신호 (CheckResult에 score) | M | ✅ |
 
 ### 🌊 Wave 2 — 조종 가능·지속 루프 (daemon v2)
 | Step | 항목 | effort | 상태 |
@@ -231,3 +231,30 @@ North star: reviewer의 REJECTION이 ACCEPTANCE로 파싱되는 일은 절대 �
   `clippy -D warnings` clean.
   잔여 경계: reviewer가 스스로 첫 줄에 accept 토큰을 내고도 토큰 없는 prose로 모순 reject하는 self-contradiction은
   파서가 아닌 reviewer-protocol 위반이며, nerve-core 결정론적 verifier(acceptance = verdict-accept AND check Pass)가 backstop.
+
+### S7 — distance-to-goal 진행 신호 (✅ DONE, 2026-06-16)
+
+실패한 결정론적 체크가 이제 **pass-ratio**(distance-to-goal)를 실어, 루프가 binary pass/fail 대신
+수치 진행 신호를 갖는다. **순수 additive 텔레메트리 + stall 힌트** — 수락은 여전히 진짜 green
+체크(`CheckResult::Pass`, partial ratio 절대 아님)와 verdict accept를 **둘 다** 요구한다(게이트 불변).
+North star(S7): progress 신호는 수락 게이트를 **약화/변경하지 못한다**. lead가 위조한 progress가
+false-accept를 유발하면 보안 버그(false-reject/추가 abort는 허용).
+
+- `CheckResult::Fail { reason, progress: Option<u16> }` — **PERMILLE**(0..=1000). `f64`가 아니라 permille이라
+  `CheckResult: Eq`(→`RoundRecord`·`RpcEnvelope` derive) 보존. `serde(default)`+`skip_serializing_if=None`이라
+  구버전 소비자 와이어 호환 → `RPC_SCHEMA_VERSION` 1.1.0→**1.2.0**(minor; doctor는 major만 비교, config 기본값 1.1.0 유지).
+  `CheckResult::progress() -> Option<f64>`(Pass=1.0, Skipped=None, Fail=p/1000).
+- `goal.rs`: 실패 체크 출력에서 비율 파싱 — libtest(`N passed; M failed`)·pytest(`M failed, N passed`) 요약을
+  스트림별 **마지막 요약 줄** 우선(`next_back`). 양쪽 스트림 모두 인식되면 **가장 비관적(min) 비율** 채택 —
+  lead가 한 스트림에 위조한 `1000 passed`가 다른 스트림의 실제 실패 요약을 가리지 못함(min은 stall 압박을 늘릴 뿐
+  완화 불가 → reject-only 신호와 일관, codex S7 r2 nit 반영). prose 내성: 숫자가 `passed`/`failed` 바로 앞일 때만
+  카운트(토큰 분할+windows). 미인식→None. infra 실패(spawn/timeout/await/output-cap)는 progress=None.
+  nonzero-exit 분기에서 `stdout_text` 캡처(cap 체크가 Err를 이미 early-return하므로 Ok).
+- **no-progress 가드 일반화**: 동일 patch hash(ma-1)뿐 아니라, **다른** patch를 내도 지금까지의 best pass-ratio를
+  못 넘으면 stall로 카운트(green에 가까워지지 않고 churn하는 lead 포착). `round_is_stalled`는 progress 차원이 **순수 가산** —
+  측정 가능한 비율이 없으면 기존 identical-hash 동작으로 환원, hash 누락은 절대 stall 아님. `best_progress`는 현재 라운드
+  반영 **전**의 best와 비교(개선 판정 정확). 이 경로는 **abort(블록)만** 유발 → non-accept를 accept로 뒤집을 수 없음.
+  게이트(`terminal`/`goal_satisfied`/`blocked`/`nits_unverified`)는 progress와 무관(no_progress_exceeded 경유로만 블록 가산).
+- 검증: `cargo test --workspace` green (core 138: parse_progress libtest/pytest/all-failed/unrecognized/last-line/worst-across-streams +
+  progress() accessor + goal-evaluator 통합 + round_is_stalled/check_result_progress 회귀; config 42, cli 49+16+4, adapter 92+1, types 25, tui 13),
+  `clippy -D warnings` clean.

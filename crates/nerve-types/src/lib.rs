@@ -187,13 +187,35 @@ pub enum AgentEvent {
 #[serde(rename_all = "snake_case")]
 pub enum CheckResult {
     Pass,
-    Fail { reason: String },
+    Fail {
+        reason: String,
+        /// S7 distance-to-goal signal: the deterministic check's pass-ratio in
+        /// PERMILLE (0..=1000) when its output exposed a recognizable test
+        /// summary, else absent. Permille (not `f64`) keeps `CheckResult: Eq`,
+        /// which `RoundRecord`/`RpcEnvelope` depend on. Optional + skipped-when-
+        /// `None` so older consumers stay wire-compatible (minor schema bump).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<u16>,
+    },
     Skipped,
 }
 
 impl CheckResult {
     pub fn is_pass(&self) -> bool {
         matches!(self, Self::Pass)
+    }
+
+    /// Distance-to-goal progress in `[0.0, 1.0]` (S7): `Pass` is fully satisfied
+    /// (`1.0`), `Skipped` carries no signal (`None`), and `Fail` reports the
+    /// parsed pass-ratio when the check emitted a recognizable test summary.
+    /// This is additive telemetry and a stall hint — it NEVER affects
+    /// acceptance, which still requires a real [`CheckResult::Pass`].
+    pub fn progress(&self) -> Option<f64> {
+        match self {
+            Self::Pass => Some(1.0),
+            Self::Skipped => None,
+            Self::Fail { progress, .. } => progress.map(|p| f64::from(p) / 1000.0),
+        }
     }
 }
 
@@ -214,7 +236,7 @@ pub struct RoundRecord {
 ///
 /// Bumped on breaking schema changes. Minor compatible: unknown fields in
 /// payload or envelope must be silently ignored by older consumers.
-pub const RPC_SCHEMA_VERSION: &str = "1.1.0";
+pub const RPC_SCHEMA_VERSION: &str = "1.2.0";
 
 /// Versioned wire envelope used for RPC event streaming between the core
 /// runtime and external consumers (TUI, plugins, telemetry sinks).
