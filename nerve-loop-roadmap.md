@@ -70,7 +70,7 @@ Claude Code와 Codex의 changelog를 벤치마킹해 Nerve의 loop/goal 방향�
 | Step | 항목 | effort | 상태 |
 |---|---|---|---|
 | S13 | 실행형 plan → loop 핸드오프 (Steps → Task/PatrolTask) | L | ✅ |
-| S14 | Agent-Teams 조율 원장 (공유 task 원장 + mailbox + 파일락 claim) | L | ⬜ |
+| S14 | Agent-Teams 조율 원장 (공유 task 원장 + mailbox + 파일락 claim) | L | ✅ |
 | S15 | Conductor 라이브 상태 + 일괄 cancel (S9 의존) | L | ⬜ |
 
 ---
@@ -627,3 +627,65 @@ S11/S12 게이트 활성)로 돌고, plan(LLM markdown)은 task **프롬프트**
 - DOUBLE 리뷰: codex r1(d62c419) = REQUEST_CHANGES(정합성: 121..=128바이트 plan id가 무효 task id 파생→dispatch
   실패) → 파생 task id 사전검증으로 해결. codex r1(재검증 HEAD) = ACCEPT_WITH_NITS(nit: `--max-steps 0` 무음
   no-op) → fail-closed로 수정. 동일 clean HEAD에서 연속 2회 no-blocking 리뷰로 LAND.
+
+### S14 — Agent-Teams 조율 원장 (공유 task 원장 + mailbox + 파일락 claim) (✅ DONE, 2026-06-17)
+
+Mayor/Patrol 큐는 권위 상태를 디렉토리(pending/claimed/done/failed)로만 들고, 크로스-patrol 가시성이 없었다 —
+TUI/운영자가 "지금 어떤 task를 누가 들고 있나"를 보려면 O(dir-scan)이고, patrol끼리 신호를 주고받을 채널도
+없었다. S14는 **조율/관측 전용** 레이어를 추가한다: 큐 상태의 비정규화 투영인 **공유 원장**(`ledger.json`) +
+patrol 간 **파일 백드 mailbox** + claim의 파일락 일반화. 핵심은 이게 **수락/apply 신호가 절대 아니라는 것**.
+
+**North star(반드시 유지)**: (N1) 원장/mailbox는 **관측·조율 전용** — 수락/apply 신호가 절대 될 수 없다. 권위
+큐 디렉토리 + 결정론적 `blocked` 게이트가 수락/apply의 **유일한** 권위로 남는다(S11과 동형: 디스크 기록은
+audit-only, 권위 상태는 딴 데). **원장과 디렉토리가 어긋나면 디렉토리가 이긴다** —
+`ledger_is_non_authoritative_status_comes_from_dirs`가 원장을 통째로 지워도 `status`가 디렉토리에서 정확히
+나옴을 증명. (N2) 모든 id는 `validate_file_component`(S13 `is_valid_queue_id` 술어) 경유 →
+`..`/`/`/`\`/공백/빈 문자열 fail-closed; task/patrol/recipient 어느 것도 큐 루트를 못 벗어난다. (N3) 원자적 +
+락 직렬화 쓰기 — RMW는 **전용 `ledger.lock`**(`mayor.lock`과 별개)로 직렬화. `Patrol::claim`의 `mayor.lock`
+임계구역 **안에서** 원장 쓰기가 일어나므로, `mayor.lock`을 재사용하면 같은 프로세스가 같은 경로에 두 번째
+배타 flock → **자기 교착**. 별도 락 파일로 두 임계구역을 독립시켜 claim을 절대 막지 않는다. (N4) additive/inert
+— `coordination_enabled=false`면 모든 `record_*`/mailbox가 early-return → **큐 동작 바이트 동일**. 원장/mailbox는
+큐 **루트** 바로 아래(pending/done 밖)에 살아 `count_json_files`/`count_claimed_recursive`/기존 테스트에 영향
+없음. (N5) best-effort/비권위 — 원장/mailbox 실패는 호출부에서 `eprintln` 경고만, 권위
+enqueue/claim/finish/recover를 **절대 중단 안 함**. (N6) 조율 경로에 **새 LLM 없음**. (N7) mailbox는 lead가
+consent를 위조하는 **은닉 채널이 아님** — `MailKind`는 닫힌 enum(Note/Progress/Reclaimed)으로 **apply/consent
+변종이 없어** mailbox 메시지가 apply 결정으로 파싱되거나 `blocked`를 완화하는 데 쓰일 수 없다(S11 north star:
+apply consent는 lead가 위조 불가).
+
+- `nerve-core/mayor_patrol.rs`: **`MayorLock` → 일반 `FileLock`** (`acquire(workspace_root, name)`); claim은
+  `FileLock::acquire(.., "mayor.lock")`, 원장은 `"ledger.lock"`로 분리(N3). `QueueLayout`에 `root` 필드 +
+  `ledger_path()`/`mailbox_dir()`(큐 루트 바로 아래, `ensure()` 불변이라 disabled시 바이트 동일). 타입:
+  `LedgerState{Pending/Claimed/Done/Failed}`, `LedgerEntry{task_id,state,owner,created/claimed/finished_at,
+  cost_microusd,verdict}`, `Ledger{version,entries: BTreeMap}`(결정론적 직렬화), 닫힌 `MailKind{Note,Progress,
+  Reclaimed}`(N7), `MailMessage{id,from,to,kind,body,created_at}`. **`Coordinator`**(workspace+layout+enabled):
+  `ledger()` 락프리 읽기(없으면 빈 원장), `mutate_ledger`(disabled면 no-op → `ledger.lock` → read/default →
+  RMW → `write_json_atomic`), `record_enqueued/claimed/finished/recovered`(전부 `validate_file_component` 후
+  mutate; finished는 Success/Skipped→Done·Failed→Failed로 **큐 이동과 같은 방향** 매핑 → 실패를 done으로 오보
+  안 함), `send_mail`(disabled no-op, to/from/id 검증, `mailbox/<to>/<id>.json` atomic), `drain_mail`
+  (**disabled no-op** — FS 접근 전에 early-return이라 비활성 시 기존 mailbox 파일을 읽지도 삭제하지도 않음[N4];
+  enabled시 검증 후 읽고-삭제, malformed는 운영자 검사용으로 남김).
+- 프로덕션 와이어링(전부 best-effort, eprintln 경고): `Mayor::enqueue`는 pending 원자 쓰기 **후**
+  `record_enqueued`; `Patrol::claim`은 검증 블록 **후** `record_claimed`(보유 중인 `mayor.lock`과 별개 락이라
+  교착 없음); `Patrol::run_task`는 result 쓰기 **후** `record_finished`; `Mayor::recover_orphans`는 rename **후**
+  `record_recovered` + patrol mailbox에 `Reclaimed` 통지(mailbox에 실제 생산자/소비자를 줘 dead-code 방지).
+  `Mayor`에 `ledger()`/`drain_mail()` 공개.
+- `nerve-config/lib.rs`: `MayorPatrolConfig`에 `#[serde(default = "default_coordination_enabled")]
+  coordination_enabled: bool`(serde 기본 **true**) + Default + 기본함수; `loads_default_mayor_patrol_config`에
+  기본 true + explicit-false roundtrip 단언 추가. `deny_unknown_fields` 유지.
+- `nerve-cli/main.rs`: `nv mayor`에 `--ledger`(원장 스냅샷 출력) + `--mailbox <PATROL_ID>`(수신함 drain·출력)
+  플래그; `run_mayor_subcommand`에서 status **전에** 라우팅. `print_ledger`/`print_mailbox` 헬퍼. parse 테스트.
+- `nerve-core/lib.rs`: `Coordinator, Ledger, LedgerEntry, LedgerState, MailKind, MailMessage` 재export.
+- 검증: `cargo build --workspace` clean, `cargo test --workspace` green (core 200→208 [+8: pending→claimed,
+  finished done&failed, recover→원장갱신+Reclaim mail, disabled-writes-nothing+큐불변, 비권위(원장 삭제해도
+  status 정확), traversal-id 거부(원장+mailbox), 동시 enqueue 무손실(12 스레드), mailbox send/drain
+  roundtrip+격리], cli 62→63 [+1: S14 조율 플래그 parse + 기존 flag-parse 확장], config 53[기존 테스트 확장:
+  기본 true + explicit-false roundtrip], adapter 92, patch 20, types 25, tui 13, integration 16+4),
+  `cargo clippy --workspace --all-targets -- -D warnings` exit 0.
+- DOUBLE 리뷰: codex 독립 리뷰(자체 `CARGO_TARGET_DIR`로 build/test/clippy 재실행 + N1-N7를 REFUTE 시도 —
+  특히 N1 비권위/디렉토리-우선, N3 `ledger.lock`≠`mayor.lock` 무교착, N5 disabled 바이트 동일, N7 mailbox
+  비-consent). codex r1(43deef3) = REQUEST_CHANGES(**N4 위반**: `drain_mail`이 `coordination_enabled=false`를
+  무시 — 비활성인데도 recipient 검증 후 `<queue>/mailbox/<recipient>`를 읽고 유효 파일을 **삭제**; 실제 `nv`로
+  재현 `drained=1`+파일 삭제). N1/N2/N3/N5/N6/N7 권위 경계는 hold. → `drain_mail` 첫 줄에 `if !self.enabled
+  { return Ok(Vec::new()); }` early-return 추가(`send_mail`/`mutate_ledger`와 동일 가드, FS 접근 전) + 비활성
+  drain이 기존 파일을 안 읽고 안 지우는 회귀 테스트 + traversal 테스트를 `\`/탭/NUL/129바이트로 강화(codex nit).
+  동일 clean HEAD에서 연속 2회 no-blocking 리뷰로 LAND.

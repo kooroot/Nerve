@@ -29,7 +29,7 @@
 //! 4. **No partial writes**: every JSON file is written via tempfile +
 //!    `rename(2)`. No reader ever observes a half-written file.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::Write as _;
@@ -235,6 +235,22 @@ impl Mayor {
         self.shutdown_tx.subscribe()
     }
 
+    /// S14: a coordinator bound to this Mayor's workspace + config.
+    fn coordinator(&self) -> Coordinator {
+        Coordinator::new(self.workspace_root.clone(), &self.config)
+    }
+
+    /// S14: snapshot of the coordination ledger. Observability ONLY — the queue
+    /// directories + the deterministic `blocked` gate remain the sole authority.
+    pub fn ledger(&self) -> Result<Ledger, MayorError> {
+        self.coordinator().ledger()
+    }
+
+    /// S14: read and remove all coordination messages addressed to `recipient`.
+    pub fn drain_mail(&self, recipient: &str) -> Result<Vec<MailMessage>, MayorError> {
+        self.coordinator().drain_mail(recipient)
+    }
+
     /// Write a task to `pending/<task_id>.json`.
     pub async fn enqueue(&self, task: PatrolTask) -> Result<(), MayorError> {
         validate_file_component("task_id", &task.task_id)?;
@@ -254,6 +270,16 @@ impl Mayor {
         }
         let path = layout.pending_path(&task.task_id);
         write_json_atomic(&path, &task)?;
+
+        // S14: project the new pending task into the coordination ledger
+        // (best-effort, non-authoritative — the pending file written above is
+        // the authoritative state, so a ledger failure must not fail enqueue).
+        if let Err(err) = self
+            .coordinator()
+            .record_enqueued(&task.task_id, task.created_at)
+        {
+            eprintln!("warning: coordination ledger record_enqueued failed: {err}");
+        }
 
         if let Some(rpc) = &self.rpc {
             let _ = rpc.emit(
@@ -293,6 +319,7 @@ impl Mayor {
         }
         let ttl = Duration::from_secs(u64::from(self.config.claim_ttl_secs));
         let now = SystemTime::now();
+        let coord = self.coordinator();
         for patrol_dir in fs::read_dir(&layout.claimed)? {
             let patrol_dir = patrol_dir?;
             if !patrol_dir.file_type()?.is_dir() {
@@ -326,6 +353,20 @@ impl Mayor {
                 let target = layout.pending_path(&task_id);
                 fs::rename(&path, &target)?;
                 recovered += 1;
+                // S14: clear ownership in the ledger and drop a Reclaimed notice
+                // into the patrol's mailbox (best-effort, non-authoritative — the
+                // rename above is the authoritative recovery). The mail is purely
+                // informational: the patrol's claim file is already gone.
+                if let Err(err) = coord.record_recovered(&task_id) {
+                    eprintln!("warning: coordination ledger record_recovered failed: {err}");
+                }
+                let _ = coord.send_mail(&MailMessage::new(
+                    &task_id,
+                    "mayor",
+                    &patrol_id,
+                    MailKind::Reclaimed,
+                    format!("task `{task_id}` reclaimed from `{patrol_id}` (stale heartbeat)"),
+                ));
                 if let Some(rpc) = &self.rpc {
                     let _ = rpc.emit(
                         RPC_MAYOR_ORPHAN_RECOVERED,
@@ -407,6 +448,11 @@ impl Patrol {
         &self.id
     }
 
+    /// S14: a coordinator bound to this Patrol's workspace + config.
+    fn coordinator(&self) -> Coordinator {
+        Coordinator::new(self.workspace_root.clone(), &self.config)
+    }
+
     /// Try to claim the lex-smallest task from `pending/`. Returns
     /// `Err(MayorError::QueueEmpty)` when the queue is empty.
     pub fn claim(&self) -> Result<PatrolTask, MayorError> {
@@ -414,7 +460,7 @@ impl Patrol {
         let layout = QueueLayout::new(&self.workspace_root, &self.config);
         layout.ensure()?;
         self.write_heartbeat(&layout)?;
-        let _lock = MayorLock::acquire(&self.workspace_root)?;
+        let _lock = FileLock::acquire(&self.workspace_root, "mayor.lock")?;
 
         let pending = sorted_json_filenames(&layout.pending)?;
         let candidate = pending.first().cloned().ok_or(MayorError::QueueEmpty)?;
@@ -443,6 +489,13 @@ impl Patrol {
                 "pending filename `{expected_task_id}` did not match payload task_id `{}`",
                 task.task_id
             )));
+        }
+        // S14: record the claim in the coordination ledger. This uses the
+        // SEPARATE `ledger.lock`, so although the `mayor.lock` (`_lock`) is still
+        // held here, there is no self-deadlock. Best-effort: the claimed file on
+        // disk is the authoritative state.
+        if let Err(err) = self.coordinator().record_claimed(&task.task_id, &self.id) {
+            eprintln!("warning: coordination ledger record_claimed failed: {err}");
         }
         if let Some(rpc) = &self.rpc {
             let _ = rpc.emit(
@@ -502,6 +555,16 @@ impl Patrol {
 
         let result_path = layout.result_path(&task_id);
         write_json_atomic(&result_path, &result)?;
+
+        // S14: record completion in the coordination ledger (best-effort,
+        // non-authoritative). Maps the verdict the SAME direction as the queue
+        // move below, so the ledger never reports a failed task as done.
+        if let Err(err) =
+            self.coordinator()
+                .record_finished(&task_id, result.verdict, result.cost_microusd)
+        {
+            eprintln!("warning: coordination ledger record_finished failed: {err}");
+        }
 
         // Move claimed/<patrol>/<task>.json into done/ or failed/.
         let claimed_path = layout
@@ -610,6 +673,11 @@ impl Patrol {
 /// Resolves the on-disk directories used by [`Mayor`] and [`Patrol`].
 #[derive(Debug, Clone)]
 struct QueueLayout {
+    /// Queue root (`<workspace>/<queue_dir>`). The S14 ledger + mailbox live
+    /// directly under it, OUTSIDE pending/claimed/done/failed, so they never
+    /// affect `count_json_files`/`count_claimed_recursive` or the authoritative
+    /// queue state.
+    root: PathBuf,
     pending: PathBuf,
     claimed: PathBuf,
     done: PathBuf,
@@ -629,7 +697,16 @@ impl QueueLayout {
             failed: queue_root.join("failed"),
             heartbeat: queue_root.join("heartbeat"),
             results: results_root,
+            root: queue_root,
         }
+    }
+
+    fn ledger_path(&self) -> PathBuf {
+        self.root.join("ledger.json")
+    }
+
+    fn mailbox_dir(&self) -> PathBuf {
+        self.root.join("mailbox")
     }
 
     fn ensure(&self) -> Result<(), MayorError> {
@@ -802,19 +879,29 @@ fn validate_file_component(kind: &'static str, value: &str) -> Result<(), MayorE
 }
 
 // =====================================================================
-// `mayor.lock` advisory lock
+// `.nerve/session-meta/*.lock` advisory lock
 // =====================================================================
 
+/// Advisory exclusive lock on a `.nerve/session-meta/<name>` file (`fs2` flock,
+/// [`LOCK_TIMEOUT`] deadline). Serializes a short critical section across
+/// processes and is released on drop.
+///
+/// The Mayor uses `mayor.lock` to serialize the claim scan + atomic rename so
+/// two patrols can't double-claim. The S14 coordination ledger uses a SEPARATE
+/// `ledger.lock`: a ledger write happens INSIDE `Patrol::claim`'s `mayor.lock`
+/// critical section, so reusing `mayor.lock` for the ledger would self-deadlock
+/// (a second exclusive flock on the same path from the same process blocks).
+/// Distinct lock files keep the two critical sections independent.
 #[derive(Debug)]
-struct MayorLock {
+struct FileLock {
     file: File,
 }
 
-impl MayorLock {
-    fn acquire(workspace_root: &Path) -> Result<Self, MayorError> {
+impl FileLock {
+    fn acquire(workspace_root: &Path, name: &str) -> Result<Self, MayorError> {
         let dir = workspace_root.join(".nerve").join("session-meta");
         fs::create_dir_all(&dir)?;
-        let path = dir.join("mayor.lock");
+        let path = dir.join(name);
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -837,9 +924,326 @@ impl MayorLock {
     }
 }
 
-impl Drop for MayorLock {
+impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
+    }
+}
+
+// =====================================================================
+// S14 — coordination ledger + mailbox
+// =====================================================================
+//
+// North star: the ledger and mailbox are COORDINATION / OBSERVABILITY ONLY.
+// They are NEVER an acceptance or apply signal. The authoritative queue
+// directories (pending/claimed/done/failed) plus the deterministic `blocked`
+// gate in the synaptic loop remain the SOLE authority for what is accepted or
+// applied — exactly as before S14. The ledger is a denormalized projection of
+// queue state (so a TUI / `nv mayor --ledger` gets O(1) cross-patrol status
+// instead of an O(dir-scan)); if it ever disagrees with the dirs, the DIRS win.
+// All writes are best-effort: a ledger/mailbox failure WARNS at the call site
+// and never aborts the authoritative enqueue/claim/finish/recover operation.
+
+/// Schema version of the on-disk [`Ledger`].
+const LEDGER_VERSION: u32 = 1;
+
+/// Lifecycle state of a task as recorded in the coordination [`Ledger`]. Mirrors
+/// the authoritative queue directory the task currently lives in.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerState {
+    Pending,
+    Claimed,
+    Done,
+    Failed,
+}
+
+/// One task's row in the coordination [`Ledger`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LedgerEntry {
+    pub task_id: String,
+    pub state: LedgerState,
+    /// Patrol that currently (or last) owned the task; cleared on recovery.
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub claimed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub cost_microusd: Option<u64>,
+    #[serde(default)]
+    pub verdict: Option<PatrolVerdict>,
+}
+
+impl LedgerEntry {
+    fn pending(task_id: &str) -> Self {
+        Self {
+            task_id: task_id.to_string(),
+            state: LedgerState::Pending,
+            owner: None,
+            created_at: None,
+            claimed_at: None,
+            finished_at: None,
+            cost_microusd: None,
+            verdict: None,
+        }
+    }
+}
+
+/// The shared coordination ledger — a projection of queue state keyed by task
+/// id. `BTreeMap` keeps the serialized form deterministic (stable diffs/tests).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Ledger {
+    pub version: u32,
+    pub entries: BTreeMap<String, LedgerEntry>,
+}
+
+/// Kind of an inter-agent coordination message. A CLOSED enum of coordination
+/// metadata ONLY: there is deliberately NO apply/consent variant, so a mailbox
+/// message can never be parsed into an apply decision or used to relax `blocked`
+/// (S11 north star: apply consent is unforgeable by the lead; the mailbox is not
+/// a covert consent channel).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MailKind {
+    /// Free-form coordination note.
+    Note,
+    /// Progress / status signal.
+    Progress,
+    /// The Mayor reclaimed a task from a patrol (stale heartbeat → orphan
+    /// recovery). Informational: the patrol's claim file is already gone.
+    Reclaimed,
+}
+
+/// A file-backed coordination message addressed to a recipient's inbox.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MailMessage {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub kind: MailKind,
+    pub body: String,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+impl MailMessage {
+    pub fn new(
+        id: impl Into<String>,
+        from: impl Into<String>,
+        to: impl Into<String>,
+        kind: MailKind,
+        body: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            from: from.into(),
+            to: to.into(),
+            kind,
+            body: body.into(),
+            created_at: Some(Utc::now()),
+        }
+    }
+}
+
+/// S14 coordinator — best-effort, non-authoritative shared ledger + mailbox,
+/// built cheaply from a [`Mayor`]/[`Patrol`]'s config + workspace root.
+///
+/// Every mutation is a no-op when `coordination_enabled` is false (queue
+/// behavior is then byte-identical to pre-S14). Ledger RMW is serialized by a
+/// DEDICATED `ledger.lock` ([`FileLock`]), SEPARATE from `mayor.lock`, so a
+/// ledger write inside [`Patrol::claim`]'s `mayor.lock` critical section can
+/// never self-deadlock. All ids are forced through [`validate_file_component`]
+/// (the S13 `is_valid_queue_id` predicate) so a crafted task/patrol/recipient id
+/// can never escape the queue root.
+#[derive(Debug, Clone)]
+pub struct Coordinator {
+    workspace_root: PathBuf,
+    layout: QueueLayout,
+    enabled: bool,
+}
+
+impl Coordinator {
+    fn new(workspace_root: PathBuf, config: &MayorPatrolConfig) -> Self {
+        let layout = QueueLayout::new(&workspace_root, config);
+        let enabled = config.coordination_enabled;
+        Self {
+            workspace_root,
+            layout,
+            enabled,
+        }
+    }
+
+    /// Whether coordination is enabled (config `coordination_enabled`).
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    // ----- ledger -----
+
+    /// Load the current ledger snapshot. Lock-free: writers replace the file
+    /// atomically, so a reader always sees a complete version. A missing file is
+    /// an empty ledger (not an error).
+    pub fn ledger(&self) -> Result<Ledger, MayorError> {
+        let path = self.layout.ledger_path();
+        if !path.exists() {
+            return Ok(Ledger {
+                version: LEDGER_VERSION,
+                entries: BTreeMap::new(),
+            });
+        }
+        read_json(&path)
+    }
+
+    fn mutate_ledger<F: FnOnce(&mut Ledger)>(&self, f: F) -> Result<(), MayorError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let _lock = FileLock::acquire(&self.workspace_root, "ledger.lock")?;
+        let path = self.layout.ledger_path();
+        let mut ledger = if path.exists() {
+            read_json(&path)?
+        } else {
+            Ledger {
+                version: LEDGER_VERSION,
+                entries: BTreeMap::new(),
+            }
+        };
+        f(&mut ledger);
+        ledger.version = LEDGER_VERSION;
+        write_json_atomic(&path, &ledger)?;
+        Ok(())
+    }
+
+    /// Record a task entering `pending/` (enqueue). Idempotent: re-enqueue keeps
+    /// the original `created_at`.
+    pub fn record_enqueued(
+        &self,
+        task_id: &str,
+        created_at: Option<DateTime<Utc>>,
+    ) -> Result<(), MayorError> {
+        validate_file_component("ledger task_id", task_id)?;
+        self.mutate_ledger(|ledger| {
+            let entry = ledger
+                .entries
+                .entry(task_id.to_string())
+                .or_insert_with(|| LedgerEntry::pending(task_id));
+            entry.state = LedgerState::Pending;
+            entry.owner = None;
+            entry.claimed_at = None;
+            if entry.created_at.is_none() {
+                entry.created_at = created_at.or_else(|| Some(Utc::now()));
+            }
+        })
+    }
+
+    /// Record a task being claimed by a patrol.
+    pub fn record_claimed(&self, task_id: &str, patrol_id: &str) -> Result<(), MayorError> {
+        validate_file_component("ledger task_id", task_id)?;
+        validate_file_component("ledger patrol_id", patrol_id)?;
+        self.mutate_ledger(|ledger| {
+            let entry = ledger
+                .entries
+                .entry(task_id.to_string())
+                .or_insert_with(|| LedgerEntry::pending(task_id));
+            entry.state = LedgerState::Claimed;
+            entry.owner = Some(patrol_id.to_string());
+            entry.claimed_at = Some(Utc::now());
+        })
+    }
+
+    /// Record a task finishing. `verdict` maps to `Done` (Success/Skipped) or
+    /// `Failed` — the SAME direction as the queue file move, so the ledger never
+    /// reports a failed task as done.
+    pub fn record_finished(
+        &self,
+        task_id: &str,
+        verdict: PatrolVerdict,
+        cost_microusd: u64,
+    ) -> Result<(), MayorError> {
+        validate_file_component("ledger task_id", task_id)?;
+        self.mutate_ledger(|ledger| {
+            let entry = ledger
+                .entries
+                .entry(task_id.to_string())
+                .or_insert_with(|| LedgerEntry::pending(task_id));
+            entry.state = match verdict {
+                PatrolVerdict::Success | PatrolVerdict::Skipped => LedgerState::Done,
+                PatrolVerdict::Failed => LedgerState::Failed,
+            };
+            entry.verdict = Some(verdict);
+            entry.cost_microusd = Some(cost_microusd);
+            entry.finished_at = Some(Utc::now());
+        })
+    }
+
+    /// Record a claim being recovered (moved back to `pending/`): clears owner.
+    pub fn record_recovered(&self, task_id: &str) -> Result<(), MayorError> {
+        validate_file_component("ledger task_id", task_id)?;
+        self.mutate_ledger(|ledger| {
+            let entry = ledger
+                .entries
+                .entry(task_id.to_string())
+                .or_insert_with(|| LedgerEntry::pending(task_id));
+            entry.state = LedgerState::Pending;
+            entry.owner = None;
+            entry.claimed_at = None;
+        })
+    }
+
+    // ----- mailbox -----
+
+    /// Deliver a coordination message to `msg.to`'s inbox
+    /// (`<queue>/mailbox/<to>/<id>.json`, atomic). No-op when disabled. All of
+    /// `to`/`from`/`id` are path-traversal-guarded, so a sender can only write a
+    /// validated recipient dir inside the queue root.
+    pub fn send_mail(&self, msg: &MailMessage) -> Result<(), MayorError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        validate_file_component("mail recipient", &msg.to)?;
+        validate_file_component("mail sender", &msg.from)?;
+        validate_file_component("mail id", &msg.id)?;
+        let dir = self.layout.mailbox_dir().join(&msg.to);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.json", msg.id));
+        write_json_atomic(&path, msg)?;
+        Ok(())
+    }
+
+    /// Read and REMOVE all messages in `recipient`'s inbox (deterministic order).
+    /// Empty when disabled or no inbox. Malformed files are left in place (not
+    /// returned) for operator inspection rather than silently deleted.
+    ///
+    /// When `coordination_enabled` is false this is a pure no-op returning empty
+    /// (the SAME `!self.enabled` early-return as [`send_mail`]/`mutate_ledger`):
+    /// a drain must NEVER read or delete pre-existing mailbox files while
+    /// disabled, so the disabled queue is byte-identical / inert (N4). The guard
+    /// comes BEFORE any filesystem access so no message is consumed or removed.
+    pub fn drain_mail(&self, recipient: &str) -> Result<Vec<MailMessage>, MayorError> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        validate_file_component("mail recipient", recipient)?;
+        let dir = self.layout.mailbox_dir().join(recipient);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for name in sorted_json_filenames(&dir)? {
+            let path = dir.join(&name);
+            match read_json::<MailMessage>(&path) {
+                Ok(msg) => {
+                    out.push(msg);
+                    let _ = fs::remove_file(&path);
+                }
+                Err(_) => { /* leave malformed message for inspection */ }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -890,6 +1294,15 @@ mod tests {
             per_patrol_budget_microusd: None,
             heartbeat_secs: 1,
             claim_ttl_secs: 2,
+            coordination_enabled: true,
+        }
+    }
+
+    /// Like [`cfg`] but with the S14 coordination ledger/mailbox disabled.
+    fn cfg_no_coordination() -> MayorPatrolConfig {
+        MayorPatrolConfig {
+            coordination_enabled: false,
+            ..cfg()
         }
     }
 
@@ -1181,5 +1594,242 @@ mod tests {
 
         assert_eq!(result.verdict, PatrolVerdict::Success);
         assert_eq!(seen.load(Ordering::SeqCst), 777);
+    }
+
+    // ----- S14: coordination ledger + mailbox -----
+
+    #[tokio::test]
+    async fn ledger_records_pending_then_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mayor = Mayor::new(cfg(), dir.path().to_path_buf(), Some(1_000_000));
+        mayor
+            .enqueue(PatrolTask::new("t-led", "prompt", 1000))
+            .await
+            .unwrap();
+
+        let entry = mayor.ledger().unwrap().entries.remove("t-led").unwrap();
+        assert_eq!(entry.state, LedgerState::Pending);
+        assert!(entry.owner.is_none());
+        assert!(entry.created_at.is_some());
+
+        let patrol = Patrol::new("p-led".to_string(), cfg(), dir.path().to_path_buf());
+        let claimed = patrol.claim().unwrap();
+        assert_eq!(claimed.task_id, "t-led");
+
+        let entry = mayor.ledger().unwrap().entries.remove("t-led").unwrap();
+        assert_eq!(entry.state, LedgerState::Claimed);
+        assert_eq!(entry.owner.as_deref(), Some("p-led"));
+        assert!(entry.claimed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn ledger_records_finished_done_and_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mayor = Mayor::new(cfg(), dir.path().to_path_buf(), Some(10_000_000));
+        mayor
+            .enqueue(PatrolTask::new("t-ok", "prompt", 1_000_000))
+            .await
+            .unwrap();
+        mayor
+            .enqueue(PatrolTask::new("t-bad", "prompt", 1_000_000))
+            .await
+            .unwrap();
+
+        // Claim+run each. Patrols claim the lex-smallest first (t-bad < t-ok).
+        let p = Patrol::new("p-fin".to_string(), cfg(), dir.path().to_path_buf());
+        p.run_one(stub_dispatch(false, 100)).await.unwrap();
+        p.run_one(stub_dispatch(true, 4242)).await.unwrap();
+
+        let ledger = mayor.ledger().unwrap();
+        let ok = ledger.entries.get("t-ok").unwrap();
+        assert_eq!(ok.state, LedgerState::Done);
+        assert_eq!(ok.verdict, Some(PatrolVerdict::Success));
+        assert_eq!(ok.cost_microusd, Some(4242));
+        assert!(ok.finished_at.is_some());
+
+        let bad = ledger.entries.get("t-bad").unwrap();
+        assert_eq!(bad.state, LedgerState::Failed);
+        assert_eq!(bad.verdict, Some(PatrolVerdict::Failed));
+    }
+
+    #[tokio::test]
+    async fn recover_orphans_updates_ledger_and_sends_reclaim_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mayor = Mayor::new(cfg(), dir.path().to_path_buf(), None);
+        let queue_root = dir.path().join(".nerve").join("queue");
+        let claimed_dir = queue_root.join("claimed").join("p-dead");
+        fs::create_dir_all(&claimed_dir).unwrap();
+        let stale = PatrolTask::new("t-orph", "prompt", 500);
+        write_json_atomic(&claimed_dir.join("t-orph.json"), &stale).unwrap();
+        // Seed the ledger as if the dead patrol had claimed it.
+        mayor.coordinator().record_claimed("t-orph", "p-dead").unwrap();
+
+        let heartbeat_dir = queue_root.join("heartbeat");
+        fs::create_dir_all(&heartbeat_dir).unwrap();
+        let heartbeat_path = heartbeat_dir.join("p-dead");
+        File::create(&heartbeat_path).unwrap();
+        backdate_to_seconds_ago(&heartbeat_path, 120);
+
+        let status = mayor.status().await.unwrap();
+        assert_eq!(status.orphans_recovered, 1);
+
+        // Ledger: ownership cleared, back to Pending.
+        let entry = mayor.ledger().unwrap().entries.remove("t-orph").unwrap();
+        assert_eq!(entry.state, LedgerState::Pending);
+        assert!(entry.owner.is_none());
+
+        // Mailbox: the dead patrol got a Reclaimed notice (non-authoritative).
+        let mail = mayor.drain_mail("p-dead").unwrap();
+        assert_eq!(mail.len(), 1);
+        assert_eq!(mail[0].kind, MailKind::Reclaimed);
+        assert_eq!(mail[0].from, "mayor");
+        // Drained: a second drain is empty.
+        assert!(mayor.drain_mail("p-dead").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ledger_disabled_writes_nothing_and_queue_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mayor = Mayor::new(cfg_no_coordination(), dir.path().to_path_buf(), Some(1_000_000));
+        mayor
+            .enqueue(PatrolTask::new("t-off", "prompt", 1000))
+            .await
+            .unwrap();
+
+        // Authoritative queue state is identical; no ledger file is created.
+        assert!(dir.path().join(".nerve/queue/pending/t-off.json").exists());
+        assert!(!dir.path().join(".nerve/queue/ledger.json").exists());
+        assert!(mayor.ledger().unwrap().entries.is_empty());
+        // Mailbox send is a no-op when disabled.
+        mayor
+            .coordinator()
+            .send_mail(&MailMessage::new("m1", "mayor", "p1", MailKind::Note, "hi"))
+            .unwrap();
+        assert!(!dir.path().join(".nerve/queue/mailbox").exists());
+
+        // Disabled drain is ALSO a pure no-op: a pre-existing mailbox file (e.g.
+        // left from when coordination was enabled) must be neither returned nor
+        // DELETED while disabled — the disabled queue is byte-identical / inert.
+        let inbox = dir.path().join(".nerve/queue/mailbox/p1");
+        fs::create_dir_all(&inbox).unwrap();
+        let preexisting = inbox.join("leftover.json");
+        write_json_atomic(
+            &preexisting,
+            &MailMessage::new("leftover", "mayor", "p1", MailKind::Note, "old"),
+        )
+        .unwrap();
+        let drained = mayor.drain_mail("p1").unwrap();
+        assert!(drained.is_empty(), "disabled drain must return nothing");
+        assert!(
+            preexisting.exists(),
+            "disabled drain must NOT delete pre-existing mailbox files"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_is_non_authoritative_status_comes_from_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mayor = Mayor::new(cfg(), dir.path().to_path_buf(), Some(1_000_000));
+        mayor
+            .enqueue(PatrolTask::new("t-a", "p", 1000))
+            .await
+            .unwrap();
+        mayor
+            .enqueue(PatrolTask::new("t-b", "p", 1000))
+            .await
+            .unwrap();
+
+        // Nuke the ledger entirely. The authoritative status must be unaffected:
+        // it is computed from the queue directories, never from the ledger.
+        fs::remove_file(dir.path().join(".nerve/queue/ledger.json")).unwrap();
+        let status = mayor.status().await.unwrap();
+        assert_eq!(status.pending_count, 2);
+        assert!(mayor.ledger().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn ledger_and_mailbox_reject_traversal_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = Coordinator::new(dir.path().to_path_buf(), &cfg());
+        // The full reject set of `is_valid_queue_id`: traversal, separators
+        // (`/` and `\`), whitespace/control (space, tab, NUL), empty, and the
+        // 129-byte over-limit boundary.
+        let over_limit = "x".repeat(129);
+        let bad_ids: Vec<&str> = vec![
+            "../escape",
+            "a/b",
+            "a\\b",
+            "..",
+            "with space",
+            "tab\tx",
+            "nul\0x",
+            "",
+            &over_limit,
+        ];
+        for bad in bad_ids {
+            assert!(coord.record_enqueued(bad, None).is_err(), "id {bad:?}");
+            assert!(
+                coord
+                    .send_mail(&MailMessage::new("m", "mayor", bad, MailKind::Note, "x"))
+                    .is_err(),
+                "recipient {bad:?}"
+            );
+            assert!(coord.drain_mail(bad).is_err(), "drain {bad:?}");
+        }
+        // No traversal write escaped the queue root.
+        assert!(!dir.path().join(".nerve/queue/escape.json").exists());
+        assert!(!dir.path().join(".nerve/escape.json").exists());
+    }
+
+    #[test]
+    fn ledger_concurrent_enqueue_no_lost_update() {
+        // N threads racing distinct ids must all land: the dedicated ledger.lock
+        // serializes the read-modify-write so no update is lost.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let n = 12usize;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let coord = Coordinator::new(root, &cfg());
+                    coord
+                        .record_enqueued(&format!("task-{i:02}"), None)
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let ledger = Coordinator::new(root, &cfg()).ledger().unwrap();
+        assert_eq!(ledger.entries.len(), n);
+    }
+
+    #[test]
+    fn mailbox_send_drain_roundtrip_and_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = Coordinator::new(dir.path().to_path_buf(), &cfg());
+        coord
+            .send_mail(&MailMessage::new("m1", "mayor", "p1", MailKind::Note, "one"))
+            .unwrap();
+        coord
+            .send_mail(&MailMessage::new("m2", "p2", "p1", MailKind::Progress, "two"))
+            .unwrap();
+        coord
+            .send_mail(&MailMessage::new("m3", "mayor", "p2", MailKind::Note, "other"))
+            .unwrap();
+
+        // p1 gets exactly its two messages (deterministic order by id).
+        let p1 = coord.drain_mail("p1").unwrap();
+        assert_eq!(p1.len(), 2);
+        assert_eq!(p1[0].id, "m1");
+        assert_eq!(p1[1].id, "m2");
+        // Isolation: p2's inbox is independent and untouched by p1's drain.
+        let p2 = coord.drain_mail("p2").unwrap();
+        assert_eq!(p2.len(), 1);
+        assert_eq!(p2[0].id, "m3");
+        // Drain consumes: a second drain is empty.
+        assert!(coord.drain_mail("p1").unwrap().is_empty());
     }
 }

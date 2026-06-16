@@ -41,8 +41,8 @@ pub use budget_audit::{
 pub use goal::{GoalError, GoalEvaluator};
 pub use goal_intent::{GOAL_INTENT_SYSTEM_PROMPT, GoalIntentConverter, GoalIntentError};
 pub use mayor_patrol::{
-    DispatchFuture, Mayor, MayorError, MayorStatus, Patrol, PatrolResult, PatrolTask, PatrolVerdict,
-    is_valid_queue_id,
+    Coordinator, DispatchFuture, Ledger, LedgerEntry, LedgerState, MailKind, MailMessage, Mayor,
+    MayorError, MayorStatus, Patrol, PatrolResult, PatrolTask, PatrolVerdict, is_valid_queue_id,
 };
 pub use plan::{
     PLAN_ONLY_SYSTEM_PROMPT, PLAN_REVIEW_SYSTEM_PROMPT, PlanError, PlanRunOptions, PlanSections,

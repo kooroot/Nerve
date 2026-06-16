@@ -300,6 +300,17 @@ struct MayorArgs {
     results_dir: Option<PathBuf>,
     #[arg(long, help = "Print the queue status and exit (no dispatch)")]
     status_only: bool,
+    #[arg(
+        long,
+        help = "S14: print the coordination ledger (task states) and exit (no dispatch)"
+    )]
+    ledger: bool,
+    #[arg(
+        long,
+        value_name = "PATROL_ID",
+        help = "S14: drain and print the given recipient's coordination mailbox, then exit"
+    )]
+    mailbox: Option<String>,
 }
 
 /// Tier 3j `nv patrol` arguments.
@@ -1218,6 +1229,22 @@ async fn run_mayor_subcommand(args: MayorArgs, _mock: bool) -> Result<()> {
     );
     let total = config.orchestration.budget_cost_microusd_ceiling;
     let mayor = Mayor::new(mp, cwd.clone(), total);
+
+    // S14: observability-only subcommands — print coordination state and exit
+    // without draining the queue. These never affect acceptance or apply.
+    if let Some(recipient) = args.mailbox.as_deref() {
+        let messages = mayor
+            .drain_mail(recipient)
+            .with_context(|| format!("failed to drain mailbox for `{recipient}`"))?;
+        print_mailbox(recipient, &messages);
+        return Ok(());
+    }
+    if args.ledger {
+        let ledger = mayor.ledger().context("failed to read coordination ledger")?;
+        print_ledger(&ledger);
+        return Ok(());
+    }
+
     let status = mayor.status().await.context("mayor status failed")?;
     print_mayor_status(&status);
     if args.status_only {
@@ -1246,6 +1273,38 @@ fn print_mayor_status(status: &nerve_core::MayorStatus) {
     );
     for patrol in &status.active_patrols {
         println!("  patrol heartbeat: {patrol}");
+    }
+}
+
+/// S14: render the coordination ledger. Observability only — this is a
+/// projection of queue state, never an acceptance/apply signal.
+fn print_ledger(ledger: &nerve_core::Ledger) {
+    println!("ledger: version={} entries={}", ledger.version, ledger.entries.len());
+    for entry in ledger.entries.values() {
+        let owner = entry.owner.as_deref().unwrap_or("-");
+        let cost = entry
+            .cost_microusd
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "  {task} state={state:?} owner={owner} cost_microusd={cost}",
+            task = entry.task_id,
+            state = entry.state,
+        );
+    }
+}
+
+/// S14: render a drained coordination mailbox.
+fn print_mailbox(recipient: &str, messages: &[nerve_core::MailMessage]) {
+    println!("mailbox: recipient={recipient} drained={}", messages.len());
+    for msg in messages {
+        println!(
+            "  [{kind:?}] from={from} id={id}: {body}",
+            kind = msg.kind,
+            from = msg.from,
+            id = msg.id,
+            body = msg.body,
+        );
     }
 }
 
@@ -6799,6 +6858,33 @@ mod tests {
                 assert_eq!(args.max_patrols, Some(4));
                 assert_eq!(args.per_patrol_budget_microusd, Some(100_000));
                 assert!(args.status_only);
+                // S14 flags default off/none.
+                assert!(!args.ledger);
+                assert!(args.mailbox.is_none());
+            }
+            other => panic!("expected Mayor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_mayor_subcommand_s14_coordination_flags() {
+        use clap::Parser;
+        let ledger = Cli::try_parse_from(["nv", "mayor", "--ledger"])
+            .expect("clap must accept `nv mayor --ledger`");
+        match ledger.command {
+            Some(Command::Mayor(args)) => {
+                assert!(args.ledger);
+                assert!(args.mailbox.is_none());
+            }
+            other => panic!("expected Mayor subcommand, got {other:?}"),
+        }
+
+        let mail = Cli::try_parse_from(["nv", "mayor", "--mailbox", "patrol-1"])
+            .expect("clap must accept `nv mayor --mailbox <id>`");
+        match mail.command {
+            Some(Command::Mayor(args)) => {
+                assert_eq!(args.mailbox.as_deref(), Some("patrol-1"));
+                assert!(!args.ledger);
             }
             other => panic!("expected Mayor subcommand, got {other:?}"),
         }

@@ -607,6 +607,15 @@ pub struct MayorPatrolConfig {
     pub heartbeat_secs: u32,
     #[serde(default = "default_claim_ttl_secs")]
     pub claim_ttl_secs: u32,
+    /// S14: enable the coordination ledger + mailbox (observability/coordination
+    /// only — NEVER an acceptance or apply signal; the deterministic `blocked`
+    /// gate stays the sole authority). When `false`, the Mayor/Patrol record
+    /// nothing extra and queue behavior is byte-identical to before S14.
+    /// Defaults `true`: the ledger/mailbox live under the queue root (not in
+    /// pending/done/…), so even enabled they leave the authoritative queue state
+    /// and all existing counts untouched.
+    #[serde(default = "default_coordination_enabled")]
+    pub coordination_enabled: bool,
 }
 
 impl Default for MayorPatrolConfig {
@@ -618,6 +627,7 @@ impl Default for MayorPatrolConfig {
             per_patrol_budget_microusd: None,
             heartbeat_secs: default_heartbeat_secs(),
             claim_ttl_secs: default_claim_ttl_secs(),
+            coordination_enabled: default_coordination_enabled(),
         }
     }
 }
@@ -1263,6 +1273,10 @@ fn default_claim_ttl_secs() -> u32 {
     600
 }
 
+fn default_coordination_enabled() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1804,6 +1818,8 @@ mod tests {
         assert!(mp.per_patrol_budget_microusd.is_none());
         assert_eq!(mp.heartbeat_secs, 30);
         assert_eq!(mp.claim_ttl_secs, 600);
+        // S14: coordination ledger/mailbox default on (observability only).
+        assert!(mp.coordination_enabled);
 
         // Embedded default config keeps mayor_patrol unset to preserve legacy
         // byte-identical orchestration serialization.
@@ -1813,6 +1829,12 @@ mod tests {
         // Empty `{}` block deserialises to all defaults.
         let parsed: MayorPatrolConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed, MayorPatrolConfig::default());
+
+        // S14: an explicit `coordination_enabled: false` is honored (operator
+        // opt-out → byte-identical legacy queue behavior).
+        let off: MayorPatrolConfig =
+            serde_json::from_str(r#"{"coordination_enabled": false}"#).unwrap();
+        assert!(!off.coordination_enabled);
     }
 
     #[test]
