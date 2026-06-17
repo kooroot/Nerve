@@ -1939,6 +1939,30 @@ pub fn doctor_checks(_config: &Config, cwd: &Path) -> Vec<DoctorCheck> {
         status,
     });
 
+    // 6. (macOS, H8) Seatbelt enforcement canary. Seatbelt silently DROPS denied
+    //    operations, so an OS change that broke enforcement would weaken the
+    //    `sandbox.mode=required` write confinement INVISIBLY. Prove the kernel
+    //    still denies a known out-of-root write and surface a loud Fail if it
+    //    does not (or if the probe is inconclusive). Diagnostic only — this is
+    //    NOT on the per-run hot path (H4 provides the per-run Required self-test).
+    #[cfg(target_os = "macos")]
+    {
+        let status = match sandbox::seatbelt_enforcement_canary() {
+            Ok(true) => DoctorStatus::Ok,
+            Ok(false) => DoctorStatus::Fail(
+                "macOS Seatbelt did NOT deny a known out-of-root write — sandbox enforcement appears BROKEN; `sandbox.mode=required` would not actually confine writes on this host. Use a container/VM for hard isolation."
+                    .to_string(),
+            ),
+            Err(err) => DoctorStatus::Fail(format!(
+                "could not verify macOS Seatbelt enforcement (canary inconclusive): {err}"
+            )),
+        };
+        checks.push(DoctorCheck {
+            name: "sandbox_enforcement".to_string(),
+            status,
+        });
+    }
+
     checks
 }
 
@@ -3755,11 +3779,12 @@ mod tests {
         let config = consensus_config();
         let checks = doctor_checks(&config, dir.path());
 
-        // Five checks emitted in the documented order.
+        // Five cross-platform checks in documented order; macOS appends a sixth
+        // `sandbox_enforcement` canary (H8), asserted separately below.
         let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
-            names,
-            vec![
+            &names[..5],
+            &[
                 "git",
                 "disk_space",
                 "orphaned_worktrees",
@@ -3767,6 +3792,20 @@ mod tests {
                 "active_goal",
             ]
         );
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(names.len(), 6, "macOS emits the sandbox_enforcement canary");
+            assert_eq!(names[5], "sandbox_enforcement");
+            // Seatbelt enforces on a healthy dev host, so the canary passes.
+            assert_eq!(
+                checks[5].status,
+                DoctorStatus::Ok,
+                "sandbox enforcement canary: {:?}",
+                checks[5].status
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(names.len(), 5);
 
         // git should be present in the test environment.
         assert_eq!(

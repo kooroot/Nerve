@@ -76,6 +76,23 @@
 //! IPC policy would break real build tools. strict is additive and inert when
 //! off (the profile is byte-identical). It does not change the verdict below.
 //!
+//! **H8 strict read-scoping (opt-in, macOS).** strict ALSO denies `file-read*`
+//! under the operator's well-known credential stores (`~/.ssh`, `~/.aws`,
+//! `~/Library/Keychains`) so gate-run code cannot harvest those secrets before
+//! exfil. This is best-effort, NOT a read jail: it is applied only when `$HOME`
+//! resolves (absent `$HOME` ⇒ no read-scoping), every other path stays readable,
+//! and a determined process can still reach secrets the operator made readable
+//! elsewhere. Like the mach-lookup denies it is additive and inert when off
+//! (byte-identical profile) and monotone (only adds `(deny …)`).
+//!
+//! **H8 enforcement canary.** Seatbelt silently DROPS denied operations, so an
+//! OS change that broke enforcement would weaken `Required` INVISIBLY.
+//! [`seatbelt_enforcement_canary`] (surfaced by `nv doctor`) is the only signal
+//! that this happened: it proves the kernel still denies a known out-of-root
+//! write. macOS confinement is permanently weaker than Linux (no syscall filter;
+//! Seatbelt drops denied ops silently); App Sandbox / Endpoint Security are
+//! explicitly out of scope.
+//!
 //! Therefore `Required` raises the bar against accidental and naive escapes; it
 //! is NOT a security boundary against a determined adversary, with or without
 //! strict mode. For hard isolation of an untrusted tree, run the whole loop
@@ -189,7 +206,22 @@ fn seatbelt_decide(
         return no_backend_decide(config.mode);
     }
     let writable = canonical_writable_roots(cwd, extra_writable_roots);
-    let profile = seatbelt_profile(&writable, config.allow_network, config.strict);
+    // H8: under strict, scope reads away from credential stores. Computed from
+    // `$HOME` here (kept out of the pure profile builder) and canonicalized so
+    // the deny subpaths match the kernel's symlink-resolved view, exactly like
+    // the writable roots. A path that cannot be canonicalized (e.g. it does not
+    // exist yet) falls back to itself — denying a not-yet-present path is
+    // harmless and future-proof. Empty when off or when `$HOME` is unresolved,
+    // which keeps the profile byte-identical to the non-strict build.
+    let sensitive = if config.strict {
+        home_sensitive_read_paths(std::env::var_os("HOME").map(PathBuf::from))
+            .into_iter()
+            .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let profile = seatbelt_profile(&writable, config.allow_network, config.strict, &sensitive);
     // `sandbox-exec -p <profile> -- <command> [args...]`. The wrapper-owned `--`
     // terminates sandbox-exec's own option parsing, so a `check_cmd[0]` that
     // begins with `-` (e.g. `--`) is treated as the command, NOT consumed as a
@@ -209,8 +241,18 @@ fn seatbelt_decide(
 /// unless explicitly allowed. SBPL is last-match-wins, so the later
 /// `(allow file-write* (subpath ...))` re-grants writes inside the roots while
 /// every other location remains denied.
+///
+/// `sensitive_read_paths` (H8) are credential-store directories whose reads are
+/// denied — but ONLY under `strict`, and only when the slice is non-empty.
+/// Off-strict the parameter is ignored entirely so the profile stays
+/// byte-identical to the pre-H8 build (additive/inert when off; monotone).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn seatbelt_profile(writable_roots: &[PathBuf], allow_network: bool, strict: bool) -> String {
+fn seatbelt_profile(
+    writable_roots: &[PathBuf],
+    allow_network: bool,
+    strict: bool,
+    sensitive_read_paths: &[PathBuf],
+) -> String {
     let mut p = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
     if !writable_roots.is_empty() {
         p.push_str("(allow file-write*\n");
@@ -248,6 +290,25 @@ fn seatbelt_profile(writable_roots: &[PathBuf], allow_network: bool, strict: boo
                 "(deny mach-lookup\n    (global-name \"com.apple.mDNSResponder\")\n    (global-name \"com.apple.mDNSResponder.dnsproxy\"))\n",
             );
         }
+        // H8: opt-in read-scoping. Deny reads of well-known credential stores
+        // (~/.ssh, ~/.aws, ~/Library/Keychains) so gate-run code cannot harvest
+        // them before exfil. SBPL is last-match-wins, so this deny overrides the
+        // earlier `(allow default)` for exactly these subpaths; it targets a
+        // different operation (file-read*) than the write re-allow above, so it
+        // does not interact with the writable-root grant. Emitted ONLY when the
+        // caller supplied paths — empty when `$HOME` is unresolved, in which case
+        // no read-scoping is applied (best-effort; NOT a hard read jail). When
+        // `strict` is false this whole block is skipped, so the profile is
+        // byte-identical to the pre-H8 build.
+        if !sensitive_read_paths.is_empty() {
+            p.push_str("(deny file-read*\n");
+            for path in sensitive_read_paths {
+                p.push_str("    (subpath ");
+                p.push_str(&sbpl_string(&path.to_string_lossy()));
+                p.push_str(")\n");
+            }
+            p.push_str(")\n");
+        }
     }
     p
 }
@@ -267,6 +328,112 @@ fn sbpl_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// The well-known credential stores whose reads `strict` mode denies (H8),
+/// derived from the operator's home directory. Pure (takes `home` explicitly)
+/// so it is unit-testable without mutating the process environment. Returns
+/// empty when `home` is absent or empty — read-scoping is then simply not
+/// applied (best-effort; the mach-lookup denies still apply). macOS-shaped
+/// paths; the caller canonicalizes them.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn home_sensitive_read_paths(home: Option<PathBuf>) -> Vec<PathBuf> {
+    match home {
+        Some(home) if !home.as_os_str().is_empty() => vec![
+            home.join(".ssh"),
+            home.join(".aws"),
+            home.join("Library").join("Keychains"),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// Decide the [`seatbelt_enforcement_canary`] verdict from two observed facts:
+/// whether the out-of-grant ESCAPE file exists (the canary's denied write leaked
+/// through) and whether the in-grant LIVE marker exists (the canary actually
+/// ran). `Some(false)` = the escape leaked ⇒ enforcement BROKEN; `Some(true)` =
+/// no escape AND the canary ran ⇒ enforcement live; `None` = inconclusive (the
+/// canary did not even complete its in-grant write, so "no escape" is vacuous —
+/// the caller must fail loud, never read it as confined). The escape check wins
+/// over the live check: a leaked escape is conclusive evidence of breakage
+/// regardless of whether the in-grant write also landed. Pure; tested on every
+/// platform.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn canary_enforced(escape_exists: bool, live_exists: bool) -> Option<bool> {
+    if escape_exists {
+        Some(false)
+    } else if live_exists {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Runtime self-test that macOS Seatbelt still ENFORCES the write confinement
+/// the `Required` guarantee depends on. Seatbelt silently DROPS denied
+/// operations, so an OS change that broke enforcement would degrade `Required`
+/// SILENTLY (H8). This spawns `/bin/sh` under a real `sandbox-exec` profile that
+/// grants writes ONLY to a throwaway temp root, then has it (1) write a LIVE
+/// marker INSIDE the grant and (2) attempt an ESCAPE write to a sibling temp dir
+/// OUTSIDE every grant. Paths are passed via the environment, never interpolated
+/// into the shell script, so a path with quotes/spaces/newlines cannot inject
+/// shell syntax (same discipline as the H4 confinement canary). The two writes
+/// are sequenced with `;` (not `&&`) so the escape is attempted even if the
+/// in-grant write fails — a broken in-grant write cannot mask an escape.
+///
+/// `Ok(true)` = the escape write was DENIED and the canary ran (enforcement
+/// live). `Ok(false)` = the escape write SUCCEEDED (Seatbelt is NOT enforcing —
+/// `Required` would not actually confine writes on this host). `Err` = the probe
+/// could not be run to a conclusion (sandbox-exec missing, temp mint/spawn
+/// failed, or the in-grant write did not land so the result is vacuous) — the
+/// caller must treat this as a loud failure, never as "confined".
+///
+/// This is a DIAGNOSTIC for `nv doctor`, NOT a per-run gate (H4 already provides
+/// the per-run `Required` self-test); keep it off the hot path.
+#[cfg(target_os = "macos")]
+pub fn seatbelt_enforcement_canary() -> std::io::Result<bool> {
+    use std::process::Command as StdCommand;
+
+    if !Path::new(SANDBOX_EXEC).exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{SANDBOX_EXEC} not found; cannot verify Seatbelt enforcement"),
+        ));
+    }
+
+    let work = tempfile::tempdir()?;
+    let probe = tempfile::tempdir()?;
+    // Canonicalize so the grant matches the kernel's symlink-resolved view.
+    let work = std::fs::canonicalize(work.path())?;
+    // The probe dir is deliberately NOT a writable root, so a write into it must
+    // be denied by the kernel when enforcement is live.
+    let escape = std::fs::canonicalize(probe.path())?.join("escape.txt");
+    let live = work.join("live.txt");
+
+    let profile = seatbelt_profile(std::slice::from_ref(&work), false, false, &[]);
+
+    // The shell expands `$NV_CANARY_*` (set by us to the real paths) as single
+    // double-quoted words; the paths never enter the script text.
+    let status = StdCommand::new(SANDBOX_EXEC)
+        .arg("-p")
+        .arg(&profile)
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("echo live > \"$NV_CANARY_LIVE\" ; echo escaped > \"$NV_CANARY_ESCAPE\"")
+        .env("NV_CANARY_LIVE", &live)
+        .env("NV_CANARY_ESCAPE", &escape)
+        .status()?;
+    // Exit code is not authoritative (a denied write makes `sh` exit non-zero,
+    // but so would an unrelated failure); file existence is the real signal.
+    let _ = status;
+
+    match canary_enforced(escape.exists(), live.exists()) {
+        Some(verdict) => Ok(verdict),
+        None => Err(std::io::Error::other(
+            "Seatbelt enforcement canary inconclusive: the in-grant write did not land, so the absence of an escape cannot be trusted",
+        )),
+    }
+    // `work` (shadowed) and `probe` TempDirs drop here, removing the probe dirs.
 }
 
 // ---------------------------------------------------------------------------
@@ -380,7 +547,7 @@ mod tests {
 
     #[test]
     fn seatbelt_profile_denies_writes_and_network_by_default() {
-        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], false, false);
+        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], false, false, &[]);
         assert!(p.contains("(allow default)"));
         assert!(p.contains("(deny file-write*)"));
         assert!(p.contains("(subpath \"/tmp/work\")"));
@@ -394,7 +561,7 @@ mod tests {
 
     #[test]
     fn seatbelt_profile_allows_network_when_opted_in() {
-        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], true, false);
+        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], true, false, &[]);
         assert!(!p.contains("(deny network*)"));
     }
 
@@ -402,7 +569,7 @@ mod tests {
     fn seatbelt_profile_escapes_quotes_and_backslashes_in_paths() {
         // A path with a quote/paren must not break out of the string literal.
         let evil = PathBuf::from("/tmp/a\"b)\\c");
-        let p = seatbelt_profile(&[evil], false, false);
+        let p = seatbelt_profile(&[evil], false, false, &[]);
         assert!(p.contains("(subpath \"/tmp/a\\\"b)\\\\c\")"), "profile = {p}");
     }
 
@@ -414,7 +581,7 @@ mod tests {
     fn seatbelt_profile_strict_off_emits_no_mach_lookup_deny() {
         let roots = [PathBuf::from("/tmp/work")];
         for allow_network in [false, true] {
-            let p = seatbelt_profile(&roots, allow_network, false);
+            let p = seatbelt_profile(&roots, allow_network, false, &[]);
             assert!(
                 !p.contains("mach-lookup"),
                 "strict=off must not emit any mach-lookup deny (allow_network={allow_network}); profile = {p}"
@@ -427,7 +594,7 @@ mod tests {
     /// `(allow default)` so last-match-wins actually denies them.
     #[test]
     fn seatbelt_profile_strict_denies_cfprefsd_and_mdns_when_hermetic() {
-        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], false, true);
+        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], false, true, &[]);
         assert!(p.contains("(deny mach-lookup"), "profile = {p}");
         assert!(p.contains("com.apple.cfprefsd.agent"), "profile = {p}");
         assert!(p.contains("com.apple.cfprefsd.daemon"), "profile = {p}");
@@ -446,13 +613,95 @@ mod tests {
     /// buy nothing (the socket path is open anyway).
     #[test]
     fn seatbelt_profile_strict_with_network_keeps_cfprefsd_drops_mdns() {
-        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], true, true);
+        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], true, true, &[]);
         assert!(p.contains("com.apple.cfprefsd.agent"), "profile = {p}");
         assert!(
             !p.contains("mDNSResponder"),
             "mDNSResponder deny is pointless (and harmful) when network is allowed; profile = {p}"
         );
         assert!(!p.contains("(deny network*)"), "network is allowed; profile = {p}");
+    }
+
+    // --- H8 read-scoping (pure) ---
+
+    /// strict=true WITH sensitive paths emits a `(deny file-read* (subpath …))`
+    /// block for each path, and the deny comes AFTER `(allow default)` so
+    /// last-match-wins actually denies the reads.
+    #[test]
+    fn seatbelt_profile_strict_denies_reads_of_sensitive_paths() {
+        let secrets = [
+            PathBuf::from("/Users/x/.ssh"),
+            PathBuf::from("/Users/x/.aws"),
+            PathBuf::from("/Users/x/Library/Keychains"),
+        ];
+        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], false, true, &secrets);
+        assert!(p.contains("(deny file-read*"), "profile = {p}");
+        for s in &secrets {
+            assert!(
+                p.contains(&sbpl_string(&s.to_string_lossy())),
+                "missing deny subpath for {}; profile = {p}",
+                s.display()
+            );
+        }
+        let allow_default = p.find("(allow default)").unwrap();
+        let deny_read = p.find("(deny file-read*").unwrap();
+        assert!(
+            allow_default < deny_read,
+            "(allow default) must precede the file-read deny (last-match-wins)"
+        );
+    }
+
+    /// strict=FALSE never emits a file-read deny, even when sensitive paths are
+    /// passed: read-scoping is gated behind strict, and the profile must be
+    /// byte-identical to the same call with no sensitive paths.
+    #[test]
+    fn seatbelt_profile_read_scoping_is_inert_when_strict_off() {
+        let secrets = [PathBuf::from("/Users/x/.ssh")];
+        let with = seatbelt_profile(&[PathBuf::from("/tmp/work")], false, false, &secrets);
+        let without = seatbelt_profile(&[PathBuf::from("/tmp/work")], false, false, &[]);
+        assert!(!with.contains("(deny file-read*"), "profile = {with}");
+        assert_eq!(
+            with, without,
+            "off-strict profile must ignore sensitive paths (byte-identical)"
+        );
+    }
+
+    /// strict=true with NO sensitive paths (e.g. `$HOME` unresolved) emits no
+    /// file-read deny — read-scoping is best-effort, not a hard read jail.
+    #[test]
+    fn seatbelt_profile_strict_without_sensitive_paths_emits_no_read_deny() {
+        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], false, true, &[]);
+        assert!(!p.contains("(deny file-read*"), "profile = {p}");
+        // The mach-lookup denies still apply (strict is otherwise unchanged).
+        assert!(p.contains("(deny mach-lookup"), "profile = {p}");
+    }
+
+    /// `home_sensitive_read_paths` derives the three credential stores from a
+    /// present home dir, and returns empty when home is absent or empty (so the
+    /// caller applies no read-scoping rather than denying bogus paths).
+    #[test]
+    fn home_sensitive_read_paths_derives_from_home_and_fails_open() {
+        let paths = home_sensitive_read_paths(Some(PathBuf::from("/Users/x")));
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/Users/x/.ssh"),
+                PathBuf::from("/Users/x/.aws"),
+                PathBuf::from("/Users/x/Library/Keychains"),
+            ]
+        );
+        assert!(home_sensitive_read_paths(None).is_empty());
+        assert!(home_sensitive_read_paths(Some(PathBuf::new())).is_empty());
+    }
+
+    /// `canary_enforced` truth table: a leaked escape is BROKEN regardless of the
+    /// live marker; no escape + live ran = enforced; nothing ran = inconclusive.
+    #[test]
+    fn canary_enforced_truth_table() {
+        assert_eq!(canary_enforced(true, true), Some(false)); // escaped => broken
+        assert_eq!(canary_enforced(true, false), Some(false)); // escaped => broken
+        assert_eq!(canary_enforced(false, true), Some(true)); // confined + ran
+        assert_eq!(canary_enforced(false, false), None); // inconclusive
     }
 
     // --- bwrap args (pure; tested on every platform incl. the macOS dev host) ---
@@ -563,7 +812,7 @@ mod tests {
         // Canonicalize so the profile matches the kernel's symlink-resolved view.
         let work = std::fs::canonicalize(work.path()).unwrap();
         let sibling = std::fs::canonicalize(sibling.path()).unwrap();
-        let profile = seatbelt_profile(std::slice::from_ref(&work), false, false);
+        let profile = seatbelt_profile(std::slice::from_ref(&work), false, false, &[]);
 
         let run = |target: &std::path::Path| {
             StdCommand::new(SANDBOX_EXEC)
@@ -609,8 +858,8 @@ mod tests {
 
         let work = tempfile::tempdir().unwrap();
         let work = std::fs::canonicalize(work.path()).unwrap();
-        let lax = seatbelt_profile(std::slice::from_ref(&work), false, false);
-        let strict = seatbelt_profile(std::slice::from_ref(&work), false, true);
+        let lax = seatbelt_profile(std::slice::from_ref(&work), false, false, &[]);
+        let strict = seatbelt_profile(std::slice::from_ref(&work), false, true, &[]);
 
         let pid = std::process::id();
         let domain_ctrl = format!("com.nerve.h3test.ctrl.{pid}");
@@ -687,6 +936,123 @@ mod tests {
         );
     }
 
+    /// H8 read-scoping (macOS real kernel): under the strict profile a read of a
+    /// file UNDER a listed sensitive path is DENIED, while a read of a file NOT
+    /// under any sensitive path still succeeds. We pass a throwaway temp dir as
+    /// the "sensitive" path (the same machinery production points at ~/.ssh etc.)
+    /// so the test never touches the operator's real credentials. The successful
+    /// public read is the positive control: it proves `sandbox-exec` ACCEPTED the
+    /// strict profile and ran the child, so the denied secret read is attributable
+    /// to the file-read deny, not a rejected/invalid profile or a missing file.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn strict_profile_denies_reads_under_sensitive_path() {
+        use std::process::Command as StdCommand;
+
+        let work = tempfile::tempdir().unwrap();
+        let secret_dir = tempfile::tempdir().unwrap();
+        let work = std::fs::canonicalize(work.path()).unwrap();
+        let secret_dir = std::fs::canonicalize(secret_dir.path()).unwrap();
+
+        // A readable file outside any sensitive path, and a "secret" inside one.
+        let public = work.join("public.txt");
+        std::fs::write(&public, "PUBLIC").unwrap();
+        let secret = secret_dir.join("key.txt");
+        std::fs::write(&secret, "TOPSECRET").unwrap();
+
+        // strict profile grants writes to `work` and scopes reads away from
+        // `secret_dir`.
+        let strict = seatbelt_profile(
+            std::slice::from_ref(&work),
+            false,
+            true,
+            std::slice::from_ref(&secret_dir),
+        );
+
+        // `cat "$NV_TARGET"` — path via env, never interpolated into the script.
+        let read_under = |target: &std::path::Path| {
+            StdCommand::new(SANDBOX_EXEC)
+                .arg("-p")
+                .arg(&strict)
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg("cat \"$NV_TARGET\"")
+                .env("NV_TARGET", target)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+
+        // Positive control: the public read succeeds, proving the strict profile
+        // was accepted and the child ran (so the secret denial below is real).
+        assert!(
+            read_under(&public),
+            "positive control: reading a non-sensitive file must succeed under the strict profile"
+        );
+        // The read-scoping denies the secret read.
+        assert!(
+            !read_under(&secret),
+            "strict read-scoping: a read under the sensitive path must be denied"
+        );
+    }
+
+    /// H8 enforcement canary (macOS real kernel, healthy host): Seatbelt enforces
+    /// on this dev host, so the canary reports `Ok(true)` — a known out-of-root
+    /// write was denied while the in-grant write landed. This is the signal
+    /// `nv doctor` surfaces; if a future OS broke enforcement it would flip to
+    /// `Ok(false)` and the doctor check would fail loudly.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_enforcement_canary_reports_enforced_on_healthy_host() {
+        assert!(
+            seatbelt_enforcement_canary().unwrap(),
+            "Seatbelt must deny a known out-of-root write on a healthy macOS host"
+        );
+    }
+
+    /// H8 canary fail-detection (macOS real kernel): if the probe profile were
+    /// to GRANT the escape target (simulating broken/ineffective enforcement),
+    /// the escape write would land and `canary_enforced` must read it as BROKEN
+    /// (`Some(false)`), never as confined. This mirrors the H4 fail-closed proof:
+    /// it shows the canary's verdict tracks real kernel behavior, so it cannot
+    /// silently pass when enforcement is absent.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_canary_detects_ineffective_confinement() {
+        use std::process::Command as StdCommand;
+
+        let work = tempfile::tempdir().unwrap();
+        let probe = tempfile::tempdir().unwrap();
+        let work = std::fs::canonicalize(work.path()).unwrap();
+        let probe = std::fs::canonicalize(probe.path()).unwrap();
+        let escape = probe.join("escape.txt");
+        let live = work.join("live.txt");
+
+        // INEFFECTIVE profile: grant writes to BOTH roots, so the "escape" write
+        // is actually permitted — exactly what a broken Seatbelt would allow.
+        let granted = [work.clone(), probe.clone()];
+        let profile = seatbelt_profile(&granted, false, false, &[]);
+
+        let _ = StdCommand::new(SANDBOX_EXEC)
+            .arg("-p")
+            .arg(&profile)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("echo live > \"$NV_CANARY_LIVE\" ; echo escaped > \"$NV_CANARY_ESCAPE\"")
+            .env("NV_CANARY_LIVE", &live)
+            .env("NV_CANARY_ESCAPE", &escape)
+            .status()
+            .unwrap();
+
+        // The escape landed (enforcement ineffective) → verdict must be BROKEN.
+        assert!(escape.exists(), "escape write should land under the granting profile");
+        assert_eq!(
+            canary_enforced(escape.exists(), live.exists()),
+            Some(false),
+            "canary must report BROKEN when the escape write is not confined"
+        );
+    }
+
     /// Argv transparency: a hostile `check_cmd = ["--", "true"]` must NOT let
     /// `sandbox-exec` consume the `--` as its own option terminator and run
     /// `true` (which would be a false Pass). The wrapper-owned `--` makes the
@@ -727,7 +1093,7 @@ mod tests {
     /// still globally denied (no re-allow block emitted).
     #[test]
     fn seatbelt_profile_with_no_roots_denies_all_writes() {
-        let p = seatbelt_profile(&[], false, false);
+        let p = seatbelt_profile(&[], false, false, &[]);
         assert!(p.contains("(deny file-write*)"));
         assert!(!p.contains("(allow file-write*"), "no roots => no re-allow block");
     }
