@@ -580,27 +580,43 @@ fn tail_for_reason(text: &str) -> String {
 
 /// S7 best-effort distance-to-goal: the pass-ratio of a recognizable test
 /// summary in the failed check's output, in PERMILLE (0..=1000). Recognizes
-/// libtest (`N passed; M failed; ...`) and pytest (`M failed, N passed in ...`)
-/// summaries in either stream, preferring the LAST such line (the final summary).
-/// Returns `None` when nothing is recognized — progress is additive telemetry and
-/// a stall hint, never an acceptance signal, so an unparsed check just lacks it.
+/// libtest (`N passed; M failed; ...`), pytest (`M failed, N passed in ...`),
+/// and jest (`Tests: M failed, N passed, T total`) summaries via the shared
+/// `passed`/`failed` token scan, plus `go test` (`--- PASS:` / `--- FAIL:`
+/// per-test markers) which prints no aggregate summary line. Returns `None`
+/// when nothing is recognized — progress is additive telemetry and a stall hint,
+/// never an acceptance signal, so an unparsed check (any other ecosystem) just
+/// lacks it and the loop safely falls back to identical-output stall detection.
 ///
-/// When BOTH streams carry a recognizable summary, take the most pessimistic
-/// (minimum) ratio rather than letting either stream win by position. The lead
-/// controls the check's output, so a forged `1000 passed; 0 failed` on one stream
-/// must not be able to mask a real failure summary on the other. Reporting the
-/// worst ratio only ever feeds MORE stall pressure (toward abort), never less —
-/// consistent with progress being a reject-only signal.
+/// The hint takes the most pessimistic (minimum) ratio across stdout/stderr and
+/// across the summary-line and go-marker recognizers, so it always biases toward
+/// MORE stall pressure (toward abort), never less. It is best-effort and NOT
+/// tamper-proof: the summary recognizer uses the LAST summary line in a stream
+/// (the conventional final-result line), so a lead that appends a later forged
+/// `1000 passed; 0 failed` summary in the same stream — or that omits/garbles the
+/// real failure so nothing recognizable remains — can inflate this hint. That can
+/// only DELAY a stall-driven abort; it can never satisfy a goal, shorten review,
+/// or flip a verdict, because acceptance keys SOLELY on the deterministic check's
+/// exit code, never on progress. Progress is a reject-only signal end to end.
 fn parse_progress(stdout: &str, stderr: &str) -> Option<u16> {
-    match (parse_progress_in(stdout), parse_progress_in(stderr)) {
+    pessimistic(parse_progress_in(stdout), parse_progress_in(stderr))
+}
+
+/// The most pessimistic available pass-ratio: the minimum when both are present
+/// (so neither recognizer/stream can mask the other's failures), else whichever
+/// is present. Keeps progress strictly reject-only.
+fn pessimistic(a: Option<u16>, b: Option<u16>) -> Option<u16> {
+    match (a, b) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (only, None) | (None, only) => only,
     }
 }
 
-/// Last recognizable test-summary pass-ratio (permille) in one stream.
+/// Recognizable pass-ratio (permille) in one stream: the last summary-line
+/// ratio combined pessimistically with the `go test` marker ratio.
 fn parse_progress_in(text: &str) -> Option<u16> {
-    text.lines().filter_map(progress_from_line).next_back()
+    let summary = text.lines().filter_map(progress_from_line).next_back();
+    pessimistic(summary, go_test_progress(text))
 }
 
 /// Pass-ratio (permille) of a single line, if it carries `passed`/`failed`
@@ -613,11 +629,38 @@ fn progress_from_line(line: &str) -> Option<u16> {
         (None, None) => return None,
         (p, f) => (p.unwrap_or(0), f.unwrap_or(0)),
     };
+    ratio_permille(passed, failed)
+}
+
+/// `go test` / `gotestsum` print no aggregate `N passed` summary line, only
+/// per-test `--- PASS:` / `--- FAIL:` markers (one per test, at any indent under
+/// `-v`). Count them across the whole stream: `passed` = `--- PASS:` count,
+/// `failed` = `--- FAIL:` count. Reject-only by construction — every `FAIL`
+/// marker only lowers the ratio, so this can feed stall pressure toward abort
+/// but never fabricate acceptance (the exit-code gate stays authoritative).
+/// Returns `None` when no markers are present, so non-go output is unaffected.
+fn go_test_progress(text: &str) -> Option<u16> {
+    let mut passed = 0u64;
+    let mut failed = 0u64;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("--- PASS:") {
+            passed += 1;
+        } else if trimmed.starts_with("--- FAIL:") {
+            failed += 1;
+        }
+    }
+    ratio_permille(passed, failed)
+}
+
+/// `passed / (passed + failed)` in permille (0..=1000), or `None` when the total
+/// is zero. `passed <= total`, so the result is `<= 1000` and fits in `u16`;
+/// `.min` is belt-and-braces.
+fn ratio_permille(passed: u64, failed: u64) -> Option<u16> {
     let total = passed.checked_add(failed)?;
     if total == 0 {
         return None;
     }
-    // passed <= total, so this is <= 1000 and fits in u16; `.min` is belt-and-braces.
     Some((passed.saturating_mul(1000) / total).min(1000) as u16)
 }
 
@@ -762,6 +805,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_progress_jest_summary() {
+        // jest writes `Tests: M failed, N passed, T total` (often padded). The
+        // shared token scan finds 11 before `passed` and 1 before `failed`:
+        // 11/12 = 916 permille.
+        let out = "Tests:       1 failed, 11 passed, 12 total\n";
+        assert_eq!(parse_progress(out, ""), Some(916));
+    }
+
+    #[test]
     fn parse_progress_all_failed_is_zero() {
         assert_eq!(
             parse_progress("test result: FAILED. 0 passed; 2 failed; 0 ignored\n", ""),
@@ -797,6 +849,54 @@ mod tests {
         assert_eq!(parse_progress(stdout, stderr), Some(0));
         // Order-independent: same worst-case regardless of which stream is rosy.
         assert_eq!(parse_progress(stderr, stdout), Some(0));
+    }
+
+    #[test]
+    fn parse_progress_go_test_markers() {
+        // `go test -v` prints no aggregate `N passed` summary, only per-test
+        // `--- PASS:` / `--- FAIL:` markers (indented under the subtest, and the
+        // package `FAIL`/`ok` footer carries no counts). 3/4 PASS = 750 permille.
+        let out = "=== RUN   TestAlpha\n--- PASS: TestAlpha (0.00s)\n\
+            === RUN   TestBeta\n    --- FAIL: TestBeta/case (0.00s)\n\
+            === RUN   TestGamma\n--- PASS: TestGamma (0.00s)\n\
+            === RUN   TestDelta\n--- PASS: TestDelta (0.00s)\n\
+            FAIL\nexit status 1\nFAIL\texample/pkg\t0.012s\n";
+        assert_eq!(parse_progress(out, ""), Some(750));
+    }
+
+    #[test]
+    fn parse_progress_go_test_all_fail_is_zero() {
+        let out = "--- FAIL: TestA (0.00s)\n--- FAIL: TestB (0.00s)\nFAIL\n";
+        assert_eq!(parse_progress(out, ""), Some(0));
+    }
+
+    #[test]
+    fn parse_progress_go_markers_combine_pessimistically_with_summary() {
+        // Within ONE stream, a forged all-pass libtest summary must not mask a real
+        // go `--- FAIL:` marker on the same stream — the pessimistic (min) ratio of
+        // the two recognizers wins, so this only ever raises stall pressure.
+        let out = "--- FAIL: TestReal (0.00s)\n\
+            test result: ok. 10 passed; 0 failed\n";
+        assert_eq!(parse_progress(out, ""), Some(0));
+    }
+
+    #[test]
+    fn parse_progress_go_markers_worst_across_streams() {
+        // Go markers participate in the same cross-stream pessimism as summaries.
+        let stdout = "--- PASS: TestA (0.00s)\n--- PASS: TestB (0.00s)\n";
+        let stderr = "===== 1 failed, 0 passed in 0.01s =====\n";
+        assert_eq!(parse_progress(stdout, stderr), Some(0));
+        assert_eq!(parse_progress(stderr, stdout), Some(0));
+    }
+
+    #[test]
+    fn parse_progress_go_prose_without_markers_is_none() {
+        // Prose mentioning PASS/FAIL without the leading `--- PASS:`/`--- FAIL:`
+        // marker must not be parsed as go-test progress; output stays unrecognized.
+        assert_eq!(
+            parse_progress("all checks PASS and nothing did FAIL here\n", ""),
+            None
+        );
     }
 
     #[test]

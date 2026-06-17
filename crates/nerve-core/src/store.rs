@@ -863,6 +863,63 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_checkpoint_writes_never_corrupt_under_multi_instance() {
+        // Each thread models a SEPARATE `nv` instance: its own `NerveStore` over
+        // the SAME `.nerve/` dir. `save_checkpoint` -> `write_json_atomic` writes
+        // to a unique per-call `NamedTempFile` then `rename(2)`s it onto
+        // `{id}.json`, so concurrent writers either touch DIFFERENT files (distinct
+        // run-ids) or race renames onto the SAME path where each rename swaps in
+        // one COMPLETE file. A reader therefore never observes a torn/partial
+        // checkpoint. This is a structural property of atomic per-id writes — NOT a
+        // guarantee that requires a single serialized writer task; checkpoints stay
+        // non-authoritative recovery telemetry either way.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let path_ref = path.as_path();
+
+        // 8 distinct run-ids, each written once by its own instance...
+        let distinct: Vec<Task> = (0..8)
+            .map(|i| Task::new(format!("run {i}"), path_ref))
+            .collect();
+        // ...plus one HOT id hammered concurrently by many instances (rename races
+        // onto a single path), with VARYING payload sizes to widen any non-atomic
+        // partial-write window.
+        let hot = Task::new("hot run", path_ref);
+        let hot_ref = &hot;
+
+        std::thread::scope(|scope| {
+            for task in &distinct {
+                scope.spawn(move || {
+                    let store = NerveStore::new(path_ref);
+                    store.save_checkpoint(&sample_checkpoint(task, 1)).unwrap();
+                });
+            }
+            for round in 0..32u8 {
+                let rounds = (round % 5) as usize + 1;
+                scope.spawn(move || {
+                    let store = NerveStore::new(path_ref);
+                    store
+                        .save_checkpoint(&sample_checkpoint(hot_ref, rounds))
+                        .unwrap();
+                });
+            }
+        });
+
+        // `list_checkpoints` `read_json`s EVERY `*.json`, so a single torn file
+        // would make this `unwrap` panic. All distinct ids plus the hot id must
+        // have survived as complete, parseable checkpoints.
+        let listed = NerveStore::new(path_ref).list_checkpoints().unwrap();
+        let ids: std::collections::HashSet<_> =
+            listed.iter().map(|c| c.task.id.clone()).collect();
+        for task in &distinct {
+            assert!(ids.contains(&task.id), "distinct checkpoint {} missing", task.id);
+        }
+        assert!(ids.contains(&hot.id), "hot checkpoint missing");
+        // 8 distinct + 1 hot = 9 valid files (no duplicates, none corrupt).
+        assert_eq!(listed.len(), 9);
+    }
+
+    #[test]
     fn apply_and_rollback_keep_session_history_in_sync() {
         let dir = tempfile::tempdir().unwrap();
         let patch = NvPatch::new(vec![FilePatch::create("created.txt", "created\n")]);

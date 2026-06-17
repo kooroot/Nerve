@@ -246,6 +246,14 @@ impl Mayor {
         self.coordinator().ledger()
     }
 
+    /// H17: rebuild the coordination ledger from the authoritative queue dirs and
+    /// return the reconciled snapshot. See [`Coordinator::reconcile`]: dirs win on
+    /// every disagreement, it is a no-op when coordination is disabled, and the
+    /// result is observability ONLY — never consulted by the apply gate.
+    pub fn reconcile_ledger(&self) -> Result<Ledger, MayorError> {
+        self.coordinator().reconcile()
+    }
+
     /// S14: read and remove all coordination messages addressed to `recipient`.
     pub fn drain_mail(&self, recipient: &str) -> Result<Vec<MailMessage>, MayorError> {
         self.coordinator().drain_mail(recipient)
@@ -854,6 +862,52 @@ fn list_heartbeats(dir: &Path) -> Result<Vec<String>, MayorError> {
     Ok(entries)
 }
 
+/// The terminal [`LedgerState`] a [`PatrolVerdict`] maps to — the SAME direction
+/// as the queue file move in `Patrol::run_task` (Success/Skipped → `done/`,
+/// Failed → `failed/`). Routing `record_finished` and `reconcile` through one
+/// mapping guarantees the ledger can never report a failed task as done.
+fn terminal_state(verdict: PatrolVerdict) -> LedgerState {
+    match verdict {
+        PatrolVerdict::Success | PatrolVerdict::Skipped => LedgerState::Done,
+        PatrolVerdict::Failed => LedgerState::Failed,
+    }
+}
+
+/// One queue file as read by [`read_task_ids`]: its `task_id` (from the
+/// filename) and the best-effort `created_at` from the payload.
+type TaskIdRow = (String, Option<DateTime<Utc>>);
+
+/// Read every valid `<task_id>.json` in a flat queue directory as a
+/// `(task_id, created_at)` pair for ledger reconciliation. The id comes from the
+/// FILENAME (the authoritative key the queue uses), and `created_at` is a
+/// best-effort read of the `PatrolTask` payload — a file that will not parse
+/// still contributes its id + state (with `None` timestamp), so reconcile never
+/// drops a real on-disk task just because its payload is unreadable. Files whose
+/// stem is not a valid queue id are skipped (defense-in-depth: such a file could
+/// not have been written by `enqueue`/`claim`).
+fn read_task_ids(dir: &Path) -> Result<Vec<TaskIdRow>, MayorError> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(task_id) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !is_valid_queue_id(task_id) {
+            continue;
+        }
+        let created_at = read_json::<PatrolTask>(&path).ok().and_then(|t| t.created_at);
+        out.push((task_id.to_string(), created_at));
+    }
+    Ok(out)
+}
+
 /// True iff `id` is a valid on-disk queue component: 1..=128 bytes of
 /// `[A-Za-z0-9_-]`. This is the SAME predicate [`Mayor::enqueue`] enforces on
 /// every `task_id` (via [`validate_file_component`]); it is exposed so callers
@@ -1170,10 +1224,7 @@ impl Coordinator {
                 .entries
                 .entry(task_id.to_string())
                 .or_insert_with(|| LedgerEntry::pending(task_id));
-            entry.state = match verdict {
-                PatrolVerdict::Success | PatrolVerdict::Skipped => LedgerState::Done,
-                PatrolVerdict::Failed => LedgerState::Failed,
-            };
+            entry.state = terminal_state(verdict);
             entry.verdict = Some(verdict);
             entry.cost_microusd = Some(cost_microusd);
             entry.finished_at = Some(Utc::now());
@@ -1192,6 +1243,128 @@ impl Coordinator {
             entry.owner = None;
             entry.claimed_at = None;
         })
+    }
+
+    /// H17: REBUILD the ledger from scratch by scanning the AUTHORITATIVE queue
+    /// directories, re-converging the projection on disk truth after any drift —
+    /// a crashed writer, a manual file move, or a lost best-effort `record_*`. The
+    /// DIRS WIN on every disagreement: an entry the ledger had but no directory
+    /// backs is DROPPED, and a task present on disk but missing from the ledger is
+    /// ADDED. Scan order pending → claimed → done/failed means a task that
+    /// (transiently) appears under two directories resolves to the most-terminal
+    /// state — the SAME direction as the queue file move — so reconcile can never
+    /// downgrade a finished task back to pending nor report a failed task as done.
+    ///
+    /// Observability ONLY, exactly like every other ledger write: a no-op when
+    /// coordination is disabled (returns the current snapshot and writes NOTHING,
+    /// so queue behavior stays byte-identical to pre-S14), serialized by the
+    /// dedicated `ledger.lock`, and written atomically. The ledger is NEVER
+    /// consulted by the `blocked` gate, so reconciling cannot move a verdict
+    /// toward acceptance.
+    pub fn reconcile(&self) -> Result<Ledger, MayorError> {
+        if !self.enabled {
+            return self.ledger();
+        }
+        let _lock = FileLock::acquire(&self.workspace_root, "ledger.lock")?;
+        let rebuilt = self.scan_queue_dirs()?;
+        write_json_atomic(&self.layout.ledger_path(), &rebuilt)?;
+        Ok(rebuilt)
+    }
+
+    /// Build a fresh [`Ledger`] purely from the authoritative queue directories.
+    /// Read-only: takes no lock and writes nothing (the public [`Self::reconcile`]
+    /// owns the `ledger.lock` + atomic write). Pending first, then claimed, then
+    /// the terminal `done`/`failed` dirs, so a more-terminal directory overwrites
+    /// any earlier transient appearance of the same id.
+    fn scan_queue_dirs(&self) -> Result<Ledger, MayorError> {
+        let mut entries: BTreeMap<String, LedgerEntry> = BTreeMap::new();
+
+        // pending/<id>.json → Pending.
+        for (task_id, created_at) in read_task_ids(&self.layout.pending)? {
+            entries.insert(
+                task_id.clone(),
+                LedgerEntry {
+                    state: LedgerState::Pending,
+                    owner: None,
+                    created_at,
+                    claimed_at: None,
+                    finished_at: None,
+                    cost_microusd: None,
+                    verdict: None,
+                    task_id,
+                },
+            );
+        }
+
+        // claimed/<patrol>/<id>.json → Claimed, owner = patrol directory name.
+        if self.layout.claimed.exists() {
+            for patrol_dir in fs::read_dir(&self.layout.claimed)? {
+                let patrol_dir = patrol_dir?;
+                if !patrol_dir.file_type()?.is_dir() {
+                    continue;
+                }
+                let patrol_id = patrol_dir.file_name().to_string_lossy().into_owned();
+                for (task_id, created_at) in read_task_ids(&patrol_dir.path())? {
+                    entries.insert(
+                        task_id.clone(),
+                        LedgerEntry {
+                            state: LedgerState::Claimed,
+                            owner: Some(patrol_id.clone()),
+                            created_at,
+                            claimed_at: None,
+                            finished_at: None,
+                            cost_microusd: None,
+                            verdict: None,
+                            task_id,
+                        },
+                    );
+                }
+            }
+        }
+
+        // done/ + failed/ → terminal. STATE comes from the DIRECTORY (dirs win);
+        // verdict/cost/finished_at/owner are enriched from `results/<id>.json`
+        // ONLY when the result's verdict agrees with the directory, so a tampered
+        // result claiming success for a task sitting in `failed/` is ignored and
+        // the row stays Failed with no rosy metadata.
+        for (dir, dir_state) in [
+            (&self.layout.done, LedgerState::Done),
+            (&self.layout.failed, LedgerState::Failed),
+        ] {
+            for (task_id, created_at) in read_task_ids(dir)? {
+                let result = self
+                    .read_result(&task_id)
+                    .filter(|r| terminal_state(r.verdict) == dir_state);
+                entries.insert(
+                    task_id.clone(),
+                    LedgerEntry {
+                        state: dir_state,
+                        owner: result.as_ref().map(|r| r.patrol_id.clone()),
+                        created_at,
+                        claimed_at: None,
+                        finished_at: result.as_ref().and_then(|r| r.finished_at),
+                        cost_microusd: result.as_ref().map(|r| r.cost_microusd),
+                        verdict: result.as_ref().map(|r| r.verdict),
+                        task_id,
+                    },
+                );
+            }
+        }
+
+        Ok(Ledger {
+            version: LEDGER_VERSION,
+            entries,
+        })
+    }
+
+    /// Best-effort read of `results/<task_id>.json`. `None` when absent or
+    /// unparseable (reconcile then leaves the terminal row's metadata empty).
+    fn read_result(&self, task_id: &str) -> Option<PatrolResult> {
+        let path = self.layout.result_path(task_id);
+        if !path.exists() {
+            return None;
+        }
+        read_json(&path).ok()
     }
 
     // ----- mailbox -----
@@ -1745,6 +1918,127 @@ mod tests {
         let status = mayor.status().await.unwrap();
         assert_eq!(status.pending_count, 2);
         assert!(mayor.ledger().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn reconcile_rebuilds_ledger_from_dirs_and_dirs_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let coord = Coordinator::new(root.clone(), &cfg());
+
+        let queue = root.join(".nerve/queue");
+        let results = root.join(".nerve/results");
+
+        // Lay out the AUTHORITATIVE queue dirs by hand: one task in each lifecycle
+        // directory, terminal ones backed by a result file.
+        write_json_atomic(
+            &queue.join("pending/t-pending.json"),
+            &PatrolTask::new("t-pending", "p", 1000),
+        )
+        .unwrap();
+        write_json_atomic(
+            &queue.join("claimed/p-worker/t-claimed.json"),
+            &PatrolTask::new("t-claimed", "p", 1000),
+        )
+        .unwrap();
+        write_json_atomic(
+            &queue.join("done/t-done.json"),
+            &PatrolTask::new("t-done", "p", 1000),
+        )
+        .unwrap();
+        write_json_atomic(
+            &results.join("t-done.json"),
+            &PatrolResult::success("t-done", "p-worker", 4242),
+        )
+        .unwrap();
+        write_json_atomic(
+            &queue.join("failed/t-failed.json"),
+            &PatrolTask::new("t-failed", "p", 1000),
+        )
+        .unwrap();
+        // A TAMPERED result claiming SUCCESS for a task sitting in `failed/` must
+        // be ignored — dirs win, so the row stays Failed with NO rosy metadata.
+        write_json_atomic(
+            &results.join("t-failed.json"),
+            &PatrolResult::success("t-failed", "p-worker", 9999),
+        )
+        .unwrap();
+
+        // Seed a DIVERGENT stale ledger: a wrong state for a real task, plus a
+        // ghost entry no directory backs. (t-done / t-failed are deliberately
+        // ABSENT from the seed — dir-only — and must be ADDED by reconcile.)
+        coord.record_claimed("t-pending", "p-stale").unwrap(); // dir actually says Pending
+        coord.record_enqueued("t-ghost", None).unwrap(); // no dir backs this
+        assert!(coord.ledger().unwrap().entries.contains_key("t-ghost"));
+
+        let ledger = coord.reconcile().unwrap();
+
+        // Exactly the four on-disk tasks survive; the stale ghost is DROPPED.
+        assert_eq!(ledger.entries.len(), 4);
+        assert!(
+            !ledger.entries.contains_key("t-ghost"),
+            "stale ghost (no backing dir) must be dropped"
+        );
+
+        let pending = ledger.entries.get("t-pending").unwrap();
+        assert_eq!(
+            pending.state,
+            LedgerState::Pending,
+            "dirs win: stale Claimed corrected back to Pending"
+        );
+        assert!(pending.owner.is_none());
+        assert!(pending.created_at.is_some(), "created_at read from task file");
+
+        let claimed = ledger.entries.get("t-claimed").unwrap();
+        assert_eq!(claimed.state, LedgerState::Claimed);
+        assert_eq!(claimed.owner.as_deref(), Some("p-worker"));
+
+        let done = ledger.entries.get("t-done").unwrap();
+        assert_eq!(done.state, LedgerState::Done);
+        assert_eq!(done.verdict, Some(PatrolVerdict::Success));
+        assert_eq!(done.cost_microusd, Some(4242));
+        assert!(done.finished_at.is_some());
+
+        let failed = ledger.entries.get("t-failed").unwrap();
+        assert_eq!(
+            failed.state,
+            LedgerState::Failed,
+            "dirs win: a task in failed/ stays Failed"
+        );
+        // The tampered success result was rejected (verdict ≠ dir), so no metadata.
+        assert_eq!(failed.verdict, None);
+        assert_eq!(failed.cost_microusd, None);
+
+        // The reconciled ledger was PERSISTED atomically — a fresh reader agrees.
+        let reread = Coordinator::new(root, &cfg()).ledger().unwrap();
+        assert_eq!(reread, ledger);
+    }
+
+    #[test]
+    fn reconcile_is_noop_when_coordination_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let queue = root.join(".nerve/queue");
+        // A real pending task exists on disk...
+        write_json_atomic(
+            &queue.join("pending/t-x.json"),
+            &PatrolTask::new("t-x", "p", 1000),
+        )
+        .unwrap();
+
+        // ...but with coordination disabled, reconcile writes NOTHING and returns
+        // the current (empty) snapshot — a disabled queue stays byte-identical to
+        // pre-S14, exactly like `mutate_ledger`'s `!enabled` no-op.
+        let coord = Coordinator::new(root.clone(), &cfg_no_coordination());
+        let ledger = coord.reconcile().unwrap();
+        assert!(
+            ledger.entries.is_empty(),
+            "disabled reconcile must not project the dirs"
+        );
+        assert!(
+            !queue.join("ledger.json").exists(),
+            "disabled reconcile must not create the ledger file"
+        );
     }
 
     #[test]

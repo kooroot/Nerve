@@ -211,6 +211,8 @@ Nerve exposes one CLI binary, `nv`.
 | `nv mcp list-tools` | Start configured MCP servers and list advertised tools |
 | `nv mcp probe <server>` | Handshake one configured MCP server and print its tools |
 | `nv mayor --status-only` | Show Mayor queue depth without dispatching |
+| `nv mayor --ledger` | Print the non-authoritative coordination ledger and exit |
+| `nv mayor --reconcile` | Rebuild the ledger from the queue directories (dirs win), print it, and exit |
 | `nv patrol --id <slot> --status` | Show a patrol slot's token/worktree/status view |
 | `nv patrol --id <slot> --once` | Claim and run one queued patrol task |
 | `nv benchmark pi` | Run the deterministic Pi-inspired workflow benchmark |
@@ -729,6 +731,8 @@ Nerve is built around conservative file mutation:
 - RPC tokens are stored under `.nerve/session-meta/` with restrictive permissions on Unix.
 - MCP servers default to read-only mode with deny-by-default admission (allowlist or read-only annotation evidence required), a write-tool blacklist veto, and a provenance-gated legacy posture; an optional per-tool `argument_policy` adds lexical path-root confinement and substring denylists as monotone-restrictive defense-in-depth.
 - Mayor/Patrol queue identifiers are restricted to safe file-component characters and duplicate task IDs are rejected.
+- The `/goal` no-progress hint is reject-only telemetry, computed only for a check that already failed: it reads the pass-ratio of recognized test summaries (libtest, pytest, jest) plus `go test` per-test `--- PASS:`/`--- FAIL:` markers, taking the most pessimistic (minimum) ratio across stdout/stderr and across recognizers so it always biases toward more stall pressure. It is best-effort and not tamper-proof — because the summary recognizer uses the last summary line in a stream, a lead can inflate the hint by appending a later forged all-pass summary or by suppressing the real failure output entirely. That can only delay a stall-driven abort: progress is never read as acceptance, so it cannot satisfy a goal, shorten review, or flip a verdict — the deterministic exit-code check stays the sole acceptance authority. Unrecognized output yields no ratio and the loop falls back to identical-output stall detection.
+- The coordination ledger and round checkpoints are non-authoritative projections, never consulted by the deterministic apply/`blocked` gate. Checkpoints are written atomically per run-id, so concurrent multi-instance writers never corrupt them. `nv mayor --reconcile` rebuilds the ledger from the authoritative queue directories — the directories win on any disagreement, so reconcile never downgrades a finished task back to pending nor reports a failed task as done (a result file that disagrees with its queue directory is ignored).
 - Generated runtime state under `.nerve/` is ignored by Git.
 
 Runtime persistence and patch indexing are implemented under `.nerve/`.

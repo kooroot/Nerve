@@ -308,6 +308,11 @@ struct MayorArgs {
     ledger: bool,
     #[arg(
         long,
+        help = "H17: rebuild the coordination ledger from the queue directories (dirs win on disagreement), print it, and exit (no dispatch)"
+    )]
+    reconcile: bool,
+    #[arg(
+        long,
         value_name = "PATROL_ID",
         help = "S14: drain and print the given recipient's coordination mailbox, then exit"
     )]
@@ -1272,6 +1277,16 @@ async fn run_mayor_subcommand(args: MayorArgs, _mock: bool) -> Result<()> {
     }
     if args.ledger {
         let ledger = mayor.ledger().context("failed to read coordination ledger")?;
+        print_ledger(&ledger);
+        return Ok(());
+    }
+    if args.reconcile {
+        // H17: rebuild the ledger from the authoritative queue dirs (dirs win),
+        // persist it, and print it. Observability/repair only — never touches the
+        // queue files or the apply gate. No-op write when coordination is disabled.
+        let ledger = mayor
+            .reconcile_ledger()
+            .context("failed to reconcile coordination ledger")?;
         print_ledger(&ledger);
         return Ok(());
     }
@@ -7119,8 +7134,9 @@ mod tests {
                 assert_eq!(args.max_patrols, Some(4));
                 assert_eq!(args.per_patrol_budget_microusd, Some(100_000));
                 assert!(args.status_only);
-                // S14 flags default off/none.
+                // S14/H17 flags default off/none.
                 assert!(!args.ledger);
+                assert!(!args.reconcile);
                 assert!(args.mailbox.is_none());
             }
             other => panic!("expected Mayor subcommand, got {other:?}"),
@@ -7135,6 +7151,18 @@ mod tests {
         match ledger.command {
             Some(Command::Mayor(args)) => {
                 assert!(args.ledger);
+                assert!(!args.reconcile);
+                assert!(args.mailbox.is_none());
+            }
+            other => panic!("expected Mayor subcommand, got {other:?}"),
+        }
+
+        let reconcile = Cli::try_parse_from(["nv", "mayor", "--reconcile"])
+            .expect("clap must accept `nv mayor --reconcile`");
+        match reconcile.command {
+            Some(Command::Mayor(args)) => {
+                assert!(args.reconcile);
+                assert!(!args.ledger);
                 assert!(args.mailbox.is_none());
             }
             other => panic!("expected Mayor subcommand, got {other:?}"),
@@ -7146,6 +7174,7 @@ mod tests {
             Some(Command::Mayor(args)) => {
                 assert_eq!(args.mailbox.as_deref(), Some("patrol-1"));
                 assert!(!args.ledger);
+                assert!(!args.reconcile);
             }
             other => panic!("expected Mayor subcommand, got {other:?}"),
         }

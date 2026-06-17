@@ -549,11 +549,19 @@ impl Synapse {
             inner.rounds.clone()
         };
 
-        // S8: persist the in-flight checkpoint. Additive telemetry only — a
-        // write failure is logged and swallowed (never aborts the loop, never
-        // touches acceptance). Cadence is once per completed round (model-call
-        // bounded), and the payload is small + atomic, so the inline sync write
-        // is acceptable here; a dedicated writer task is a future S9 concern.
+        // S8: persist the in-flight checkpoint. Additive recovery telemetry only
+        // — a write failure is logged and swallowed (never aborts the loop, never
+        // touches acceptance), and a checkpoint is never read as an authority on
+        // whether a run succeeded. Cadence is once per completed round (model-call
+        // bounded). The write goes through `write_json_atomic` (unique per-call
+        // temp file + `rename(2)`) onto a per-run-id `{id}.json`, so even
+        // concurrent multi-instance writers hit DIFFERENT files atomically, or race
+        // renames onto one path where each swaps in a COMPLETE file — corruption is
+        // structurally prevented and a reader never sees a torn checkpoint
+        // (`store::concurrent_checkpoint_writes_never_corrupt_under_multi_instance`
+        // proves this). A dedicated async writer task is therefore a deferred
+        // latency optimization (S9), NOT a correctness requirement; the inline sync
+        // write is safe here.
         if let Some(sink) = &self.checkpoint {
             let checkpoint = store::RunCheckpoint {
                 task: sink.task.clone(),
