@@ -393,6 +393,25 @@ impl SubprocessAdapter {
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
+                    // H14: the model CLI child must never outlive its generation
+                    // future. Without this, dropping an in-flight generation
+                    // (daemon shutdown, the run future being dropped, a panic
+                    // unwind, or a future cancel-select) orphans the LLM CLI
+                    // process, leaking quota and a stray child. `kill_on_drop`
+                    // sends SIGKILL when the owning `Child` is dropped, so a
+                    // dropped generation is reliably reaped. This is set ONLY on
+                    // the GENERATION spawn — never on the goal-check verifier
+                    // (goal.rs) or any rollback path, which must run to completion
+                    // and are killed only explicitly (anti-pattern #3: only model
+                    // generation is interruptible). It is reject-direction only:
+                    // a killed generation can never become an acceptance — a
+                    // cancelled run maps to blocked + not-applied at the seam.
+                    // The normal happy path is unaffected: the child is awaited to
+                    // completion below (and on timeout/drain-error explicitly
+                    // start_kill'd + waited), so `kill_on_drop` fires only when the
+                    // future is genuinely abandoned, never double-killing a
+                    // normally-finished child.
+                    .kill_on_drop(true)
                     .spawn()
             },
             self.spawn_retries,
@@ -2874,5 +2893,92 @@ Lead notes before the patch.
         assert_eq!(usage.input_tokens, 14);
         assert_eq!(usage.output_tokens, 9);
         assert_eq!(usage.estimated_cost_microusd, Some(120));
+    }
+
+    /// H14: read a PID written by the child's `echo $$`, tolerating the brief
+    /// window where the file exists but the write has not landed yet.
+    #[cfg(unix)]
+    fn read_pid(pidfile: &Path) -> Option<u32> {
+        std::fs::read_to_string(pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+    }
+
+    /// H14: poll `kill -0 <pid>` (dependency-free; succeeds iff the process still
+    /// exists) until it reports the process gone or the deadline elapses.
+    #[cfg(unix)]
+    async fn wait_until_dead(pid: u32, within: Duration) -> bool {
+        let start = tokio::time::Instant::now();
+        loop {
+            let alive = Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !alive {
+                return true;
+            }
+            if start.elapsed() >= within {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// H14: dropping an in-flight generation future must REAP the model-CLI
+    /// child, never orphan it. The child records its own PID (`$$`) then `exec`s
+    /// the long sleeper, so the recorded PID *is* the process `kill_on_drop` must
+    /// SIGKILL (no forked grandchild to leak). We drive the real `run_prompt`
+    /// future only until the child is alive and has recorded its PID — no
+    /// fixed-time race — then drop it; with `kill_on_drop(true)` the child dies.
+    /// Unix-only: it relies on `sh`/`sleep`/`kill -0`, the platforms the model-CLI
+    /// generation path targets.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_in_flight_generation_reaps_child_no_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        // `sh -c <script> <arg0>` binds `$0` to <arg0> (the pidfile). The shell
+        // writes its PID, then `exec sleep` replaces the image *keeping the same
+        // PID*, so the recorded PID is the live process kill_on_drop reaps.
+        let adapter = SubprocessAdapter::new(
+            "reaper-test",
+            "sh",
+            vec![
+                "-c".to_string(),
+                "echo $$ > \"$0\"; exec sleep 30".to_string(),
+                pidfile.to_string_lossy().into_owned(),
+            ],
+        );
+        let (tx, _rx) = mpsc::channel(8);
+
+        // Drive the generation future until the child has spawned and recorded
+        // its PID, then drop it. `break pid` exits the loop; `fut` (owning the
+        // `Child`) then drops at block end → kill_on_drop SIGKILLs the child.
+        let pid = {
+            let fut = adapter.run_prompt("ignored".to_string(), dir.path(), &tx);
+            tokio::pin!(fut);
+            loop {
+                tokio::select! {
+                    _ = &mut fut => {
+                        panic!("generation finished before the drop (sleep too short?)")
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                        if let Some(pid) = read_pid(&pidfile) {
+                            break pid;
+                        }
+                    }
+                }
+            }
+        };
+
+        // SIGKILL + reap is asynchronous; poll until the PID is gone.
+        assert!(
+            wait_until_dead(pid, Duration::from_secs(5)).await,
+            "child pid {pid} was orphaned — kill_on_drop did not reap the dropped generation"
+        );
     }
 }

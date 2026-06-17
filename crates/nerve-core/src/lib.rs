@@ -1355,7 +1355,9 @@ fn budget_exceeded_feedback(reviewer_id: &str, usage: &UsageStats) -> ReviewerFe
 /// during THIS generation (each item is also recorded to the synapse for the
 /// report). S10 uses the returned batch to optionally redirect the next refine
 /// or short-circuit the loop — strictly at the round seam, never mid-generation
-/// (the lead's model subprocess is not `kill_on_drop`).
+/// (steering is seam-only by design; H14's `kill_on_drop` on the generation
+/// subprocess only reaps an abandoned generation future, it is not a
+/// mid-generation steering or cancel hook).
 async fn collect_output_with_crossfire<F>(
     output_future: F,
     reviewer: &dyn ModelAdapter,

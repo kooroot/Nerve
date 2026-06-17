@@ -845,8 +845,10 @@ impl ReviewStrictness {
 /// recorded for the report but never steering the lead nor stopping a round.
 ///
 /// Both non-`Off` actions are REJECTION-DIRECTION ONLY and act strictly at the
-/// round seam (the lead's model subprocess is not `kill_on_drop`, and steering
-/// is seam-only by design — roadmap directive (e) / anti-pattern #3). They can
+/// round seam (steering is seam-only by design — roadmap directive (e) /
+/// anti-pattern #3; H14's `kill_on_drop` on the generation subprocess only
+/// reaps an abandoned generation future and is never a mid-generation steering
+/// or cancel hook). They can
 /// only push the loop toward more scrutiny / refine / abort, NEVER toward
 /// acceptance: the deterministic gate (verdict-accept AND check Pass) stays the
 /// sole acceptance authority. A "looks good" crossfire never accelerates
