@@ -32,6 +32,16 @@ pub enum GoalError {
     PrivateTmpDir(std::io::Error),
 }
 
+/// H4: failure reason when the `Required` runtime confinement self-test (canary)
+/// finds that an out-of-grant write was NOT denied — i.e. the sandbox wrap is
+/// ineffective. The check is refused (fail closed) rather than run effectively
+/// unconfined.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
+const CONFINEMENT_SELFTEST_FAILED: &str = "sandbox confinement self-test failed: an out-of-root write was NOT denied under sandbox.mode=required; refusing to run the check unconfined (fail closed)";
+
 #[derive(Debug, Clone)]
 pub struct GoalEvaluator {
     goal: GoalSpec,
@@ -145,7 +155,42 @@ impl GoalEvaluator {
                         self.goal.check_cmd[1..].to_vec(),
                     )
                 }
-                SandboxDecision::Wrap { program, args } => (program, args),
+                SandboxDecision::Wrap { program, args } => {
+                    // H4: `Required` promises code never runs unconfined, but
+                    // fail-closed was enforced only at DECISION time (no backend
+                    // -> Refuse). Once `decide` returns `Wrap`, the runtime
+                    // trusted the wrap blindly: if the kernel/bwrap ran the inner
+                    // command but the confinement profile was NOT actually in
+                    // force (flag drift, missing userns, profile not applied),
+                    // the real check would run effectively UNCONFINED while
+                    // believed confined = fail-OPEN. Before trusting the wrap,
+                    // run a canary that PROVES an out-of-grant write is denied.
+                    // It can only turn a believed-confined run into a Fail; it
+                    // never fabricates a Pass. `Required` only (Auto is
+                    // best-effort by definition; no canary latency there); macOS
+                    // /Linux only (the only Wrap-producing backends — elsewhere
+                    // `Required` already Refuses at decision time).
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    if self.sandbox.mode == nerve_config::SandboxMode::Required {
+                        let confined = match &private_tmp {
+                            Some(grant) => {
+                                self.verify_confinement(&extra_writable, grant.path())
+                                    .await?
+                            }
+                            // `Required` is always sandbox-enabled, so a private
+                            // dir was minted and this is `Some`. If it somehow is
+                            // not, we cannot run the self-test -> fail closed.
+                            None => false,
+                        };
+                        if !confined {
+                            return Ok(CheckResult::Fail {
+                                reason: CONFINEMENT_SELFTEST_FAILED.to_string(),
+                                progress: None,
+                            });
+                        }
+                    }
+                    (program, args)
+                }
                 SandboxDecision::Refuse { reason } => {
                     return Ok(CheckResult::Fail {
                         reason,
@@ -280,6 +325,38 @@ impl GoalEvaluator {
             Ok(CheckResult::Fail { reason, progress })
         }
     }
+
+    /// H4: prove the sandbox wrap actually confines before trusting it (`Required`
+    /// only). Mint a probe dir OUTSIDE the writable grant and run a canary under
+    /// the SAME policy as the real check; return whether an out-of-grant write is
+    /// genuinely denied. `Ok(false)` (or a mint error via `?`) makes the caller
+    /// fail closed. The probe dir is RAII-cleaned. macOS/Linux only — the only
+    /// `Wrap`-producing backends.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn verify_confinement(
+        &self,
+        profile_writable: &[PathBuf],
+        grant_dir: &std::path::Path,
+    ) -> Result<bool, GoalError> {
+        // The probe dir is a FRESH tempfile sibling, deliberately NOT added to
+        // `profile_writable`, so the sandbox profile does not grant it. It must
+        // EXIST so the only reason an in-probe write can fail is sandbox denial,
+        // not a missing parent.
+        let probe = tempfile::Builder::new()
+            .prefix("nerve-canary-")
+            .tempdir()
+            .map_err(GoalError::PrivateTmpDir)?;
+        run_confinement_probe(
+            &self.sandbox,
+            &self.cwd,
+            profile_writable,
+            grant_dir,
+            probe.path(),
+            self.goal.timeout_secs,
+        )
+        .await
+        // `probe` drops here -> the probe dir (and any escape file) is removed.
+    }
 }
 
 /// H2: per-check writable-temp policy. When the sandbox confines writes, mint a
@@ -308,6 +385,89 @@ fn private_check_tmpdir(sandbox: &SandboxConfig) -> Result<Option<TempDir>, Goal
             .map_err(GoalError::PrivateTmpDir)?;
     }
     Ok(Some(dir))
+}
+
+/// H4 verdict (keyed on FILE PRESENCE, never an exit code — exit codes are
+/// invertible, file presence is not). The wrap is confining iff the out-of-grant
+/// ESCAPE write was DENIED (no file) AND the in-grant LIVE marker proves the
+/// canary actually ran. `LIVE` absent => the canary never executed => ambiguous
+/// => treat as NOT confined (fail closed), never as confined.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
+fn canary_confined(escape_exists: bool, live_exists: bool) -> bool {
+    !escape_exists && live_exists
+}
+
+/// H4: run one confinement canary under the SAME sandbox policy the real check
+/// will use, and report whether an out-of-grant write is actually DENIED. The
+/// canary writes a LIVE marker INSIDE the grant (positive control: proves the
+/// canary ran at all, so "no escape file" cannot be confused with "canary never
+/// executed") and attempts an ESCAPE write into `probe_dir`, which is OUTSIDE the
+/// granted writable set. Returns `Ok(true)` only when the escape was denied AND
+/// the canary demonstrably ran; otherwise `Ok(false)` so the caller fails closed.
+/// It can only ever turn a believed-confined run into a Fail — it never
+/// fabricates a Pass. macOS/Linux only.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn run_confinement_probe(
+    config: &SandboxConfig,
+    cwd: &std::path::Path,
+    profile_writable: &[PathBuf],
+    grant_dir: &std::path::Path,
+    probe_dir: &std::path::Path,
+    timeout_secs: u64,
+) -> Result<bool, GoalError> {
+    let live = grant_dir.join(".nerve-canary-live");
+    let escape = probe_dir.join("nerve-canary-escape");
+    // Paths are passed via env (not interpolated into the script) so a path with
+    // a quote/space/newline cannot break out of the shell command. `;` not `&&`:
+    // attempt the ESCAPE write even if the LIVE write is somehow blocked, so a
+    // broken in-grant write can never mask an ineffective wrap.
+    let script = "printf x > \"$NERVE_CANARY_LIVE\"; printf x > \"$NERVE_CANARY_ESCAPE\"";
+    let canary_cmd = [
+        "sh".to_string(),
+        "-c".to_string(),
+        script.to_string(),
+    ];
+    let (program, args) = match sandbox::decide(config, cwd, &canary_cmd, profile_writable) {
+        SandboxDecision::Wrap { program, args } => (program, args),
+        // We are only called on the real check's `Wrap` path, and `decide` keys
+        // its Wrap/Refuse choice on backend availability (not the inner command),
+        // so the canary also decides `Wrap`. Any other decision means we cannot
+        // prove confinement -> fail closed.
+        _ => return Ok(false),
+    };
+    let mut command = Command::new(&program);
+    command
+        .args(&args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_clear()
+        .env("NERVE_CANARY_LIVE", &live)
+        .env("NERVE_CANARY_ESCAPE", &escape);
+    let mut child = command.spawn()?;
+    // The canary does two tiny writes; cap well under the check timeout. On
+    // timeout/await-error we cannot conclude confinement -> fail closed.
+    let dur = Duration::from_secs(timeout_secs.clamp(1, 10));
+    match timeout(dur, child.wait()).await {
+        // Exit status intentionally ignored — the authoritative signal is file
+        // presence below, which a no-op'd wrap cannot fake.
+        Ok(Ok(_status)) => {}
+        Ok(Err(_)) | Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Ok(false);
+        }
+    }
+    let verdict = canary_confined(escape.exists(), live.exists());
+    // Keep the grant pristine for the real check that runs next (the LIVE marker
+    // lives in the same dir that becomes the child's TMPDIR). The escape file, if
+    // any, lives in the probe dir which the caller RAII-removes.
+    let _ = std::fs::remove_file(&live);
+    Ok(verdict)
 }
 
 struct OutputCapExceeded(usize);
@@ -772,5 +932,120 @@ mod tests {
             "a direct write outside the private temp grant must be denied"
         );
         assert!(!escape.exists(), "denied write must leave no file");
+    }
+
+    // --- H4: Required runtime confinement self-test (canary) ---
+
+    /// The canary verdict keys on FILE PRESENCE only (exit codes are invertible):
+    /// confined iff the out-of-grant escape write was denied (absent) AND the
+    /// in-grant live marker proves the canary actually ran. A missing live marker
+    /// (canary never executed) is NEVER reported as confined — fail closed.
+    #[test]
+    fn canary_confined_truth_table() {
+        assert!(
+            canary_confined(false, true),
+            "escape denied + canary ran => confined"
+        );
+        assert!(
+            !canary_confined(true, true),
+            "escape SUCCEEDED => not confined (fail closed)"
+        );
+        assert!(
+            !canary_confined(false, false),
+            "canary never ran (no live marker) => not confined (fail closed)"
+        );
+        assert!(
+            !canary_confined(true, false),
+            "escape succeeded + no live => not confined"
+        );
+    }
+
+    /// macOS real kernel: under an EFFECTIVE wrap the canary's out-of-grant write
+    /// is denied, so `run_confinement_probe` reports confined and leaves no escape
+    /// file. The profile grants only `cwd` + `grant` (the probe dir is excluded).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn confinement_probe_reports_confined_when_escape_denied() {
+        let cwd_t = tempfile::tempdir().unwrap();
+        let grant_t = tempfile::tempdir().unwrap();
+        let probe_t = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(cwd_t.path()).unwrap();
+        let grant = std::fs::canonicalize(grant_t.path()).unwrap();
+        let probe = std::fs::canonicalize(probe_t.path()).unwrap();
+        let sandbox = SandboxConfig {
+            mode: nerve_config::SandboxMode::Required,
+            allow_network: false,
+        };
+        let confined =
+            run_confinement_probe(&sandbox, &cwd, std::slice::from_ref(&grant), &grant, &probe, 10)
+                .await
+                .unwrap();
+        assert!(confined, "an out-of-grant write must be denied -> confined");
+        assert!(
+            !probe.join("nerve-canary-escape").exists(),
+            "the denied escape write must leave no file"
+        );
+    }
+
+    /// macOS real kernel, FAIL-CLOSED: simulate an INEFFECTIVE wrap by letting the
+    /// canary's own profile ALSO grant the probe dir, so the out-of-grant escape
+    /// write SUCCEEDS (as it would under a silently no-op'd wrap).
+    /// `run_confinement_probe` must then report NOT confined — proving that when a
+    /// wrap fails to block an out-of-root write, the canary catches it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn confinement_probe_reports_unconfined_when_escape_succeeds() {
+        let cwd_t = tempfile::tempdir().unwrap();
+        let grant_t = tempfile::tempdir().unwrap();
+        let probe_t = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(cwd_t.path()).unwrap();
+        let grant = std::fs::canonicalize(grant_t.path()).unwrap();
+        let probe = std::fs::canonicalize(probe_t.path()).unwrap();
+        let sandbox = SandboxConfig {
+            mode: nerve_config::SandboxMode::Required,
+            allow_network: false,
+        };
+        let confined = run_confinement_probe(
+            &sandbox,
+            &cwd,
+            &[grant.clone(), probe.clone()],
+            &grant,
+            &probe,
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !confined,
+            "when an out-of-grant write SUCCEEDS, the canary must report NOT confined (fail closed)"
+        );
+    }
+
+    /// H4 end-to-end (macOS real kernel): a healthy `Required` run is NOT broken
+    /// by the canary — the self-test finds confinement effective and the real
+    /// check proceeds to Pass on its own exit status.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn goal_evaluator_required_canary_allows_healthy_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let sandbox = SandboxConfig {
+            mode: nerve_config::SandboxMode::Required,
+            allow_network: false,
+        };
+        let evaluator = GoalEvaluator::with_options(
+            spec_with_cmd(vec!["true"], 30),
+            Vec::new(),
+            4096,
+            cwd,
+            None,
+            sandbox,
+        )
+        .unwrap();
+        assert_eq!(
+            evaluator.evaluate().await,
+            CheckResult::Pass,
+            "the canary must not break a healthy Required run"
+        );
     }
 }
