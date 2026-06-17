@@ -342,6 +342,14 @@ impl GoalEvaluator {
         // `profile_writable`, so the sandbox profile does not grant it. It must
         // EXIST so the only reason an in-probe write can fail is sandbox denial,
         // not a missing parent.
+        //
+        // Edge case (fail-safe direction): if the check's `cwd` is a broad
+        // ANCESTOR of the system temp dir (e.g. `/`), the probe — minted under
+        // the system temp — falls inside the always-writable `cwd` grant, so the
+        // escape write succeeds and the canary reports NOT confined -> the check
+        // is refused. This is a (theoretical, pathological-cwd) FALSE-NEGATIVE
+        // that fails CLOSED; it never fails open. A normal check `cwd` (a repo /
+        // worktree dir) is never an ancestor of the temp root.
         let probe = tempfile::Builder::new()
             .prefix("nerve-canary-")
             .tempdir()
