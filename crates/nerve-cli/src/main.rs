@@ -6,7 +6,7 @@ use nerve_adapter::{
 };
 use nerve_config::{
     BuiltinVerifierMode, Config, DaemonProtocol, GoalIntent, GoalSpec, McpConfig, PlanStrategy,
-    RpcConfig,
+    RpcConfig, resolve_mcp_read_only_posture,
 };
 use nerve_core::session_fork::{ForkOptions as CoreForkOptions, SessionTree};
 use nerve_core::store::{ApprovalGrant, NerveStore, RunCheckpoint};
@@ -21,7 +21,8 @@ use nerve_core::{
 };
 use nerve_tui::{TuiApp, TuiAppOptions, TuiState};
 use nerve_types::{
-    AgentEvent, McpToolCall, PlanReport, RPC_SCHEMA_VERSION, RoundRecord, RpcEnvelope, Task, Verdict,
+    AgentEvent, McpReadOnlyPosture, McpToolCall, PlanReport, RPC_SCHEMA_VERSION, RoundRecord,
+    RpcEnvelope, Task, Verdict,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -1090,6 +1091,27 @@ fn active_mcp_config(config: &Config) -> Option<&McpConfig> {
     config.roles.mcp.as_ref()
 }
 
+/// Resolve the effective MCP `read_only` posture (H1) under the config's S4
+/// provenance, emitting a LOUD warning when a repo-local config's weaker
+/// `legacy_denylist` request is refused. Centralized so every MCP entry point
+/// applies the same provenance gate and the same operator-facing warning.
+fn resolve_mcp_posture(config: &Config, mcp: &McpConfig) -> McpReadOnlyPosture {
+    let consent = project_verifier_consent_from_env();
+    let effective = resolve_mcp_read_only_posture(config.source(), mcp.read_only_posture, consent);
+    if effective != mcp.read_only_posture {
+        // The only downgrade is Project-source + LegacyDenylist without consent.
+        eprintln!(
+            "{}",
+            warn(format!(
+                "mcp: ignoring `read_only_posture = legacy_denylist` from project-local config \
+                 (untrusted source — a cloned repo could weaken your write posture); using \
+                 deny-by-default. Set {PROJECT_VERIFIER_CONSENT_ENV}=1 to honor it."
+            ))
+        );
+    }
+    effective
+}
+
 async fn run_mcp_subcommand(command: McpCommand) -> Result<()> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let config = Config::load_from(&cwd)?;
@@ -1097,12 +1119,13 @@ async fn run_mcp_subcommand(command: McpCommand) -> Result<()> {
         println!("mcp: no servers configured (roles.mcp / profiles[].mcp empty)");
         return Ok(());
     };
+    let posture = resolve_mcp_posture(&config, &mcp);
 
     match command {
         McpCommand::ListTools { json } => {
             let mut registry = McpRegistry::new();
             if let Err(err) = registry
-                .register_all(&mcp.servers, &mcp.write_tool_patterns, &mcp.allow_tools)
+                .register_all(&mcp.servers, &mcp.write_tool_patterns, &mcp.allow_tools, posture)
                 .await
             {
                 anyhow::bail!("failed to start MCP servers: {err}");
@@ -1150,7 +1173,7 @@ async fn run_mcp_subcommand(command: McpCommand) -> Result<()> {
             } else {
                 mcp.write_tool_patterns.clone()
             };
-            let client = McpClient::new(spec, patterns);
+            let client = McpClient::new(spec, patterns, posture);
             client
                 .start()
                 .await
@@ -3580,13 +3603,14 @@ async fn handle_mcp_slash(raw_command: &str, args: Vec<&str>, cwd: &Path) -> Res
         println!("/mcp: no servers configured (roles.mcp / profiles[].mcp empty)");
         return Ok(());
     };
+    let posture = resolve_mcp_posture(&config, &mcp);
     let mut iter = args.into_iter();
     let action = iter.next().unwrap_or("list");
     match action {
         "list" => {
             let mut registry = McpRegistry::new();
             registry
-                .register_all(&mcp.servers, &mcp.write_tool_patterns, &mcp.allow_tools)
+                .register_all(&mcp.servers, &mcp.write_tool_patterns, &mcp.allow_tools, posture)
                 .await
                 .context("/mcp list: failed to start configured servers")?;
             for (name, client) in registry.iter() {
@@ -3635,7 +3659,7 @@ async fn handle_mcp_slash(raw_command: &str, args: Vec<&str>, cwd: &Path) -> Res
             } else {
                 mcp.write_tool_patterns.clone()
             };
-            let client = McpClient::new(spec, patterns);
+            let client = McpClient::new(spec, patterns, posture);
             client.start().await?;
             let result = client
                 .call_tool(McpToolCall {

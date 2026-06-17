@@ -435,7 +435,9 @@ From the terminal workspace:
 /mcp call docs search '{"query":"release workflow"}'
 ```
 
-MCP servers default to `read_only: true`. Tool calls are blocked when the name matches write patterns such as `shell`, `exec`, `fs.write`, or `write_file`. A global `mcp.allow_tools` list is intersected with each server's own `allowed_tools`.
+MCP servers default to `read_only: true`. Admission is **deny-by-default**: a tool is callable only if it is in the server's `allowed_tools` (the hard boundary) or its MCP annotation reports `readOnlyHint: true` / `destructiveHint: false`; an unrecognized tool fails closed. The `write_tool_patterns` blacklist (`shell`, `exec`, `fs.write`, `write_file`, …) is then applied as a final veto. A global `mcp.allow_tools` list is intersected with each server's own `allowed_tools`.
+
+Annotation trust assumes a **semi-trusted** server — a hostile server can lie in `readOnlyHint`, so `allowed_tools` is the only hard guarantee. To restore the legacy substring-only blacklist (which fails *open* on unrecognized mutating tool names) set `mcp.read_only_posture: "legacy_denylist"`; this weaker posture is honored only from your own (`~/.config`) config — a repo-local `nerve.config.json` requesting it is ignored (and warns) unless you set `NERVE_TRUST_PROJECT_VERIFIER=1`, so a cloned repo can never silently weaken your write posture. This guard governs MCP dispatch only; it does not affect the deterministic acceptance gate.
 
 ### Mayor/Patrol
 
@@ -648,7 +650,7 @@ Set `orchestration.worktree_apply: true` to run apply attempts in an isolated Gi
 
 ### MCP Config
 
-Each MCP server needs a unique non-empty `name` and non-empty `command` argv. `read_only` defaults to `true`; keep it enabled unless the server is intentionally allowed to mutate state. Global `allow_tools` is intersected with each server's `allowed_tools`.
+Each MCP server needs a unique non-empty `name` and non-empty `command` argv. `read_only` defaults to `true`; keep it enabled unless the server is intentionally allowed to mutate state. Under `read_only`, admission is deny-by-default (see the MCP Attachment section above): set per-server `allowed_tools` to whitelist exact tool names, or rely on the server's `readOnlyHint`/`destructiveHint` annotations. `mcp.read_only_posture` (`deny_by_default` default, or `legacy_denylist`) selects the admission strategy and is provenance-gated. Global `allow_tools` is intersected with each server's `allowed_tools`.
 
 ### Mayor/Patrol Config
 
@@ -707,7 +709,7 @@ Nerve is built around conservative file mutation:
 - `/goal` deterministic checks are argv-only, cwd-frozen, timeout-capped, output-capped, and can run under configured ulimits.
 - `/budget` changes are persisted as an append-only hash chain and checked by `nv doctor`.
 - RPC tokens are stored under `.nerve/session-meta/` with restrictive permissions on Unix.
-- MCP servers default to read-only mode and enforce write-tool blacklist plus allowlist filtering.
+- MCP servers default to read-only mode with deny-by-default admission (allowlist or read-only annotation evidence required), a write-tool blacklist veto, and a provenance-gated legacy posture.
 - Mayor/Patrol queue identifiers are restricted to safe file-component characters and duplicate task IDs are rejected.
 - Generated runtime state under `.nerve/` is ignored by Git.
 

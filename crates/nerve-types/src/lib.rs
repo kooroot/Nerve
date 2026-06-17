@@ -364,6 +364,32 @@ pub enum McpRole {
     Both,
 }
 
+/// How an MCP server's `read_only` posture admits tools (H1, P1 hardening).
+///
+/// The default [`DenyByDefault`](McpReadOnlyPosture::DenyByDefault) is FAIL-CLOSED:
+/// under `read_only` a tool is admitted only on positive evidence (an explicit
+/// per-server `allowed_tools` membership, or an MCP tool annotation reporting
+/// `readOnlyHint == true` / `destructiveHint == false`). The substring write-tool
+/// denylist is demoted to a secondary veto. [`LegacyDenylist`](McpReadOnlyPosture::LegacyDenylist)
+/// restores the pre-H1 behavior (substring denylist is the only guard, fails OPEN
+/// on unrecognized mutating tool names) and is the weaker posture — it is
+/// provenance-gated at config resolution so a repo-local config cannot select it.
+///
+/// This enum lives in `nerve-types` (not `nerve-config`) so `nerve-adapter` — which
+/// depends only on `nerve-types` — can hold the resolved posture without taking a
+/// dependency on `nerve-config`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum McpReadOnlyPosture {
+    /// Fail-closed: admit only on explicit allowlist membership or positive
+    /// read-only annotation evidence. The safe default.
+    #[default]
+    DenyByDefault,
+    /// Legacy fail-open: the substring write-tool denylist is the only guard.
+    /// Weaker; provenance-gated so a repo-local config cannot opt into it.
+    LegacyDenylist,
+}
+
 /// Default transport for newly-defined MCP server specs (stdio in v1.0).
 pub fn default_mcp_transport() -> McpTransport {
     McpTransport::Stdio
@@ -405,6 +431,13 @@ pub struct McpServerSpec {
 }
 
 /// Catalog entry describing a single MCP tool advertised by a server.
+///
+/// `read_only_hint` / `destructive_hint` mirror the optional MCP tool
+/// `annotations.readOnlyHint` / `annotations.destructiveHint` fields. They are
+/// `None` when the server omits the annotation (or supplies a non-boolean), and
+/// under [`McpReadOnlyPosture::DenyByDefault`] only a positive value
+/// (`read_only_hint == Some(true)` or `destructive_hint == Some(false)`) counts as
+/// read-only evidence — a missing annotation is NOT evidence (fail-closed).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpToolInfo {
     pub server: String,
@@ -413,6 +446,10 @@ pub struct McpToolInfo {
     pub description: Option<String>,
     #[serde(default)]
     pub input_schema: Option<serde_json::Value>,
+    #[serde(default)]
+    pub read_only_hint: Option<bool>,
+    #[serde(default)]
+    pub destructive_hint: Option<bool>,
 }
 
 /// A reviewer/lead-initiated MCP tool invocation, forwarded through the

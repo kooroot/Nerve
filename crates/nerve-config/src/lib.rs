@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSetBuilder};
-use nerve_types::{McpServerSpec, Task};
+use nerve_types::{McpReadOnlyPosture, McpServerSpec, Task};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::env;
@@ -574,6 +574,14 @@ pub struct McpConfig {
     pub allow_tools: Vec<String>,
     #[serde(default = "default_mcp_write_patterns")]
     pub write_tool_patterns: Vec<String>,
+    /// H1: how `read_only` servers admit tools. Absent key →
+    /// [`McpReadOnlyPosture::DenyByDefault`] (the safe, fail-closed default).
+    /// [`McpReadOnlyPosture::LegacyDenylist`] is the weaker posture and is
+    /// provenance-gated by [`resolve_mcp_read_only_posture`]: a repo-local
+    /// (`ConfigSource::Project`) config requesting it is downgraded to
+    /// `DenyByDefault` unless the operator grants explicit out-of-band consent.
+    #[serde(default)]
+    pub read_only_posture: McpReadOnlyPosture,
 }
 
 impl Default for McpConfig {
@@ -582,6 +590,45 @@ impl Default for McpConfig {
             servers: Vec::new(),
             allow_tools: Vec::new(),
             write_tool_patterns: default_mcp_write_patterns(),
+            read_only_posture: McpReadOnlyPosture::default(),
+        }
+    }
+}
+
+/// Resolve the effective MCP `read_only` posture under the S4 trust boundary (H1).
+///
+/// The weaker [`McpReadOnlyPosture::LegacyDenylist`] re-opens a guard that fails
+/// OPEN on unrecognized mutating tool names, so — mirroring
+/// [`Config::builtin_verifier_exec_trusted`] — it is honored only from an
+/// operator-controlled source ([`ConfigSource::User`]/[`Default`](ConfigSource::Default)),
+/// or from a repo-local [`ConfigSource::Project`] config when the operator passes
+/// explicit out-of-band consent a repo cannot forge. A `Project` config requesting
+/// `LegacyDenylist` without consent is DOWNGRADED to the safe `DenyByDefault`; the
+/// safe posture is always honored from any source. This keeps a cloned repo from
+/// silently weakening the operator's MCP write posture.
+///
+/// Pure function — the caller compares `configured` against the return value to
+/// decide whether to emit the (loud) downgrade warning, keeping I/O at the edge.
+pub fn resolve_mcp_read_only_posture(
+    source: ConfigSource,
+    configured: McpReadOnlyPosture,
+    operator_consent: bool,
+) -> McpReadOnlyPosture {
+    match (configured, source) {
+        // The safe, fail-closed posture is always honored from any source.
+        (McpReadOnlyPosture::DenyByDefault, _) => McpReadOnlyPosture::DenyByDefault,
+        // Operator-controlled sources may select the weaker legacy posture.
+        (McpReadOnlyPosture::LegacyDenylist, ConfigSource::User | ConfigSource::Default) => {
+            McpReadOnlyPosture::LegacyDenylist
+        }
+        // A repo-local config may only weaken with explicit operator consent;
+        // otherwise it is downgraded to the safe posture.
+        (McpReadOnlyPosture::LegacyDenylist, ConfigSource::Project) => {
+            if operator_consent {
+                McpReadOnlyPosture::LegacyDenylist
+            } else {
+                McpReadOnlyPosture::DenyByDefault
+            }
         }
     }
 }
@@ -1867,6 +1914,7 @@ mod tests {
             }],
             allow_tools: Vec::new(),
             write_tool_patterns: default_mcp_write_patterns(),
+            read_only_posture: McpReadOnlyPosture::default(),
         };
         assert!(matches!(
             mcp.validate(),
@@ -1898,6 +1946,7 @@ mod tests {
             servers: vec![server(" ")],
             allow_tools: Vec::new(),
             write_tool_patterns: default_mcp_write_patterns(),
+            read_only_posture: McpReadOnlyPosture::default(),
         };
         assert!(matches!(empty.validate(), Err(ConfigError::EmptyMcpName)));
 
@@ -1905,6 +1954,7 @@ mod tests {
             servers: vec![server("docs"), server("docs")],
             allow_tools: Vec::new(),
             write_tool_patterns: default_mcp_write_patterns(),
+            read_only_posture: McpReadOnlyPosture::default(),
         };
         assert!(matches!(
             duplicate.validate(),
@@ -1926,12 +1976,93 @@ mod tests {
             }],
             allow_tools: Vec::new(),
             write_tool_patterns: default_mcp_write_patterns(),
+            read_only_posture: McpReadOnlyPosture::default(),
         };
 
         assert!(matches!(
             mcp.validate(),
             Err(ConfigError::EmptyMcpCommand(name)) if name == "broken"
         ));
+    }
+
+    #[test]
+    fn mcp_read_only_posture_defaults_to_deny_by_default() {
+        // Absent key parses to the safe fail-closed posture.
+        let mcp: McpConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(mcp.read_only_posture, McpReadOnlyPosture::DenyByDefault);
+        assert_eq!(McpConfig::default().read_only_posture, McpReadOnlyPosture::DenyByDefault);
+    }
+
+    #[test]
+    fn mcp_read_only_posture_round_trips() {
+        let json = r#"{"read_only_posture":"legacy_denylist"}"#;
+        let mcp: McpConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(mcp.read_only_posture, McpReadOnlyPosture::LegacyDenylist);
+        // snake_case rename round-trips through serialization.
+        let back = serde_json::to_string(&mcp).unwrap();
+        assert!(back.contains("\"read_only_posture\":\"legacy_denylist\""), "got: {back}");
+    }
+
+    #[test]
+    fn resolve_posture_safe_default_honored_from_every_source() {
+        for source in [ConfigSource::Project, ConfigSource::User, ConfigSource::Default] {
+            for consent in [false, true] {
+                assert_eq!(
+                    resolve_mcp_read_only_posture(
+                        source,
+                        McpReadOnlyPosture::DenyByDefault,
+                        consent
+                    ),
+                    McpReadOnlyPosture::DenyByDefault,
+                    "DenyByDefault must always be honored (source={source:?}, consent={consent})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_posture_operator_sources_may_select_legacy() {
+        // Operator-controlled sources may opt into the weaker legacy posture
+        // regardless of the out-of-band consent signal.
+        for source in [ConfigSource::User, ConfigSource::Default] {
+            for consent in [false, true] {
+                assert_eq!(
+                    resolve_mcp_read_only_posture(
+                        source,
+                        McpReadOnlyPosture::LegacyDenylist,
+                        consent
+                    ),
+                    McpReadOnlyPosture::LegacyDenylist,
+                    "operator source may select legacy (source={source:?}, consent={consent})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_posture_project_cannot_weaken_without_consent() {
+        // A repo-local config requesting the weaker posture WITHOUT operator
+        // consent is downgraded to the safe posture — a cloned repo can never
+        // silently re-open the fail-open denylist.
+        assert_eq!(
+            resolve_mcp_read_only_posture(
+                ConfigSource::Project,
+                McpReadOnlyPosture::LegacyDenylist,
+                false
+            ),
+            McpReadOnlyPosture::DenyByDefault,
+            "Project + legacy without consent must downgrade to DenyByDefault"
+        );
+        // With explicit out-of-band operator consent, the repo request is honored.
+        assert_eq!(
+            resolve_mcp_read_only_posture(
+                ConfigSource::Project,
+                McpReadOnlyPosture::LegacyDenylist,
+                true
+            ),
+            McpReadOnlyPosture::LegacyDenylist,
+            "Project + legacy WITH consent is honored"
+        );
     }
 
     #[test]

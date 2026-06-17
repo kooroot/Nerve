@@ -6,14 +6,30 @@
 //! plus an [`McpRegistry`] used by the orchestrator to register every
 //! configured server at session start.
 //!
-//! Security guards (proposal §3 Tier 3i):
+//! Security guards (proposal §3 Tier 3i; H1 hardening):
 //!
-//! * `read_only: true` (default) rejects any tool whose name matches the
-//!   configurable `write_tool_patterns` blacklist (`shell`, `exec`, `fs.write`,
-//!   `fs.delete`, `write_file`, `run_command`, `execute_command`, …) before
-//!   the request reaches the wire.
 //! * `spec.allowed_tools` (when non-empty) is an explicit per-server allowlist
-//!   intersected with the global `mcp.allow_tools` filter at registry-level.
+//!   intersected with the global `mcp.allow_tools` filter at registry-level. It
+//!   is the **hard boundary** — checked first and never overridden by annotations.
+//! * `read_only: true` (default) admission depends on the resolved
+//!   [`McpReadOnlyPosture`]:
+//!   - [`DenyByDefault`](McpReadOnlyPosture::DenyByDefault) (the safe default):
+//!     a tool is admitted only on positive evidence — allowlist membership, or
+//!     the server's MCP tool annotation reporting `readOnlyHint == true` /
+//!     `destructiveHint == false`. An unrecognized tool fails CLOSED. This closes
+//!     the pre-H1 hole where a mutating tool named outside the denylist ran
+//!     despite `read_only`.
+//!   - [`LegacyDenylist`](McpReadOnlyPosture::LegacyDenylist): the pre-H1
+//!     behavior — only the `write_tool_patterns` substring blacklist guards, so
+//!     unrecognized mutating names fail OPEN. Weaker; provenance-gated in
+//!     `nerve-config` so a repo-local config cannot select it.
+//!
+//!   In BOTH postures the `write_tool_patterns` blacklist (`shell`, `exec`,
+//!   `fs.write`, …) is applied as a final **veto** on the tool name.
+//!   Annotation trust assumes a SEMI-TRUSTED server: a hostile server can lie in
+//!   `readOnlyHint`, so the allowlist — not annotations — is the only hard
+//!   guarantee. This guard governs MCP dispatch only; it does not touch the
+//!   deterministic accept gate in `nerve-core`.
 //! * `role` filters which orchestrator role (reviewer / lead) may discover the
 //!   server's tools via [`McpRegistry::all_tools`].
 //!
@@ -32,7 +48,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use nerve_types::{McpRole, McpServerSpec, McpToolCall, McpToolInfo, McpToolResult, McpTransport};
+use nerve_types::{
+    McpReadOnlyPosture, McpRole, McpServerSpec, McpToolCall, McpToolInfo, McpToolResult,
+    McpTransport,
+};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -81,6 +100,11 @@ pub enum McpError {
     ToolBlocked(String),
     #[error("tool not in allowlist: {0}")]
     ToolNotAllowed(String),
+    #[error(
+        "tool not provably read-only: {0} (no allowlist entry and no read-only annotation; \
+         add it to `allowed_tools` or select the legacy denylist posture)"
+    )]
+    ToolNotReadOnly(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("spawn failed: {0}")]
@@ -110,6 +134,7 @@ pub struct McpClient {
     write_tx: Mutex<Option<mpsc::Sender<String>>>,
     tools_cache: RwLock<Vec<McpToolInfo>>,
     write_tool_patterns: Vec<String>,
+    read_only_posture: McpReadOnlyPosture,
 }
 
 #[derive(Debug)]
@@ -124,9 +149,16 @@ impl McpClient {
     /// register multiple clients up-front and start them lazily.
     ///
     /// `write_tool_patterns` overrides the read-only blacklist enforced by
-    /// [`McpClient::call_tool`]. Pass an empty vector to disable the guard
-    /// even when `spec.read_only` is true (typically only useful in tests).
-    pub fn new(spec: McpServerSpec, write_tool_patterns: Vec<String>) -> Self {
+    /// [`McpClient::call_tool`]. Pass an empty vector to disable the blacklist
+    /// veto even when `spec.read_only` is true (typically only useful in tests).
+    /// `read_only_posture` selects the H1 admission strategy (see
+    /// [`McpReadOnlyPosture`]) and must already be provenance-resolved by the
+    /// caller (see `nerve_config::resolve_mcp_read_only_posture`).
+    pub fn new(
+        spec: McpServerSpec,
+        write_tool_patterns: Vec<String>,
+        read_only_posture: McpReadOnlyPosture,
+    ) -> Self {
         let name = spec.name.clone();
         Self {
             name,
@@ -137,6 +169,7 @@ impl McpClient {
             write_tx: Mutex::new(None),
             tools_cache: RwLock::new(Vec::new()),
             write_tool_patterns,
+            read_only_posture,
         }
     }
 
@@ -345,11 +378,31 @@ impl McpClient {
             return Err(McpError::ToolNotAllowed(call.tool.clone()));
         }
 
-        // Read-only guard: case-insensitive substring match against the
-        // configured write-tool patterns. Defaults to the spec-mandated list.
-        if self.spec.read_only && tool_matches_write_pattern(&call.tool, &self.write_tool_patterns)
-        {
-            return Err(McpError::ToolBlocked(call.tool.clone()));
+        // Read-only guard (H1). Admission depends on the resolved posture, then
+        // the write-pattern blacklist applies as a final veto in BOTH postures.
+        if self.spec.read_only {
+            // `allowlisted` = the tool is an explicit `allowed_tools` member.
+            // If the allowlist is non-empty we already returned above unless the
+            // tool is a member, so a non-empty allowlist here means membership.
+            let allowlisted = !self.spec.allowed_tools.is_empty();
+            // Positive read-only EVIDENCE from the cached tool annotations.
+            let evidence = {
+                let cache = self.tools_cache.read().await;
+                cache
+                    .iter()
+                    .any(|t| t.name == call.tool && tool_has_read_only_evidence(t))
+            };
+            if !read_only_admits(self.read_only_posture, allowlisted, evidence) {
+                // DenyByDefault: no allowlist entry and no read-only annotation.
+                return Err(McpError::ToolNotReadOnly(call.tool.clone()));
+            }
+            // Belt-and-suspenders VETO: the write-tool substring blacklist blocks
+            // the name even if it was admitted by annotation evidence. Applied to
+            // allowlist members too, so enabling H1 never makes a tool the legacy
+            // denylist blocked newly callable (monotone: only-ever-more-restrictive).
+            if tool_matches_write_pattern(&call.tool, &self.write_tool_patterns) {
+                return Err(McpError::ToolBlocked(call.tool.clone()));
+            }
         }
 
         let start = std::time::Instant::now();
@@ -516,11 +569,24 @@ fn parse_tools_list(server: &str, value: &Value) -> Result<Vec<McpToolInfo>, Mcp
             .and_then(Value::as_str)
             .map(|s| s.to_string());
         let input_schema = entry.get("inputSchema").cloned();
+        // MCP tool annotations are an optional object; read the read-only /
+        // destructive hints defensively. A missing object, missing key, or
+        // non-boolean value yields `None` (NOT read-only evidence) so the H1
+        // deny-by-default admission fails CLOSED on annotation-less tools.
+        let annotations = entry.get("annotations");
+        let read_only_hint = annotations
+            .and_then(|a| a.get("readOnlyHint"))
+            .and_then(Value::as_bool);
+        let destructive_hint = annotations
+            .and_then(|a| a.get("destructiveHint"))
+            .and_then(Value::as_bool);
         out.push(McpToolInfo {
             server: server.to_string(),
             name: name.to_string(),
             description,
             input_schema,
+            read_only_hint,
+            destructive_hint,
         });
     }
     Ok(out)
@@ -535,6 +601,31 @@ pub fn tool_matches_write_pattern(tool: &str, patterns: &[String]) -> bool {
     patterns
         .iter()
         .any(|pattern| !pattern.is_empty() && lower.contains(&pattern.to_ascii_lowercase()))
+}
+
+/// Positive read-only EVIDENCE from a tool's MCP annotations (H1): an explicit
+/// `readOnlyHint == true` OR `destructiveHint == false`. A missing/non-boolean
+/// annotation (`None`) is NOT evidence — admission fails closed under
+/// [`McpReadOnlyPosture::DenyByDefault`]. Annotation trust assumes a semi-trusted
+/// server; it can lie, so the per-server allowlist remains the hard boundary.
+pub fn tool_has_read_only_evidence(tool: &McpToolInfo) -> bool {
+    tool.read_only_hint == Some(true) || tool.destructive_hint == Some(false)
+}
+
+/// H1 admission decision under `read_only`, BEFORE the write-pattern veto. Pure so
+/// it is unit-testable without a live client. `allowlisted` = the tool is an
+/// explicit `allowed_tools` member; `evidence` = its annotations prove read-only.
+///
+/// [`LegacyDenylist`](McpReadOnlyPosture::LegacyDenylist) admits everything here
+/// (the substring veto is then the only guard — the pre-H1 fail-open behavior).
+/// [`DenyByDefault`](McpReadOnlyPosture::DenyByDefault) admits only on positive
+/// evidence. This is monotone: `DenyByDefault` never admits a tool `LegacyDenylist`
+/// would have rejected, and the caller's veto runs in both cases.
+pub fn read_only_admits(posture: McpReadOnlyPosture, allowlisted: bool, evidence: bool) -> bool {
+    match posture {
+        McpReadOnlyPosture::LegacyDenylist => true,
+        McpReadOnlyPosture::DenyByDefault => allowlisted || evidence,
+    }
 }
 
 /// Returns true when an MCP server bound to `spec` should be visible to a
@@ -573,6 +664,7 @@ impl McpRegistry {
         specs: &[McpServerSpec],
         write_patterns: &[String],
         allow_tools: &[String],
+        read_only_posture: McpReadOnlyPosture,
     ) -> Result<(), McpError> {
         let patterns = if write_patterns.is_empty() {
             default_write_tool_patterns()
@@ -582,7 +674,11 @@ impl McpRegistry {
         for spec in specs {
             let mut spec = spec.clone();
             scope_mcp_spec_to_allowlist(&mut spec, allow_tools);
-            let client = Arc::new(McpClient::new(spec.clone(), patterns.clone()));
+            let client = Arc::new(McpClient::new(
+                spec.clone(),
+                patterns.clone(),
+                read_only_posture,
+            ));
             if let Err(err) = client.start().await {
                 // Tear down everything we already started so we don't leak
                 // a half-initialised registry.
@@ -752,61 +848,220 @@ mod tests {
         assert_eq!(spec.allowed_tools, vec!["hover".to_string()]);
     }
 
+    // --- H1 pure decision functions -------------------------------------
+
+    #[test]
+    fn tool_has_read_only_evidence_requires_positive_annotation() {
+        let with = |ro: Option<bool>, de: Option<bool>| McpToolInfo {
+            server: "s".into(),
+            name: "t".into(),
+            description: None,
+            input_schema: None,
+            read_only_hint: ro,
+            destructive_hint: de,
+        };
+        // Positive evidence.
+        assert!(tool_has_read_only_evidence(&with(Some(true), None)));
+        assert!(tool_has_read_only_evidence(&with(None, Some(false))));
+        assert!(tool_has_read_only_evidence(&with(Some(true), Some(true))));
+        // No / negative / absent evidence → fail-closed (NOT evidence).
+        assert!(!tool_has_read_only_evidence(&with(None, None)));
+        assert!(!tool_has_read_only_evidence(&with(Some(false), None)));
+        assert!(!tool_has_read_only_evidence(&with(Some(false), Some(true))));
+    }
+
+    #[test]
+    fn read_only_admits_is_monotone() {
+        use McpReadOnlyPosture::*;
+        // Legacy admits everything at the decision layer (veto is the only guard).
+        for allow in [false, true] {
+            for ev in [false, true] {
+                assert!(read_only_admits(LegacyDenylist, allow, ev));
+            }
+        }
+        // DenyByDefault admits only on positive evidence: allowlist OR annotation.
+        assert!(read_only_admits(DenyByDefault, true, false));
+        assert!(read_only_admits(DenyByDefault, false, true));
+        assert!(read_only_admits(DenyByDefault, true, true));
+        // The hole the legacy posture leaves open is CLOSED by the new default.
+        assert!(!read_only_admits(DenyByDefault, false, false));
+        assert!(read_only_admits(LegacyDenylist, false, false));
+    }
+
+    // --- annotation parsing ---------------------------------------------
+
+    #[test]
+    fn parse_tools_list_captures_read_only_annotations() {
+        let value = json!({
+            "tools": [
+                { "name": "reader", "annotations": { "readOnlyHint": true } },
+                { "name": "safe_writer", "annotations": { "destructiveHint": false } },
+                { "name": "mutator", "annotations": { "readOnlyHint": false, "destructiveHint": true } },
+                { "name": "lying", "annotations": { "readOnlyHint": "yes" } },
+                { "name": "bare" }
+            ]
+        });
+        let tools = parse_tools_list("fixture", &value).unwrap();
+        assert_eq!(tools[0].read_only_hint, Some(true));
+        assert!(tool_has_read_only_evidence(&tools[0]));
+        assert_eq!(tools[1].destructive_hint, Some(false));
+        assert!(tool_has_read_only_evidence(&tools[1]));
+        assert_eq!(tools[2].read_only_hint, Some(false));
+        assert!(!tool_has_read_only_evidence(&tools[2]));
+        // Non-boolean annotation parses to None (not false-positive evidence).
+        assert_eq!(tools[3].read_only_hint, None);
+        assert!(!tool_has_read_only_evidence(&tools[3]));
+        // Annotation-less tool → both None → no evidence (fail-closed).
+        assert_eq!(tools[4].read_only_hint, None);
+        assert_eq!(tools[4].destructive_hint, None);
+        assert!(!tool_has_read_only_evidence(&tools[4]));
+    }
+
+    // --- call_tool admission (H1) ---------------------------------------
+
+    /// N1: an out-of-denylist mutating tool with no allowlist and no annotation
+    /// is BLOCKED under the default DenyByDefault posture — the pre-H1 fail-open
+    /// hole is closed.
     #[tokio::test]
-    async fn call_tool_blocks_write_tool_when_read_only() {
-        // Build a client without starting it so the guards still fire — we
-        // simulate "started" by inserting a placeholder child via a helper.
-        let mut spec = spec("guard");
-        spec.read_only = true;
-        let client = McpClient::new(spec, default_write_tool_patterns());
-        // Force the "started" state so call_tool reaches the blacklist check.
+    async fn deny_by_default_blocks_out_of_pattern_mutator() {
+        let client = McpClient::new(
+            spec("guard"),
+            default_write_tool_patterns(),
+            McpReadOnlyPosture::DenyByDefault,
+        );
+        // `apply_patch` matches NO write pattern and has no annotation/allowlist.
+        force_tools(
+            &client,
+            vec![tool_info("guard", "apply_patch", None, None)],
+        )
+        .await;
         force_started(&client).await;
 
         let err = client
-            .call_tool(McpToolCall {
-                server: "guard".to_string(),
-                tool: "shell".to_string(),
-                arguments: json!({}),
-            })
+            .call_tool(call("guard", "apply_patch"))
             .await
             .unwrap_err();
-        assert!(matches!(err, McpError::ToolBlocked(t) if t == "shell"));
+        assert!(matches!(err, McpError::ToolNotReadOnly(t) if t == "apply_patch"));
     }
 
+    /// A tool entirely absent from the cached tool list yields no evidence and is
+    /// blocked under DenyByDefault (fail-closed on the unknown).
+    #[tokio::test]
+    async fn deny_by_default_blocks_tool_absent_from_cache() {
+        let client = McpClient::new(
+            spec("guard"),
+            default_write_tool_patterns(),
+            McpReadOnlyPosture::DenyByDefault,
+        );
+        force_started(&client).await;
+        let err = client.call_tool(call("guard", "ghost")).await.unwrap_err();
+        assert!(matches!(err, McpError::ToolNotReadOnly(t) if t == "ghost"));
+    }
+
+    /// N3 / belt-and-suspenders: a tool admitted by a read-only annotation is
+    /// STILL vetoed when its name matches a write pattern.
+    #[tokio::test]
+    async fn deny_by_default_veto_blocks_annotation_read_only_write_name() {
+        let client = McpClient::new(
+            spec("guard"),
+            default_write_tool_patterns(),
+            McpReadOnlyPosture::DenyByDefault,
+        );
+        // `shell_status` claims readOnlyHint=true (admitted by evidence) but the
+        // name contains the `shell` write pattern → veto fires.
+        force_tools(
+            &client,
+            vec![tool_info("guard", "shell_status", Some(true), None)],
+        )
+        .await;
+        force_started(&client).await;
+
+        let err = client
+            .call_tool(call("guard", "shell_status"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::ToolBlocked(t) if t == "shell_status"));
+    }
+
+    /// N2: a LYING annotation (readOnlyHint=true on a real mutator) cannot bypass
+    /// an explicit allowlist — the allowlist is the hard boundary, checked first.
+    #[tokio::test]
+    async fn lying_annotation_cannot_bypass_allowlist() {
+        let mut spec = spec("allowlist");
+        spec.allowed_tools = vec!["read_file".to_string()];
+        let client = McpClient::new(
+            spec,
+            default_write_tool_patterns(),
+            McpReadOnlyPosture::DenyByDefault,
+        );
+        force_tools(
+            &client,
+            vec![tool_info("allowlist", "delete_all", Some(true), Some(false))],
+        )
+        .await;
+        force_started(&client).await;
+
+        let err = client
+            .call_tool(call("allowlist", "delete_all"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::ToolNotAllowed(t) if t == "delete_all"));
+    }
+
+    /// Allowlist is still enforced first regardless of posture.
     #[tokio::test]
     async fn call_tool_rejects_when_not_in_allowlist() {
         let mut spec = spec("allowlist");
         spec.allowed_tools = vec!["read_file".to_string()];
-        let client = McpClient::new(spec, default_write_tool_patterns());
+        let client = McpClient::new(
+            spec,
+            default_write_tool_patterns(),
+            McpReadOnlyPosture::DenyByDefault,
+        );
         force_started(&client).await;
 
         let err = client
-            .call_tool(McpToolCall {
-                server: "allowlist".to_string(),
-                tool: "list_files".to_string(),
-                arguments: json!({}),
-            })
+            .call_tool(call("allowlist", "list_files"))
             .await
             .unwrap_err();
         assert!(matches!(err, McpError::ToolNotAllowed(t) if t == "list_files"));
     }
 
+    /// Legacy posture reproduces the pre-H1 behavior: the substring denylist is
+    /// the only guard, so a write-pattern name is ToolBlocked (and the
+    /// deny-by-default ToolNotReadOnly path never fires).
+    #[tokio::test]
+    async fn legacy_denylist_blocks_write_tool() {
+        let client = McpClient::new(
+            spec("guard"),
+            default_write_tool_patterns(),
+            McpReadOnlyPosture::LegacyDenylist,
+        );
+        force_started(&client).await;
+        let err = client.call_tool(call("guard", "shell")).await.unwrap_err();
+        assert!(matches!(err, McpError::ToolBlocked(t) if t == "shell"));
+    }
+
     #[tokio::test]
     async fn list_tools_errors_when_not_started() {
-        let client = McpClient::new(spec("idle"), default_write_tool_patterns());
+        let client = McpClient::new(
+            spec("idle"),
+            default_write_tool_patterns(),
+            McpReadOnlyPosture::DenyByDefault,
+        );
         let err = client.list_tools().await.unwrap_err();
         assert!(matches!(err, McpError::NotStarted(_)));
     }
 
     #[tokio::test]
     async fn call_tool_errors_when_not_started() {
-        let client = McpClient::new(spec("idle"), default_write_tool_patterns());
+        let client = McpClient::new(
+            spec("idle"),
+            default_write_tool_patterns(),
+            McpReadOnlyPosture::DenyByDefault,
+        );
         let err = client
-            .call_tool(McpToolCall {
-                server: "idle".to_string(),
-                tool: "anything".to_string(),
-                arguments: json!({}),
-            })
+            .call_tool(call("idle", "anything"))
             .await
             .unwrap_err();
         assert!(matches!(err, McpError::NotStarted(_)));
@@ -821,7 +1076,11 @@ mod tests {
         let mut registry = McpRegistry::new();
         assert!(registry.get("absent").is_none());
 
-        let client = Arc::new(McpClient::new(spec("mock"), default_write_tool_patterns()));
+        let client = Arc::new(McpClient::new(
+            spec("mock"),
+            default_write_tool_patterns(),
+            McpReadOnlyPosture::DenyByDefault,
+        ));
         registry.clients.insert("mock".to_string(), client);
 
         assert!(registry.get("mock").is_some());
@@ -833,7 +1092,9 @@ mod tests {
 
     /// Drive an end-to-end JSON-RPC handshake against a Python-based mock
     /// MCP server. Marked `#[ignore]` because it depends on `python3` being
-    /// on PATH; run via `cargo test -p nerve-adapter -- --ignored`.
+    /// on PATH; run via `cargo test -p nerve-adapter -- --ignored`. The `ping`
+    /// tool advertises `readOnlyHint: true`, so under the default DenyByDefault
+    /// posture it is admitted via annotation evidence (end-to-end H1 admit path).
     #[tokio::test]
     #[ignore]
     async fn mock_server_handshake_lists_advertised_tools() {
@@ -848,7 +1109,7 @@ for line in sys.stdin:
     if method == "initialize":
         reply = {"jsonrpc":"2.0","id":req["id"],"result":{"protocolVersion":"2024-11-05"}}
     elif method == "tools/list":
-        reply = {"jsonrpc":"2.0","id":req["id"],"result":{"tools":[{"name":"ping","description":"pong"}]}}
+        reply = {"jsonrpc":"2.0","id":req["id"],"result":{"tools":[{"name":"ping","description":"pong","annotations":{"readOnlyHint":True}}]}}
     elif method == "tools/call":
         reply = {"jsonrpc":"2.0","id":req["id"],"result":{"content":[{"type":"text","text":"pong"}]}}
     else:
@@ -868,21 +1129,54 @@ for line in sys.stdin:
             role: McpRole::Both,
             read_only: true,
         };
-        let client = McpClient::new(spec, default_write_tool_patterns());
+        let client = McpClient::new(
+            spec,
+            default_write_tool_patterns(),
+            McpReadOnlyPosture::DenyByDefault,
+        );
         client.start().await.expect("handshake ok");
         let tools = client.list_tools().await.expect("list tools");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "ping");
+        assert_eq!(tools[0].read_only_hint, Some(true));
         let result = client
-            .call_tool(McpToolCall {
-                server: "mock".to_string(),
-                tool: "ping".to_string(),
-                arguments: json!({}),
-            })
+            .call_tool(call("mock", "ping"))
             .await
             .expect("tool call");
         assert!(!result.is_error);
         client.shutdown().await.expect("shutdown clean");
+    }
+
+    /// Build an `McpToolInfo` fixture with optional annotation hints.
+    fn tool_info(
+        server: &str,
+        name: &str,
+        read_only_hint: Option<bool>,
+        destructive_hint: Option<bool>,
+    ) -> McpToolInfo {
+        McpToolInfo {
+            server: server.to_string(),
+            name: name.to_string(),
+            description: None,
+            input_schema: None,
+            read_only_hint,
+            destructive_hint,
+        }
+    }
+
+    /// Build a `McpToolCall` with empty arguments.
+    fn call(server: &str, tool: &str) -> McpToolCall {
+        McpToolCall {
+            server: server.to_string(),
+            tool: tool.to_string(),
+            arguments: json!({}),
+        }
+    }
+
+    /// Seed the client's cached tool list so the H1 annotation-evidence lookup in
+    /// `call_tool` has something to consult (normally populated at `start()`).
+    async fn force_tools(client: &McpClient, tools: Vec<McpToolInfo>) {
+        *client.tools_cache.write().await = tools;
     }
 
     /// Pretend a client is "started" by inserting a dummy child marker so the
