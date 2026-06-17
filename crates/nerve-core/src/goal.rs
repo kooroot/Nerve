@@ -181,6 +181,14 @@ impl GoalEvaluator {
         // the granted private dir keeps build-tool temp writes inside the single
         // grant. Only set when a private dir was minted (sandbox enabled); Off
         // leaves the child env untouched.
+        //
+        // Compatibility (Linux): a tool that hardcodes `/tmp` and ignores
+        // `TMPDIR` will now have those writes DENIED under a confining sandbox,
+        // where the pre-H2 whole-system-temp grant (the parent's `temp_dir()`,
+        // typically `/tmp` on Linux) allowed them. This is fail-safe confinement
+        // — a denied write, never a fabricated pass — not a change to the accept
+        // gate; tools that honor `TMPDIR` (cargo/rustc/go) write inside the grant
+        // and are unaffected.
         if let Some(dir) = &private_tmp {
             command.env("TMPDIR", dir.path());
         }
