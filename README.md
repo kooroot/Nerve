@@ -391,6 +391,8 @@ Natural-language goal conversion is also available, but only in an interactive t
 
 Goal checks are argv-based, not shell strings. Nerve rejects unsafe programs, freezes the workspace cwd, applies timeout/output caps, can apply configured ulimits, and stores the active goal under `.nerve/session-meta/active-goal.json`.
 
+Goal `env` overrides are screened at validation — the deterministic chokepoint shared by the natural-language converter, the argv form, and the persisted active-goal reload — so neither a model proposal nor a repo-local `.nerve/session-meta/active-goal.json` can smuggle one in. Keys that are known process-level code-execution vectors — the dynamic-linker tunables (`LD_*`, `DYLD_*`), `PATH`, compiler/shell/interpreter hooks (`RUSTC_WRAPPER`, `BASH_ENV`, `IFS`, `GIT_SSH_COMMAND`, `NODE_OPTIONS`, `PYTHONPATH`, …), and values carrying control characters are rejected outright (fail-closed). For the converter path, every surviving override is then listed line-by-line in the confirmation prompt so it cannot ride along unseen; the interactive confirmation remains the final human gate. This is defense-in-depth, not an exhaustive capability model. Security-sensitive process env (e.g. `PATH`) should be supplied through the operator-controlled `orchestration.check_env` allowlist: because such keys are on the denylist they can never be carried by goal `env` at all. For a *non-denied* key, a goal `env` entry is still applied after — and so overrides — the inherited `check_env` value at execution, which is exactly why every surviving override is surfaced in the confirmation prompt for the operator to approve.
+
 ### Budget Controls
 
 Use `/budget` to set per-session token or cost caps during an interactive run:
@@ -719,7 +721,7 @@ Nerve is built around conservative file mutation:
 - Deleted files are restored from the original content during rollback.
 - Reviewer `BLOCK` can prevent application depending on conflict policy.
 - Worktree-isolated apply refuses dirty worktrees, symlink escapes, and stale main resets.
-- `/goal` deterministic checks are argv-only, cwd-frozen, timeout-capped, output-capped, and can run under configured ulimits.
+- `/goal` deterministic checks are argv-only, cwd-frozen, timeout-capped, output-capped, and can run under configured ulimits; natural-language conversion screens model-proposed `env` for code-execution vectors (`LD_*`/`DYLD_*`, `PATH`, toolchain/shell/interpreter hooks) and lists every surviving override in the confirmation gate.
 - `/budget` changes are persisted as an append-only hash chain and checked by `nv doctor`; the chain is unkeyed SHA-256 by default (detects accidental/naive edits) and uses keyed HMAC-SHA-256 when `NERVE_BUDGET_AUDIT_KEY`/`NERVE_BUDGET_AUDIT_KEY_FILE` (absolute path) is set off the defended host — a non-key-holder then cannot forge or edit a link (including the unlinked tail entry, which carries its own self-MAC), keying over any pre-existing unkeyed log fails loudly (only an empty log can begin a keyed chain), and a misconfigured key fails closed rather than silently downgrading to unkeyed.
 - RPC tokens are stored under `.nerve/session-meta/` with restrictive permissions on Unix.
 - MCP servers default to read-only mode with deny-by-default admission (allowlist or read-only annotation evidence required), a write-tool blacklist veto, and a provenance-gated legacy posture; an optional per-tool `argument_policy` adds lexical path-root confinement and substring denylists as monotone-restrictive defense-in-depth.

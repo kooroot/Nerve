@@ -4269,16 +4269,17 @@ fn render_goal_intent_proposal(intent: &GoalIntent) {
     if intent.proposed_spec.env.is_empty() {
         println!("  env:          (inherit only configured allowlist)");
     } else {
+        // H12: list every model-proposed override on its own line under a loud
+        // header. env is injected into the check child and overrides the
+        // operator allowlist, so the human confirmation gate must see each one
+        // explicitly — never a single comma-joined blob that hides an entry.
+        let n = intent.proposed_spec.env.len();
         println!(
-            "  env override: {}",
-            intent
-                .proposed_spec
-                .env
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "  ⚠ env:        {n} model-proposed override(s) injected into the check — review each:"
         );
+        for (k, v) in &intent.proposed_spec.env {
+            println!("      {k}={v}");
+        }
     }
     println!("  rationale:    {}", intent.rationale);
     println!("  source:       {}", intent.source_adapter);

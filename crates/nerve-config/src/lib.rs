@@ -1465,6 +1465,75 @@ mod tests {
     }
 
     #[test]
+    fn goal_spec_validate_rejects_code_execution_env_keys() {
+        // H12: dynamic-linker tunables (prefix) and exact toolchain/shell/
+        // interpreter vectors are rejected at the validation chokepoint, matched
+        // case-insensitively. This guards BOTH the model-proposed converter path
+        // and the persisted active-goal reload.
+        for key in [
+            "LD_PRELOAD",
+            "ld_preload",
+            "DYLD_INSERT_LIBRARIES",
+            "PATH",
+            "path",
+            "RUSTC_WRAPPER",
+            "BASH_ENV",
+            "IFS",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+        ] {
+            let mut env = std::collections::BTreeMap::new();
+            env.insert(key.to_string(), "x".to_string());
+            let spec = GoalSpec {
+                id: "g".into(),
+                check_cmd: vec!["cargo".into(), "test".into()],
+                timeout_secs: 60,
+                cwd: None,
+                env,
+                no_progress_max: None,
+            };
+            assert!(
+                matches!(spec.validate(), Err(ConfigError::ForbiddenEnvKey(k)) if k.eq_ignore_ascii_case(key)),
+                "env key {key} should be rejected as a code-execution vector"
+            );
+        }
+    }
+
+    #[test]
+    fn goal_spec_validate_allows_benign_env_and_rejects_control_value() {
+        // `LDFLAGS` is NOT an `LD_` tunable (underscore boundary); ordinary build
+        // env passes. A control char in any value is rejected.
+        let mut ok = std::collections::BTreeMap::new();
+        ok.insert("RUST_BACKTRACE".to_string(), "1".to_string());
+        ok.insert("LDFLAGS".to_string(), "-s".to_string());
+        ok.insert("CARGO_TERM_COLOR".to_string(), "never".to_string());
+        let spec_ok = GoalSpec {
+            id: "g".into(),
+            check_cmd: vec!["cargo".into(), "test".into()],
+            timeout_secs: 60,
+            cwd: None,
+            env: ok,
+            no_progress_max: None,
+        };
+        spec_ok.validate().expect("benign env must validate");
+
+        let mut bad = std::collections::BTreeMap::new();
+        bad.insert("RUST_LOG".to_string(), "a\nb".to_string());
+        let spec_bad = GoalSpec {
+            id: "g".into(),
+            check_cmd: vec!["cargo".into(), "test".into()],
+            timeout_secs: 60,
+            cwd: None,
+            env: bad,
+            no_progress_max: None,
+        };
+        assert!(matches!(
+            spec_bad.validate(),
+            Err(ConfigError::InvalidEnvValue(k)) if k == "RUST_LOG"
+        ));
+    }
+
+    #[test]
     fn goal_spec_validate_rejects_leading_dash_program() {
         // A leading `-` could be mis-parsed by a sandbox wrapper as one of its
         // own options, running a different command than the unwrapped gate would
@@ -1488,7 +1557,9 @@ mod tests {
     #[test]
     fn goal_spec_serde_round_trip() {
         let mut env = std::collections::BTreeMap::new();
-        env.insert("PATH".to_string(), String::new());
+        // Benign keys only: PATH and other code-execution vectors are rejected by
+        // GoalSpec::validate (H12), so a round-trip fixture uses inert overrides.
+        env.insert("RUST_BACKTRACE".to_string(), "1".to_string());
         env.insert("NERVE_RUN".to_string(), "1".to_string());
         let spec = GoalSpec {
             id: "g1".into(),
