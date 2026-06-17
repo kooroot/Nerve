@@ -1905,6 +1905,11 @@ pub fn doctor_checks(_config: &Config, cwd: &Path) -> Vec<DoctorCheck> {
             let msg = format_chain_broken(&status).unwrap_or_else(|| "chain broken".to_string());
             DoctorStatus::Fail(msg)
         }
+        // A misconfigured key is a requested-but-broken integrity feature the
+        // operator opted into (a set-but-non-UTF-8 env value, a relative/repo-local
+        // or unreadable/empty key file): fail closed and loudly rather than
+        // silently running unkeyed. Its message is already actionable.
+        Err(err @ AuditError::KeyMisconfigured { .. }) => DoctorStatus::Fail(err.to_string()),
         Err(err) => DoctorStatus::Warn(format!("failed to verify audit chain: {err}")),
     };
     checks.push(DoctorCheck {

@@ -4532,9 +4532,10 @@ async fn handle_budget_command(
                 next: next.clone(),
                 source: "slash".to_string(),
                 user_confirmed,
-                // sec-gap-12 hash chain: append_budget_audit_entry fills this
-                // with the current chain head before persisting.
+                // sec-gap-12 hash chain: append_budget_audit_entry fills
+                // prev_hash (and, when keyed, entry_mac) before persisting.
                 prev_hash: None,
+                entry_mac: None,
             };
             append_budget_audit_entry(&budget_audit_path(cwd), entry)
                 .with_context(|| "failed to append budget audit entry")?;

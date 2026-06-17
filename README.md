@@ -402,7 +402,7 @@ Use `/budget` to set per-session token or cost caps during an interactive run:
 /budget cost=$10 --force
 ```
 
-Budget changes are appended to `.nerve/session-meta/budget-audit.json` as a hash chain. `nv doctor` validates the chain and reports tampering or missing links. Global ceilings can be set in config so an interactive budget raise cannot exceed operator policy.
+Budget changes are appended to `.nerve/session-meta/budget-audit.json` as a hash chain. `nv doctor` validates the chain: a break means the log no longer verifies (it was edited after it was written, or — if you just configured a key — it predates the key). By default the chain is unkeyed SHA-256, so it catches accidental edits and naive tampering but not a determined local writer (who can recompute a fully valid chain). Set `NERVE_BUDGET_AUDIT_KEY` (or point `NERVE_BUDGET_AUDIT_KEY_FILE` at a key file via an **absolute** path) — kept OFF the host you are defending against — to key the chain with HMAC-SHA-256, so a non-key-holder cannot forge or edit a link. Keyed verification is strict and also authenticates the **tail**: each keyed entry stores a self-MAC, so even the most-recent budget change (which no successor links to yet) cannot be edited undetected. A downgrade to an unkeyed/pre-key chain is detected — keying over **any** pre-existing unkeyed log fails loudly (only an empty log can begin a keyed chain; archive or re-key an existing one). A misconfigured key (a set-but-non-UTF-8 env value, a relative key-file path, or an unreadable/empty key file) also fails closed rather than silently running unkeyed, and `nv doctor` reports it as a failure. The residual gap even when keyed: any writer can **truncate** the log to an earlier keyed prefix (rollback), and a key-holder can rewrite history — so an intact chain is not proof of authenticity. The key is read only from the operator environment, never from repo-local config. Global ceilings can be set in config so an interactive budget raise cannot exceed operator policy.
 
 ## Forks, MCP, And Mayor/Patrol
 
@@ -707,7 +707,7 @@ Nerve is built around conservative file mutation:
 - Reviewer `BLOCK` can prevent application depending on conflict policy.
 - Worktree-isolated apply refuses dirty worktrees, symlink escapes, and stale main resets.
 - `/goal` deterministic checks are argv-only, cwd-frozen, timeout-capped, output-capped, and can run under configured ulimits.
-- `/budget` changes are persisted as an append-only hash chain and checked by `nv doctor`.
+- `/budget` changes are persisted as an append-only hash chain and checked by `nv doctor`; the chain is unkeyed SHA-256 by default (detects accidental/naive edits) and uses keyed HMAC-SHA-256 when `NERVE_BUDGET_AUDIT_KEY`/`NERVE_BUDGET_AUDIT_KEY_FILE` (absolute path) is set off the defended host — a non-key-holder then cannot forge or edit a link (including the unlinked tail entry, which carries its own self-MAC), keying over any pre-existing unkeyed log fails loudly (only an empty log can begin a keyed chain), and a misconfigured key fails closed rather than silently downgrading to unkeyed.
 - RPC tokens are stored under `.nerve/session-meta/` with restrictive permissions on Unix.
 - MCP servers default to read-only mode with deny-by-default admission (allowlist or read-only annotation evidence required), a write-tool blacklist veto, and a provenance-gated legacy posture.
 - Mayor/Patrol queue identifiers are restricted to safe file-component characters and duplicate task IDs are rejected.
