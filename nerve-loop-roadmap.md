@@ -761,7 +761,7 @@ no-op, `cancelled` 항상 false ⇒ S15 이전과 비트 동일. (N5) **bulk can
 |---|---|---|---|---|
 | H1 | Wave 1 | M | ⬜ | Invert MCP read-only enforcement from substring DENYLIST to deny-by-default ALLOWLIST (or annotation-driven) |
 | H2 | Wave 1 | M | ✅ | Replace whole-system-temp writable grant with a per-check private TMPDIR (0700, RAII-cleaned) |
-| H3 | Wave 1 | M | ⬜ | Mitigate macOS daemon-mediated write+network bypass behind an opt-in strict SBPL profile |
+| H3 | Wave 1 | M | ✅ | Mitigate macOS daemon-mediated write+network bypass behind an opt-in strict SBPL profile |
 | H4 | Wave 1 | M | ✅ | Add a runtime confinement self-test so Required fails closed when a wrap is silently ineffective |
 | H5 | Wave 2 | L | ⬜ | Add an optional Linux Landlock filesystem layer (BestEffort) composed over the existing bwrap jail |
 | H6 | Wave 2 | M | ⬜ | Add an opt-in seccomp-bpf denylist of dangerous syscalls (off by default, never gates acceptance) |
@@ -808,7 +808,9 @@ no-op, `cancelled` 항상 false ⇒ S15 이전과 비트 동일. (N5) **bulk can
 
 #### H3 — Mitigate macOS daemon-mediated write+network bypass behind an opt-in strict SBPL profile
 
-**Wave 1 · effort M · ⬜ 미착수** · 의존: —
+**Wave 1 · effort M · ✅ DONE** · 의존: —
+
+> **진행 로그 (✅ DONE):** `nerve-config`의 `SandboxConfig`에 `#[serde(default)] strict: bool`(기본 false) 추가. `nerve-core/sandbox.rs`의 `seatbelt_profile(roots, allow_network, strict)`에 strict 분기 추가 — `(allow default)` 뒤에(SBPL last-match-wins) `(deny mach-lookup (global-name "com.apple.cfprefsd.agent")(...daemon))`로 **cfprefsd 매개 `defaults write` 영속 우회**를 차단, 그리고 `allow_network=false`일 때만 `(deny mach-lookup ...mDNSResponder...)`로 **DNS-over-IPC exfil 우회**를 차단(network 허용 시엔 정당한 DNS라 미적용). **strict=false면 mach-lookup deny 전무 → 프로파일 byte-identical**(additive·inert). `seatbelt_decide`가 `config.strict` 전달. 모듈 "Honest limitations" 독에 strict가 닫는 2개 채널을 명시하되 **완전성 주장 없음**(launchd/distnoted 등 잔존 — 하드 격리는 container/VM). **PROVENANCE(P1 교차규칙):** strict는 **monotone-restrictive**(오직 `(deny …)`만 추가) → repo-local(Project) config가 켜도 자기 체크를 더 조일 뿐 실행 활성화·완화 불가 → verifier-execution opt-in과 달리 operator-consent gate 불필요(필드 독+config 테스트에 근거 명시). 테스트 +6: 순수 단위 3(strict=off는 mach-lookup 무 / hermetic strict는 cfprefsd+mDNS deny & allow-default 선행 / network 허용 strict는 cfprefsd 유지·mDNS 제거), macOS 실커널 1(`strict_profile_denies_cfprefsd_mediated_write`: 비-strict에선 cfprefsd 영속=우회 실재 입증, strict에선 미영속 — 고유 도메인 2개+패닉 전 cleanup, 결정성 3회 확인; **positive control 추가**(r1 nit): strict 프로파일로 `/usr/bin/true`를 sandbox-exec에 태워 exit 0을 확인 → strict SBPL이 **거부되지 않고 적용됐음**을 직접 입증하므로 미영속이 깨진 프로파일의 vacuous pass가 아니라 cfprefsd mach-lookup deny에 기인함을 보장), config 2(strict 기본 false·round-trip+provenance 주석). 검증: nerve-config 52→54, nerve-core 218→222, 워크스페이스 test green, host `clippy -D warnings` 0, Linux cross 0, Windows lib 0. 모든 SandboxConfig 리터럴(테스트)은 `..Default::default()`로 미래 필드(H5/H6/H8) churn 방지.
 
 - **왜(보안 근거):** This is the highest-severity real residual: a concrete WRITE-confinement and NETWORK-confinement bypass available to any project code the deterministic gate runs on macOS. Under (allow default), Mach IPC reaches daemons outside the sandbox — `defaults write` -> cfprefsd persists a plist under ~/Library/Preferences despite (deny file-write*), and DNS via mDNSResponder exfiltrates over crafted hostnames despite (deny network*). This directly contradicts the hermetic-verifier intent (allow_network=false to block exfil) and means a green result on macOS is not provably hermetic.
 - **현재 상태:** The macOS profile (crates/nerve-core/src/sandbox.rs:202-217) is (allow default) minus out-of-root file-write* and minus network. The bypass is documented honestly (sandbox.rs:54-66) but explicitly 'documented, not closed' because blanket deny-by-default IPC breaks build tools.

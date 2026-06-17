@@ -800,6 +800,7 @@ mod tests {
         let sandbox = SandboxConfig {
             mode: nerve_config::SandboxMode::Required,
             allow_network: false,
+            ..Default::default()
         };
         let evaluator = GoalEvaluator::with_options(
             spec_with_cmd(vec!["sh", "-c", "echo ok > marker.txt"], 30),
@@ -830,6 +831,7 @@ mod tests {
         let sandbox = SandboxConfig {
             mode: nerve_config::SandboxMode::Required,
             allow_network: false,
+            ..Default::default()
         };
         let evaluator = GoalEvaluator::with_options(
             spec_with_cmd(vec!["false"], 30),
@@ -857,6 +859,7 @@ mod tests {
         let off = SandboxConfig {
             mode: SandboxMode::Off,
             allow_network: false,
+            ..Default::default()
         };
         assert!(
             private_check_tmpdir(&off).unwrap().is_none(),
@@ -866,6 +869,7 @@ mod tests {
             let cfg = SandboxConfig {
                 mode,
                 allow_network: false,
+                ..Default::default()
             };
             let dir = private_check_tmpdir(&cfg)
                 .unwrap()
@@ -896,6 +900,7 @@ mod tests {
         let sandbox = SandboxConfig {
             mode: nerve_config::SandboxMode::Required,
             allow_network: false,
+            ..Default::default()
         };
         // Inside $TMPDIR (the granted private dir): allowed.
         let ok = GoalEvaluator::with_options(
@@ -983,6 +988,7 @@ mod tests {
         let sandbox = SandboxConfig {
             mode: nerve_config::SandboxMode::Required,
             allow_network: false,
+            ..Default::default()
         };
         let confined =
             run_confinement_probe(&sandbox, &cwd, std::slice::from_ref(&grant), &grant, &probe, 10)
@@ -1012,6 +1018,7 @@ mod tests {
         let sandbox = SandboxConfig {
             mode: nerve_config::SandboxMode::Required,
             allow_network: false,
+            ..Default::default()
         };
         let confined = run_confinement_probe(
             &sandbox,
@@ -1040,6 +1047,7 @@ mod tests {
         let sandbox = SandboxConfig {
             mode: nerve_config::SandboxMode::Required,
             allow_network: false,
+            ..Default::default()
         };
         let evaluator = GoalEvaluator::with_options(
             spec_with_cmd(vec!["true"], 30),

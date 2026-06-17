@@ -66,9 +66,20 @@
 //!   but a host daemon reachable over a bound socket is the same class of risk.
 //! - It does not prevent disclosure of already-readable files.
 //!
+//! **H3 strict mode (opt-in, `SandboxConfig::strict`, macOS).** When enabled it
+//! appends `(deny mach-lookup (global-name …))` for the two daemons named above —
+//! `cfprefsd` (closing the `defaults write` persistence bypass) and, when
+//! `allow_network = false`, `mDNSResponder` (closing the DNS-over-IPC exfil
+//! bypass). This raises the bar on exactly those two KNOWN channels; it is NOT a
+//! completeness claim — every other daemon reachable under `(allow default)`
+//! (`launchd`, `distnoted`, `diagnosticd`, …) is still reachable, and a deny-all
+//! IPC policy would break real build tools. strict is additive and inert when
+//! off (the profile is byte-identical). It does not change the verdict below.
+//!
 //! Therefore `Required` raises the bar against accidental and naive escapes; it
-//! is NOT a security boundary against a determined adversary. For hard isolation
-//! of an untrusted tree, run the whole loop inside a container or VM.
+//! is NOT a security boundary against a determined adversary, with or without
+//! strict mode. For hard isolation of an untrusted tree, run the whole loop
+//! inside a container or VM.
 
 use nerve_config::{SandboxConfig, SandboxMode};
 use std::path::{Path, PathBuf};
@@ -178,7 +189,7 @@ fn seatbelt_decide(
         return no_backend_decide(config.mode);
     }
     let writable = canonical_writable_roots(cwd, extra_writable_roots);
-    let profile = seatbelt_profile(&writable, config.allow_network);
+    let profile = seatbelt_profile(&writable, config.allow_network, config.strict);
     // `sandbox-exec -p <profile> -- <command> [args...]`. The wrapper-owned `--`
     // terminates sandbox-exec's own option parsing, so a `check_cmd[0]` that
     // begins with `-` (e.g. `--`) is treated as the command, NOT consumed as a
@@ -199,7 +210,7 @@ fn seatbelt_decide(
 /// `(allow file-write* (subpath ...))` re-grants writes inside the roots while
 /// every other location remains denied.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn seatbelt_profile(writable_roots: &[PathBuf], allow_network: bool) -> String {
+fn seatbelt_profile(writable_roots: &[PathBuf], allow_network: bool, strict: bool) -> String {
     let mut p = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
     if !writable_roots.is_empty() {
         p.push_str("(allow file-write*\n");
@@ -212,6 +223,31 @@ fn seatbelt_profile(writable_roots: &[PathBuf], allow_network: bool) -> String {
     }
     if !allow_network {
         p.push_str("(deny network*)\n");
+    }
+    // H3: opt-in strict mode closes the two KNOWN daemon-mediated bypasses of the
+    // permissive `(allow default)` baseline by denying `mach-lookup` to the
+    // daemons that mediate them. SBPL is last-match-wins, so these denies override
+    // the earlier `(allow default)` for exactly these Mach services and nothing
+    // else. Purely additive: when `strict` is false the profile is byte-identical
+    // to the non-strict build. NOT a completeness claim — other daemons remain
+    // reachable; see the module-level "Honest limitations" docs.
+    if strict {
+        // `cfprefsd` mediates `defaults write`, which persists a plist under
+        // ~/Library/Preferences despite `(deny file-write*)`. The bypass is a
+        // WRITE, independent of network, so deny it whenever strict.
+        p.push_str(
+            "(deny mach-lookup\n    (global-name \"com.apple.cfprefsd.agent\")\n    (global-name \"com.apple.cfprefsd.daemon\"))\n",
+        );
+        // `mDNSResponder` resolves DNS over IPC, so data can exfil over crafted
+        // hostnames despite `(deny network*)`. Only deny it when network is
+        // ALREADY denied — if the operator allowed network, DNS resolution is
+        // legitimate and denying the resolver would just break it (and the socket
+        // path is open anyway, so the deny would buy nothing).
+        if !allow_network {
+            p.push_str(
+                "(deny mach-lookup\n    (global-name \"com.apple.mDNSResponder\")\n    (global-name \"com.apple.mDNSResponder.dnsproxy\"))\n",
+            );
+        }
     }
     p
 }
@@ -325,6 +361,7 @@ mod tests {
         SandboxConfig {
             mode,
             allow_network,
+            ..Default::default()
         }
     }
 
@@ -343,7 +380,7 @@ mod tests {
 
     #[test]
     fn seatbelt_profile_denies_writes_and_network_by_default() {
-        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], false);
+        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], false, false);
         assert!(p.contains("(allow default)"));
         assert!(p.contains("(deny file-write*)"));
         assert!(p.contains("(subpath \"/tmp/work\")"));
@@ -357,7 +394,7 @@ mod tests {
 
     #[test]
     fn seatbelt_profile_allows_network_when_opted_in() {
-        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], true);
+        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], true, false);
         assert!(!p.contains("(deny network*)"));
     }
 
@@ -365,8 +402,57 @@ mod tests {
     fn seatbelt_profile_escapes_quotes_and_backslashes_in_paths() {
         // A path with a quote/paren must not break out of the string literal.
         let evil = PathBuf::from("/tmp/a\"b)\\c");
-        let p = seatbelt_profile(&[evil], false);
+        let p = seatbelt_profile(&[evil], false, false);
         assert!(p.contains("(subpath \"/tmp/a\\\"b)\\\\c\")"), "profile = {p}");
+    }
+
+    // --- H3: opt-in strict daemon-mediated-bypass mitigation (pure) ---
+
+    /// strict=false is ADDITIVE-inert: the profile carries NO `mach-lookup` deny,
+    /// so it is byte-identical to the pre-H3 profile for the same inputs.
+    #[test]
+    fn seatbelt_profile_strict_off_emits_no_mach_lookup_deny() {
+        let roots = [PathBuf::from("/tmp/work")];
+        for allow_network in [false, true] {
+            let p = seatbelt_profile(&roots, allow_network, false);
+            assert!(
+                !p.contains("mach-lookup"),
+                "strict=off must not emit any mach-lookup deny (allow_network={allow_network}); profile = {p}"
+            );
+        }
+    }
+
+    /// strict=true (hermetic) denies BOTH the cfprefsd write-persistence channel
+    /// and the mDNSResponder DNS-exfil channel, and the denies come AFTER
+    /// `(allow default)` so last-match-wins actually denies them.
+    #[test]
+    fn seatbelt_profile_strict_denies_cfprefsd_and_mdns_when_hermetic() {
+        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], false, true);
+        assert!(p.contains("(deny mach-lookup"), "profile = {p}");
+        assert!(p.contains("com.apple.cfprefsd.agent"), "profile = {p}");
+        assert!(p.contains("com.apple.cfprefsd.daemon"), "profile = {p}");
+        assert!(p.contains("com.apple.mDNSResponder"), "profile = {p}");
+        let allow_default = p.find("(allow default)").unwrap();
+        let deny_lookup = p.find("(deny mach-lookup").unwrap();
+        assert!(
+            allow_default < deny_lookup,
+            "(allow default) must precede the mach-lookup deny (last-match-wins)"
+        );
+    }
+
+    /// strict=true with network ALLOWED keeps the cfprefsd write deny (a write
+    /// bypass, independent of network) but DROPS the mDNSResponder deny — denying
+    /// the resolver when network is legitimately allowed would only break DNS and
+    /// buy nothing (the socket path is open anyway).
+    #[test]
+    fn seatbelt_profile_strict_with_network_keeps_cfprefsd_drops_mdns() {
+        let p = seatbelt_profile(&[PathBuf::from("/tmp/work")], true, true);
+        assert!(p.contains("com.apple.cfprefsd.agent"), "profile = {p}");
+        assert!(
+            !p.contains("mDNSResponder"),
+            "mDNSResponder deny is pointless (and harmful) when network is allowed; profile = {p}"
+        );
+        assert!(!p.contains("(deny network*)"), "network is allowed; profile = {p}");
     }
 
     // --- bwrap args (pure; tested on every platform incl. the macOS dev host) ---
@@ -477,7 +563,7 @@ mod tests {
         // Canonicalize so the profile matches the kernel's symlink-resolved view.
         let work = std::fs::canonicalize(work.path()).unwrap();
         let sibling = std::fs::canonicalize(sibling.path()).unwrap();
-        let profile = seatbelt_profile(std::slice::from_ref(&work), false);
+        let profile = seatbelt_profile(std::slice::from_ref(&work), false, false);
 
         let run = |target: &std::path::Path| {
             StdCommand::new(SANDBOX_EXEC)
@@ -502,6 +588,103 @@ mod tests {
             "write outside the granted roots must be denied"
         );
         assert!(!escape.exists(), "denied write must not create the file");
+    }
+
+    /// H3 end-to-end (macOS real kernel): the cfprefsd-mediated write bypass that
+    /// the direct-write proof above explicitly does NOT cover is CLOSED under
+    /// strict mode. `defaults write` persists a value via `cfprefsd` (a daemon
+    /// outside the sandbox) even though a direct write to `~/Library/Preferences`
+    /// is denied. We prove the bypass is REAL under the non-strict profile (the
+    /// value persists) and is DENIED under the strict profile (it does not) — by
+    /// denying `mach-lookup` to cfprefsd. Two distinct per-pid domains so the
+    /// control's persisted value cannot mask the strict result; cleanup runs
+    /// BEFORE any assertion so a failure cannot leak the test plists. A positive
+    /// control (`/usr/bin/true` under the strict profile, exit 0) proves
+    /// `sandbox-exec` ACCEPTED the strict SBPL, so the strict non-persistence is
+    /// attributable to the mach-lookup deny rather than a rejected/invalid profile.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn strict_profile_denies_cfprefsd_mediated_write() {
+        use std::process::Command as StdCommand;
+
+        let work = tempfile::tempdir().unwrap();
+        let work = std::fs::canonicalize(work.path()).unwrap();
+        let lax = seatbelt_profile(std::slice::from_ref(&work), false, false);
+        let strict = seatbelt_profile(std::slice::from_ref(&work), false, true);
+
+        let pid = std::process::id();
+        let domain_ctrl = format!("com.nerve.h3test.ctrl.{pid}");
+        let domain_strict = format!("com.nerve.h3test.strict.{pid}");
+
+        // `defaults write <domain> probe -int 1` under `sandbox-exec -p <profile>`.
+        let write_under = |profile: &str, domain: &str| {
+            StdCommand::new(SANDBOX_EXEC)
+                .arg("-p")
+                .arg(profile)
+                .arg("/usr/bin/defaults")
+                .arg("write")
+                .arg(domain)
+                .arg("probe")
+                .arg("-int")
+                .arg("1")
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        // Did the value actually PERSIST? Read it back UNSANDBOXED (`defaults read`
+        // exits 0 iff the key exists). This reads through the same cfprefsd, so it
+        // is the authoritative persistence signal regardless of the write's exit.
+        let persisted = |domain: &str| {
+            StdCommand::new("/usr/bin/defaults")
+                .arg("read")
+                .arg(domain)
+                .arg("probe")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+
+        let _ = write_under(&lax, &domain_ctrl);
+        let _ = write_under(&strict, &domain_strict);
+        let persisted_ctrl = persisted(&domain_ctrl);
+        let persisted_strict = persisted(&domain_strict);
+
+        // Positive control: prove `sandbox-exec` ACCEPTS the strict profile (compiles
+        // it and launches the child) by running `/usr/bin/true` under it. `sandbox-exec`
+        // parses `-p <profile>` BEFORE spawning the child, so exit 0 here means the
+        // strict SBPL is syntactically valid and was applied. Without this, a future
+        // strict-SBPL edit that broke the syntax would make `sandbox-exec` reject the
+        // profile and run nothing — silently turning `!persisted_strict` into a VACUOUS
+        // pass. Exit 0 attributes the non-persistence below to the cfprefsd mach-lookup
+        // deny, not to a rejected profile. (`true` creates no state, so no cleanup.)
+        let strict_profile_accepted = StdCommand::new(SANDBOX_EXEC)
+            .arg("-p")
+            .arg(&strict)
+            .arg("/usr/bin/true")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        // Cleanup BEFORE asserting (no RAII for `defaults`; a panic must not leak).
+        let _ = StdCommand::new("/usr/bin/defaults").arg("delete").arg(&domain_ctrl).status();
+        let _ = StdCommand::new("/usr/bin/defaults").arg("delete").arg(&domain_strict).status();
+
+        // The strict profile is valid and accepted: `!persisted_strict` below reflects
+        // the mach-lookup deny, not a rejected profile that silently ran nothing.
+        assert!(
+            strict_profile_accepted,
+            "positive control: sandbox-exec must accept the strict profile (else !persisted_strict is vacuous)"
+        );
+        // The bypass is real: under the non-strict profile cfprefsd persisted it.
+        assert!(
+            persisted_ctrl,
+            "control: cfprefsd-mediated write should persist under the non-strict profile (else the test is vacuous)"
+        );
+        // strict closes it: the cfprefsd mach-lookup deny stopped the persistence.
+        assert!(
+            !persisted_strict,
+            "strict: cfprefsd-mediated write must NOT persist (mach-lookup deny should block it)"
+        );
     }
 
     /// Argv transparency: a hostile `check_cmd = ["--", "true"]` must NOT let
@@ -544,7 +727,7 @@ mod tests {
     /// still globally denied (no re-allow block emitted).
     #[test]
     fn seatbelt_profile_with_no_roots_denies_all_writes() {
-        let p = seatbelt_profile(&[], false);
+        let p = seatbelt_profile(&[], false, false);
         assert!(p.contains("(deny file-write*)"));
         assert!(!p.contains("(allow file-write*"), "no roots => no re-allow block");
     }

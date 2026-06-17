@@ -277,6 +277,22 @@ pub struct SandboxConfig {
     /// fetch (e.g. first-build dependency download). Ignored when `mode = off`.
     #[serde(default)]
     pub allow_network: bool,
+    /// H3 (macOS): opt-in STRICT confinement. Default `false`. When `true` and
+    /// `mode != off`, the macOS Seatbelt profile additionally denies `mach-lookup`
+    /// to the daemons that mediate the two documented bypasses of the permissive
+    /// baseline — `cfprefsd` (so `defaults write` can no longer persist a plist
+    /// under `~/Library/Preferences` despite `(deny file-write*)`) and, when
+    /// `allow_network = false`, `mDNSResponder` (so DNS-over-IPC exfil is closed
+    /// despite `(deny network*)`). It is purely ADDITIVE: it only ever appends
+    /// `(deny …)` directives, so it can only make confinement MORE restrictive,
+    /// never weaken it or enable execution — which is why, unlike the
+    /// verifier-execution opt-ins, it needs no operator-consent provenance gate (a
+    /// repo-local config can at most tighten its own checks, never loosen them).
+    /// Best-effort hardening of the KNOWN channels, NOT a hard boundary; other
+    /// daemons remain reachable. Inert (profile byte-identical) when `false` or on
+    /// non-macOS. See the `nerve_core::sandbox` module docs.
+    #[serde(default)]
+    pub strict: bool,
 }
 
 impl SandboxConfig {
@@ -2313,7 +2329,48 @@ mod tests {
         let cfg = SandboxConfig::default();
         assert_eq!(cfg.mode, SandboxMode::Off);
         assert!(!cfg.allow_network);
+        assert!(!cfg.strict, "H3 strict mode is opt-in, default false");
         assert!(!cfg.is_enabled());
+    }
+
+    #[test]
+    fn sandbox_strict_round_trips_and_defaults_false() {
+        // Absent `strict` key => false (additive/inert; existing configs unchanged).
+        let lax = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority",
+                "sandbox": { "mode": "required" }
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        assert!(!lax.orchestration.sandbox.strict, "absent strict => false");
+
+        // Explicit strict=true deserializes. NOTE (P1 provenance): strict is
+        // MONOTONE-RESTRICTIVE — it only appends `(deny …)` SBPL directives, so a
+        // repo-local (Project-source) config setting it can at most TIGHTEN its
+        // own checks, never loosen confinement or enable execution. Hence it needs
+        // no operator-consent gate (unlike the verifier-execution opt-ins).
+        let strict = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority",
+                "sandbox": { "mode": "required", "strict": true }
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        assert!(strict.orchestration.sandbox.strict);
+        assert!(strict.orchestration.sandbox.is_enabled());
     }
 
     #[test]
