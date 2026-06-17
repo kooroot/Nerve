@@ -42,6 +42,31 @@ pub enum GoalError {
 )]
 const CONFINEMENT_SELFTEST_FAILED: &str = "sandbox confinement self-test failed: an out-of-root write was NOT denied under sandbox.mode=required; refusing to run the check unconfined (fail closed)";
 
+/// H13: the result of one deterministic goal check plus the additive sandbox
+/// telemetry the run report surfaces. `ran_unconfined` is true ONLY when the
+/// check command actually executed but ran WITHOUT OS confinement because
+/// `sandbox.mode = auto` requested a sandbox and no backend was available on this
+/// host (the documented "confine-if-possible, else run openly" degrade). It is
+/// pure telemetry: it never changes `result`, never gates acceptance, and is
+/// false for `Off` (intentionally unconfined — not a degrade), for `Required`
+/// (which fails closed instead of degrading), whenever a backend confined the
+/// run, and when the check never ran (setup/spawn error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckOutcome {
+    pub result: CheckResult,
+    pub ran_unconfined: bool,
+}
+
+/// H13: the exact glue predicate threaded into [`CheckOutcome::ran_unconfined`].
+/// A degrade-to-unconfined is `Unconfined { warning: Some(_) }` — the `Auto`
+/// no-backend case (`Off` carries `warning: None`, so it is correctly NOT a
+/// degrade; `Wrap`/`Refuse` are confined/refused). Pure function so the mapping
+/// is unit-tested directly even on a host where a backend is always available and
+/// `decide` can therefore never return the degrade variant.
+fn decision_is_unconfined_degrade(decision: &SandboxDecision) -> bool {
+    matches!(decision, SandboxDecision::Unconfined { warning: Some(_) })
+}
+
 #[derive(Debug, Clone)]
 pub struct GoalEvaluator {
     goal: GoalSpec,
@@ -113,17 +138,23 @@ impl GoalEvaluator {
         &self.goal
     }
 
-    pub async fn evaluate(&self) -> CheckResult {
+    pub async fn evaluate(&self) -> CheckOutcome {
         match self.spawn_and_wait().await {
-            Ok(result) => result,
-            Err(err) => CheckResult::Fail {
-                reason: err.to_string(),
-                progress: None,
+            Ok(outcome) => outcome,
+            // The check never successfully ran (per-check tmpdir mint, ulimit, or
+            // spawn failed). It did not execute unconfined, so the additive
+            // `ran_unconfined` telemetry is false; the verdict is an unchanged Fail.
+            Err(err) => CheckOutcome {
+                result: CheckResult::Fail {
+                    reason: err.to_string(),
+                    progress: None,
+                },
+                ran_unconfined: false,
             },
         }
     }
 
-    async fn spawn_and_wait(&self) -> Result<CheckResult, GoalError> {
+    async fn spawn_and_wait(&self) -> Result<CheckOutcome, GoalError> {
         // S5: resolve the OS sandbox first. It confines side effects without
         // fabricating success — wrapping the command (Pass still keys on the
         // child's real exit status below), or (under `Required` with no backend)
@@ -144,8 +175,16 @@ impl GoalEvaluator {
             .as_ref()
             .map(|dir| vec![dir.path().to_path_buf()])
             .unwrap_or_default();
+        let decision =
+            sandbox::decide(&self.sandbox, &self.cwd, &self.goal.check_cmd, &extra_writable);
+        // H13: capture the additive degrade signal BEFORE the match consumes the
+        // decision. True ONLY for the `Auto` no-backend degrade
+        // (`Unconfined { warning: Some(_) }`) — never for `Off` (intentionally
+        // unconfined, `warning: None`), `Wrap` (confined), or `Refuse`. Pure
+        // telemetry: it changes neither which command runs nor the verdict below.
+        let ran_unconfined = decision_is_unconfined_degrade(&decision);
         let (program, args): (String, Vec<String>) =
-            match sandbox::decide(&self.sandbox, &self.cwd, &self.goal.check_cmd, &extra_writable) {
+            match decision {
                 SandboxDecision::Unconfined { warning } => {
                     if let Some(message) = warning {
                         tracing::warn!(target: "nerve::sandbox", "{message}");
@@ -183,18 +222,24 @@ impl GoalEvaluator {
                             None => false,
                         };
                         if !confined {
-                            return Ok(CheckResult::Fail {
-                                reason: CONFINEMENT_SELFTEST_FAILED.to_string(),
-                                progress: None,
+                            return Ok(CheckOutcome {
+                                result: CheckResult::Fail {
+                                    reason: CONFINEMENT_SELFTEST_FAILED.to_string(),
+                                    progress: None,
+                                },
+                                ran_unconfined,
                             });
                         }
                     }
                     (program, args)
                 }
                 SandboxDecision::Refuse { reason } => {
-                    return Ok(CheckResult::Fail {
-                        reason,
-                        progress: None,
+                    return Ok(CheckOutcome {
+                        result: CheckResult::Fail {
+                            reason,
+                            progress: None,
+                        },
+                        ran_unconfined,
                     });
                 }
             };
@@ -276,9 +321,12 @@ impl GoalEvaluator {
             Err(_) => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
-                return Ok(CheckResult::Fail {
-                    reason: format!("timeout after {}s", self.goal.timeout_secs),
-                    progress: None,
+                return Ok(CheckOutcome {
+                    result: CheckResult::Fail {
+                        reason: format!("timeout after {}s", self.goal.timeout_secs),
+                        progress: None,
+                    },
+                    ran_unconfined,
                 });
             }
         };
@@ -286,29 +334,38 @@ impl GoalEvaluator {
         let status = match child.wait().await {
             Ok(status) => status,
             Err(err) => {
-                return Ok(CheckResult::Fail {
-                    reason: format!("failed to await check_cmd: {err}"),
-                    progress: None,
+                return Ok(CheckOutcome {
+                    result: CheckResult::Fail {
+                        reason: format!("failed to await check_cmd: {err}"),
+                        progress: None,
+                    },
+                    ran_unconfined,
                 });
             }
         };
 
         let (stdout_res, stderr_res) = drained;
         if let Err(OutputCapExceeded(byte_cap)) = stdout_res {
-            return Ok(CheckResult::Fail {
-                reason: format!("stdout exceeded {byte_cap} bytes"),
-                progress: None,
+            return Ok(CheckOutcome {
+                result: CheckResult::Fail {
+                    reason: format!("stdout exceeded {byte_cap} bytes"),
+                    progress: None,
+                },
+                ran_unconfined,
             });
         }
         if let Err(OutputCapExceeded(byte_cap)) = stderr_res {
-            return Ok(CheckResult::Fail {
-                reason: format!("stderr exceeded {byte_cap} bytes"),
-                progress: None,
+            return Ok(CheckOutcome {
+                result: CheckResult::Fail {
+                    reason: format!("stderr exceeded {byte_cap} bytes"),
+                    progress: None,
+                },
+                ran_unconfined,
             });
         }
 
-        if status.success() {
-            Ok(CheckResult::Pass)
+        let result = if status.success() {
+            CheckResult::Pass
         } else {
             // Both reads are `Ok` here — the cap checks above returned early on
             // `Err`. The pass-ratio (S7 progress) comes from whichever stream
@@ -322,8 +379,12 @@ impl GoalEvaluator {
                 format!("status {status}: {tail}")
             };
             let progress = parse_progress(&stdout_text, &stderr_text);
-            Ok(CheckResult::Fail { reason, progress })
-        }
+            CheckResult::Fail { reason, progress }
+        };
+        Ok(CheckOutcome {
+            result,
+            ran_unconfined,
+        })
     }
 
     /// H4: prove the sandbox wrap actually confines before trusting it (`Required`
@@ -606,7 +667,7 @@ mod tests {
             dir.path().to_path_buf(),
         )
         .unwrap();
-        assert_eq!(evaluator.evaluate().await, CheckResult::Pass);
+        assert_eq!(evaluator.evaluate().await.result, CheckResult::Pass);
     }
 
     #[tokio::test]
@@ -619,7 +680,7 @@ mod tests {
             dir.path().to_path_buf(),
         )
         .unwrap();
-        let result = evaluator.evaluate().await;
+        let result = evaluator.evaluate().await.result;
         assert!(matches!(result, CheckResult::Fail { .. }), "got {result:?}");
     }
 
@@ -633,7 +694,7 @@ mod tests {
             dir.path().to_path_buf(),
         )
         .unwrap();
-        let result = evaluator.evaluate().await;
+        let result = evaluator.evaluate().await.result;
         match result {
             CheckResult::Fail { reason, .. } => {
                 assert!(reason.contains("timeout"), "reason = {reason}")
@@ -652,7 +713,7 @@ mod tests {
             dir.path().to_path_buf(),
         )
         .unwrap();
-        let result = evaluator.evaluate().await;
+        let result = evaluator.evaluate().await.result;
         match result {
             CheckResult::Fail { reason, .. } => {
                 assert!(reason.contains("exceeded"), "reason = {reason}")
@@ -777,7 +838,7 @@ mod tests {
             dir.path().to_path_buf(),
         )
         .unwrap();
-        let result = evaluator.evaluate().await;
+        let result = evaluator.evaluate().await.result;
         assert_eq!(result.progress(), Some(0.75), "got {result:?}");
         match result {
             CheckResult::Fail { progress, .. } => assert_eq!(progress, Some(750)),
@@ -811,7 +872,7 @@ mod tests {
             sandbox,
         )
         .unwrap();
-        assert_eq!(evaluator.evaluate().await, CheckResult::Pass);
+        assert_eq!(evaluator.evaluate().await.result, CheckResult::Pass);
         assert!(cwd.join("marker.txt").exists(), "in-cwd write should persist");
     }
 
@@ -843,7 +904,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(evaluator.evaluate().await, CheckResult::Fail { .. }),
+            matches!(evaluator.evaluate().await.result, CheckResult::Fail { .. }),
             "a wrapped failing check must still Fail"
         );
     }
@@ -919,10 +980,17 @@ mod tests {
             sandbox,
         )
         .unwrap();
+        let ok_outcome = ok.evaluate().await;
         assert_eq!(
-            ok.evaluate().await,
+            ok_outcome.result,
             CheckResult::Pass,
             "a write inside $TMPDIR must pass under confinement"
+        );
+        // H13: a real backend confined the run, so the additive telemetry stays
+        // false — `ran_unconfined` is reserved for the `Auto` no-backend degrade.
+        assert!(
+            !ok_outcome.ran_unconfined,
+            "a confined Required run must never report ran_unconfined"
         );
         // A sibling temp dir, outside cwd and outside the private grant: denied.
         let sibling = tempfile::tempdir().unwrap();
@@ -941,7 +1009,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(denied.evaluate().await, CheckResult::Fail { .. }),
+            matches!(denied.evaluate().await.result, CheckResult::Fail { .. }),
             "a direct write outside the private temp grant must be denied"
         );
         assert!(!escape.exists(), "denied write must leave no file");
@@ -1059,9 +1127,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            evaluator.evaluate().await,
+            evaluator.evaluate().await.result,
             CheckResult::Pass,
             "the canary must not break a healthy Required run"
+        );
+    }
+
+    /// H13: the glue predicate maps the sandbox decision to the additive
+    /// `ran_unconfined` telemetry. Host-independent (constructs decisions directly)
+    /// so the degrade case is proven even where a backend is always available and
+    /// `decide` therefore never returns it. Combined with the sandbox-layer test
+    /// `no_backend_auto_runs_unconfined_with_warning` (Auto+no-backend yields
+    /// exactly `Unconfined { warning: Some(_) }`), this closes the chain end-to-end.
+    #[test]
+    fn unconfined_degrade_predicate_only_fires_on_auto_no_backend() {
+        // The ONE security-relevant case: a confinement was requested (`Auto`) but
+        // no backend ran it — the check executed unconfined.
+        assert!(decision_is_unconfined_degrade(
+            &SandboxDecision::Unconfined {
+                warning: Some("running the check UNCONFINED".to_string()),
+            }
+        ));
+        // `Off` is intentionally unconfined (no warning): NOT a degrade.
+        assert!(!decision_is_unconfined_degrade(
+            &SandboxDecision::Unconfined { warning: None }
+        ));
+        // A confined wrap and a fail-closed refusal never "ran unconfined".
+        assert!(!decision_is_unconfined_degrade(&SandboxDecision::Wrap {
+            program: "/usr/bin/sandbox-exec".to_string(),
+            args: Vec::new(),
+        }));
+        assert!(!decision_is_unconfined_degrade(&SandboxDecision::Refuse {
+            reason: "no backend".to_string(),
+        }));
+    }
+
+    /// H13 end-to-end (host-independent): `Off` runs the check unconfined BY
+    /// DESIGN, which is NOT a degrade — so the additive telemetry must stay false.
+    /// Only the `Auto` no-backend fallback sets it. Proves the signal is plumbed
+    /// onto the real run outcome, not just the predicate.
+    #[tokio::test]
+    async fn evaluate_off_mode_is_not_reported_as_unconfined_degrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let evaluator = GoalEvaluator::with_options(
+            spec_with_cmd(vec!["true"], 5),
+            Vec::new(),
+            1024,
+            dir.path().to_path_buf(),
+            None,
+            SandboxConfig {
+                mode: nerve_config::SandboxMode::Off,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let outcome = evaluator.evaluate().await;
+        assert_eq!(outcome.result, CheckResult::Pass);
+        assert!(
+            !outcome.ran_unconfined,
+            "sandbox.mode=off is intentionally unconfined, not a degrade"
         );
     }
 }

@@ -299,6 +299,8 @@ NERVE_ADAPTER=mock cargo run -p nerve-cli -- --json "add a health endpoint"
 
 The JSON report includes the task, selected profile, round records, final reviewer verdict, final patch, captured agent events, and whether the patch was applied or blocked.
 
+The report also carries `ran_unconfined`: a machine-readable signal that is `true` only when a goal check actually ran *without* OS sandbox confinement because `sandbox.mode = auto` requested a sandbox but no backend was available on this host. This makes the two non-`off` postures observable: `auto` is *confine-if-possible, else run openly* — it degrades to an unconfined run and records `ran_unconfined: true` rather than failing — whereas `required` *fails closed*, refusing to run the check at all when no backend is available (so a `required` run never reports an unconfined execution). The field is pure telemetry: it never changes the deterministic acceptance verdict (`blocked` / `goal_satisfied`); it exists so an operator or downstream tool can detect that a run under `auto` silently lost confinement. It is `false` for `off` (unconfined by configuration, not a degrade), for any backend-confined run, and for a check that never executed; reports written before the field existed default it to `false`.
+
 ### Stored History And Patches
 
 Every run writes a session report to `.nerve/sessions/{session-id}.json`. Accepted structured patches are written to `.nerve/patches/{patch-id}.json` and indexed in `.nerve/patches/index.json`.

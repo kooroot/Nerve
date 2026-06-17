@@ -38,7 +38,7 @@ pub use budget_audit::{
     AuditChainState, AuditError, BudgetAuditEntry, BudgetSnapshot, ChainStatus,
     append_budget_audit_entry, format_chain_broken,
 };
-pub use goal::{GoalError, GoalEvaluator};
+pub use goal::{CheckOutcome, GoalError, GoalEvaluator};
 pub use goal_intent::{GOAL_INTENT_SYSTEM_PROMPT, GoalIntentConverter, GoalIntentError};
 pub use mayor_patrol::{
     Coordinator, DispatchFuture, Ledger, LedgerEntry, LedgerState, MailKind, MailMessage, Mayor,
@@ -144,6 +144,17 @@ pub struct RunReport {
     // because the patch was High risk; this NEVER affects `blocked`/`goal_satisfied`.
     #[serde(default)]
     pub apply_classification: Option<ApplyClassification>,
+    // H13: pure telemetry — true when a deterministic goal check actually executed
+    // WITHOUT OS confinement because `sandbox.mode = auto` requested a sandbox but
+    // no backend was available on this host (the documented
+    // "confine-if-possible, else run openly" degrade). It is false for `off`
+    // (intentionally unconfined — not a degrade), for `required` (which fails
+    // closed instead of degrading), whenever a backend confined the run, and when
+    // the check never ran. Like `apply_classification`, this NEVER affects
+    // `blocked`/`goal_satisfied`; it is OR-accumulated across rounds.
+    // `#[serde(default)]` keeps older persisted reports deserializable.
+    #[serde(default)]
+    pub ran_unconfined: bool,
 }
 
 /// S12: deterministic apply-risk level for the auto-mode classifier.
@@ -705,6 +716,10 @@ async fn run_synaptic_loop_inner(
     // `goal_satisfied=false`; it never overrides an acceptance.
     let mut cancelled = false;
     let mut last_check: Option<CheckResult> = None;
+    // H13: OR-accumulated additive telemetry — set once any round's check actually
+    // ran unconfined because `sandbox.mode = auto` found no backend. Never gates;
+    // surfaced in the JSON report so an operator can see a degraded run.
+    let mut ran_unconfined = false;
     // S7: best deterministic-check pass-ratio (permille) seen across rounds, so
     // the no-progress guard can also trip when the lead keeps producing DIFFERENT
     // patches that never get closer to green.
@@ -727,7 +742,9 @@ async fn run_synaptic_loop_inner(
             .with_context(|| format!("reviewer adapter `{}` failed", reviewer.id()))?;
         accumulate_feedback_usage(&mut usage, &feedback);
 
-        let check_result = run_goal_check(goal_evaluator.as_ref()).await;
+        let check_outcome = run_goal_check(goal_evaluator.as_ref()).await;
+        ran_unconfined |= check_outcome.ran_unconfined;
+        let check_result = check_outcome.result;
         last_check = Some(check_result.clone());
         let patch_sha = lead_output
             .proposed_patch
@@ -948,6 +965,7 @@ async fn run_synaptic_loop_inner(
         applied,
         blocked,
         apply_classification,
+        ran_unconfined,
     })
 }
 
@@ -1040,7 +1058,10 @@ async fn run_tournament_strategy(
 
     // Tournament strategy only runs one round; AND-combine the optional goal check.
     let goal_evaluator = build_goal_evaluator(&task, &options, &config.orchestration)?;
-    let check_result = run_goal_check(goal_evaluator.as_ref()).await;
+    let check_outcome = run_goal_check(goal_evaluator.as_ref()).await;
+    // H13: single round, so the run's unconfined-degrade telemetry is this check's.
+    let ran_unconfined = check_outcome.ran_unconfined;
+    let check_result = check_outcome.result;
     let patch_sha = final_output
         .proposed_patch
         .as_ref()
@@ -1135,6 +1156,7 @@ async fn run_tournament_strategy(
         applied,
         blocked,
         apply_classification,
+        ran_unconfined,
     })
 }
 
@@ -1202,10 +1224,14 @@ fn build_goal_evaluator(
     Ok(Some(evaluator))
 }
 
-async fn run_goal_check(evaluator: Option<&GoalEvaluator>) -> CheckResult {
+async fn run_goal_check(evaluator: Option<&GoalEvaluator>) -> CheckOutcome {
     match evaluator {
         Some(eval) => eval.evaluate().await,
-        None => CheckResult::Skipped,
+        // No goal configured: nothing ran, so it never ran unconfined.
+        None => CheckOutcome {
+            result: CheckResult::Skipped,
+            ran_unconfined: false,
+        },
     }
 }
 

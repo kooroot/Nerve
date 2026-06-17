@@ -6563,6 +6563,7 @@ mod tests {
             applied: false,
             blocked: false,
             apply_classification: None,
+            ran_unconfined: false,
         };
         let mut state = InteractiveState::new(false, true, None);
         state.last_report = Some(report);
@@ -6601,6 +6602,7 @@ mod tests {
             applied: false,
             blocked: false,
             apply_classification: classification,
+            ran_unconfined: false,
         }
     }
 
@@ -7455,6 +7457,7 @@ mod tests {
             applied: false,
             blocked: false,
             apply_classification: None,
+            ran_unconfined: false,
         };
         NerveStore::new(dir.path()).save_report(&report).unwrap();
 

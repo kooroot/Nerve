@@ -775,12 +775,57 @@ mod tests {
             applied: false,
             blocked: false,
             apply_classification: None,
+            ran_unconfined: false,
         };
         store.save_report(&report).unwrap();
 
         // The finalized report supersedes the in-flight checkpoint.
         assert!(store.load_checkpoint(&task.id).is_err());
         assert!(store.list_checkpoints().unwrap().is_empty());
+    }
+
+    /// H13: the additive `ran_unconfined` telemetry is exposed in the serialized
+    /// JSON report when a run degraded to unconfined, and older reports that
+    /// predate the field load as `false` (serde default) — never erroring. Pure
+    /// telemetry: it rides alongside the verdict; it is not the verdict.
+    #[test]
+    fn run_report_exposes_ran_unconfined_and_defaults_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = NvPatch::new(vec![FilePatch::create("created.txt", "created\n")]);
+        let task = Task::new("create file", dir.path());
+        let report = RunReport {
+            task,
+            selection: sample_selection(),
+            rounds: Vec::new(),
+            crossfire_feedback: Vec::new(),
+            final_output: AgentOutput::with_patch("lead", "patch", patch.clone()),
+            final_feedback: ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            final_patch: Some(patch),
+            events: Vec::new(),
+            usage: Default::default(),
+            budget_exceeded: false,
+            no_progress_exceeded: false,
+            crossfire_halted: false,
+            cancelled: false,
+            goal_satisfied: None,
+            applied: false,
+            blocked: false,
+            apply_classification: None,
+            // A run that degraded to an unconfined `Auto` check.
+            ran_unconfined: true,
+        };
+
+        // The JSON report a degraded run produces carries the signal verbatim.
+        let mut value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["ran_unconfined"], serde_json::json!(true));
+
+        // A pre-H13 persisted report has no such key: it must load as `false`,
+        // never error — and the deterministic gate fields are untouched.
+        value.as_object_mut().unwrap().remove("ran_unconfined");
+        let legacy: RunReport = serde_json::from_value(value).unwrap();
+        assert!(!legacy.ran_unconfined);
+        assert!(!legacy.blocked);
+        assert_eq!(legacy.goal_satisfied, None);
     }
 
     #[test]
@@ -848,6 +893,7 @@ mod tests {
             applied: false,
             blocked: false,
             apply_classification: None,
+            ran_unconfined: false,
         };
         let store = NerveStore::new(dir.path());
         store.save_report(&report).unwrap();
@@ -894,6 +940,7 @@ mod tests {
             applied: false,
             blocked: false,
             apply_classification: None,
+            ran_unconfined: false,
         };
         let store = NerveStore::new(dir.path());
         store.save_report(&report).unwrap();
