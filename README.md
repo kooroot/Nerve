@@ -718,7 +718,7 @@ Nerve is built around conservative file mutation:
 - `NvPatch` rejects absolute paths, `..` traversal, and symlinked directories that resolve outside the working directory.
 - File writes are staged through sibling temp files and committed with rename.
 - Stored JSON writes use unique same-directory temp files, and patch index updates are serialized with a lock file.
-- Multi-file apply captures pre-apply snapshots and restores them automatically if any file operation fails.
+- Multi-file apply captures byte-exact pre-apply snapshots and restores them automatically if any file operation fails. Patch content itself is UTF-8 text (unified diffs over text files): a binary/non-UTF-8 target is rejected with a clear "unsupported" error atomically — before any file is modified, so a mixed text+binary patch never partially applies — and binary diffs are not supported. The snapshot/rollback layer reads and writes raw bytes, so the restore path stays faithful regardless of the original file's encoding.
 - Created files are removed during rollback.
 - Deleted files are restored from the original content during rollback.
 - Reviewer `BLOCK` can prevent application depending on conflict policy.
