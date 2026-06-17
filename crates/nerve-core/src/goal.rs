@@ -7,6 +7,7 @@ use nerve_types::CheckResult;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Stdio;
+use tempfile::TempDir;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -24,6 +25,11 @@ pub enum GoalError {
     PathInjection(String),
     #[error("check_ulimit invalid: {0}")]
     Ulimit(#[from] UlimitError),
+    // H2: minting the per-check private temp dir failed. Fail closed (→ Fail) —
+    // we never fall back to a broader writable grant or run with a temp dir
+    // outside the sandbox's writable set.
+    #[error("failed to create per-check private temp dir: {0}")]
+    PrivateTmpDir(std::io::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -113,9 +119,21 @@ impl GoalEvaluator {
         // child's real exit status below), or (under `Required` with no backend)
         // refusing to run (→ Fail). It does not promise confined/unconfined
         // exit-code parity; see the `sandbox` module docs. The check runs in
-        // `cwd`, which is always writable; the system temp dir is added so build
-        // tools (cargo/rustc) can write their intermediates.
-        let extra_writable = vec![std::env::temp_dir()];
+        // `cwd`, which is always writable.
+        //
+        // H2: instead of granting the ENTIRE shared system temp (which let
+        // gate-run code read/clobber sibling processes' temp artifacts inside the
+        // jail), confine temp writes to a FRESH per-invocation private dir (0700,
+        // RAII-cleaned). It is the SOLE extra writable root AND the child's
+        // `TMPDIR`, so build tools (cargo/rustc) write their intermediates inside
+        // the single grant. `private_tmp` lives until this fn returns — past the
+        // child's exit/kill — then drops and removes the dir. When the sandbox is
+        // Off none is minted and the child env is untouched (byte-identical).
+        let private_tmp = private_check_tmpdir(&self.sandbox)?;
+        let extra_writable: Vec<PathBuf> = private_tmp
+            .as_ref()
+            .map(|dir| vec![dir.path().to_path_buf()])
+            .unwrap_or_default();
         let (program, args): (String, Vec<String>) =
             match sandbox::decide(&self.sandbox, &self.cwd, &self.goal.check_cmd, &extra_writable) {
                 SandboxDecision::Unconfined { warning } => {
@@ -155,6 +173,16 @@ impl GoalEvaluator {
         }
         for (key, value) in &self.goal.env {
             command.env(key, value);
+        }
+
+        // H2: point the child's `TMPDIR` at the per-check private dir LAST, so it
+        // wins over any inherited/goal env. Under a confining sandbox a `TMPDIR`
+        // outside the writable grant would have its writes denied; pinning it to
+        // the granted private dir keeps build-tool temp writes inside the single
+        // grant. Only set when a private dir was minted (sandbox enabled); Off
+        // leaves the child env untouched.
+        if let Some(dir) = &private_tmp {
+            command.env("TMPDIR", dir.path());
         }
 
         #[cfg(not(unix))]
@@ -244,6 +272,34 @@ impl GoalEvaluator {
             Ok(CheckResult::Fail { reason, progress })
         }
     }
+}
+
+/// H2: per-check writable-temp policy. When the sandbox confines writes, mint a
+/// FRESH private temp dir (0700 via `tempfile`, RAII-cleaned on drop) to serve as
+/// the SOLE extra writable root AND the child's `TMPDIR`, instead of granting the
+/// entire shared system temp. When the sandbox is `Off`, `sandbox::decide`
+/// returns `Unconfined` before it ever reads the extra-writable set, so we mint
+/// nothing and leave the child env untouched — `Off` stays byte-identical to
+/// pre-S5. Failure to create the dir is surfaced (→ `Fail`), never silently
+/// downgraded to a broader grant.
+fn private_check_tmpdir(sandbox: &SandboxConfig) -> Result<Option<TempDir>, GoalError> {
+    if !sandbox.is_enabled() {
+        return Ok(None);
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("nerve-check-")
+        .tempdir()
+        .map_err(GoalError::PrivateTmpDir)?;
+    // `tempfile` creates directories with umask-based perms (commonly 0755), which
+    // would let OTHER local users read/clobber the check's temp. Force owner-only
+    // 0700 so the private grant is actually private. Fail closed on error.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(GoalError::PrivateTmpDir)?;
+    }
+    Ok(Some(dir))
 }
 
 struct OutputCapExceeded(usize);
@@ -587,9 +643,9 @@ mod tests {
     /// keys `Pass` strictly on the child's real exit status; the sandbox adds no
     /// success of its own) — distinct from confined/unconfined exit-code parity,
     /// which is inherently unachievable since confinement is observable (see the
-    /// `sandbox` module docs / codex S5 r4). The evaluator always grants `cwd` +
-    /// the system temp dir as writable, so the nonzero exit from this non-writing
-    /// failing check wraps cleanly and the `progress` parsing path is unaffected.
+    /// `sandbox` module docs / codex S5 r4). The evaluator grants `cwd` + a fresh
+    /// per-check private temp dir as writable (H2), so the nonzero exit from this
+    /// non-writing failing check wraps cleanly and the `progress` path is unaffected.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn goal_evaluator_sandbox_required_preserves_nonzero_fail() {
@@ -612,5 +668,101 @@ mod tests {
             matches!(evaluator.evaluate().await, CheckResult::Fail { .. }),
             "a wrapped failing check must still Fail"
         );
+    }
+
+    // --- H2: per-check private temp dir ---
+
+    /// The per-check temp policy mints NOTHING when the sandbox is `Off` (so the
+    /// child env stays byte-identical to pre-S5), and a fresh 0700 dir when
+    /// confinement is requested — removed by RAII on drop.
+    #[test]
+    fn private_check_tmpdir_minted_only_when_sandbox_enabled() {
+        use nerve_config::SandboxMode;
+        let off = SandboxConfig {
+            mode: SandboxMode::Off,
+            allow_network: false,
+        };
+        assert!(
+            private_check_tmpdir(&off).unwrap().is_none(),
+            "Off must mint no private temp dir"
+        );
+        for mode in [SandboxMode::Auto, SandboxMode::Required] {
+            let cfg = SandboxConfig {
+                mode,
+                allow_network: false,
+            };
+            let dir = private_check_tmpdir(&cfg)
+                .unwrap()
+                .expect("an enabled sandbox must mint a private temp dir");
+            assert!(dir.path().is_dir(), "minted dir must exist");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let bits = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+                assert_eq!(bits, 0o700, "private temp dir must be 0700, got {bits:o}");
+            }
+            let path = dir.path().to_path_buf();
+            drop(dir);
+            assert!(!path.exists(), "RAII drop must remove the private temp dir");
+        }
+    }
+
+    /// H2 end-to-end (macOS real kernel): under a confining sandbox the per-check
+    /// private dir is the child's `TMPDIR` and the SOLE temp grant. A write to
+    /// `$TMPDIR` succeeds; a DIRECT write to a sibling dir outside the grant (what
+    /// the old whole-system-temp grant would have allowed) is denied by the
+    /// kernel and leaves no file — proving the writable surface shrank.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn goal_evaluator_sandbox_confines_temp_to_private_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let sandbox = SandboxConfig {
+            mode: nerve_config::SandboxMode::Required,
+            allow_network: false,
+        };
+        // Inside $TMPDIR (the granted private dir): allowed.
+        let ok = GoalEvaluator::with_options(
+            spec_with_cmd(
+                vec![
+                    "sh",
+                    "-c",
+                    "echo hi > \"$TMPDIR/probe\" && test -f \"$TMPDIR/probe\"",
+                ],
+                30,
+            ),
+            Vec::new(),
+            4096,
+            cwd.clone(),
+            None,
+            sandbox,
+        )
+        .unwrap();
+        assert_eq!(
+            ok.evaluate().await,
+            CheckResult::Pass,
+            "a write inside $TMPDIR must pass under confinement"
+        );
+        // A sibling temp dir, outside cwd and outside the private grant: denied.
+        let sibling = tempfile::tempdir().unwrap();
+        let sibling = std::fs::canonicalize(sibling.path()).unwrap();
+        let escape = sibling.join("escape.txt");
+        let denied = GoalEvaluator::with_options(
+            spec_with_cmd(
+                vec!["sh", "-c", &format!("echo hi > {}", escape.display())],
+                30,
+            ),
+            Vec::new(),
+            4096,
+            cwd,
+            None,
+            sandbox,
+        )
+        .unwrap();
+        assert!(
+            matches!(denied.evaluate().await, CheckResult::Fail { .. }),
+            "a direct write outside the private temp grant must be denied"
+        );
+        assert!(!escape.exists(), "denied write must leave no file");
     }
 }
