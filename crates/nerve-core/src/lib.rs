@@ -3487,6 +3487,152 @@ mod tests {
         assert!(!dir.path().join("mock-output.txt").exists());
     }
 
+    // ===== H18: standing thesis-invariant guards =============================
+    // Mechanize two facets of the safety thesis's negative space that were not
+    // previously pinned by a dedicated test (see `nerve_config::ConfigSource`'s
+    // doc comment for the full checklist). Each maps to a named regression and
+    // turns red if that regression is introduced.
+
+    #[test]
+    fn h18_invariant_run_options_default_is_dry_run() {
+        // Regression guarded: "apply defaulted true". A run built for dry-run
+        // never consents to apply, and attaching an ungranted consent handle is
+        // byte-identical to dry-run. (Complements `apply_consented_only_enables_
+        // from_a_real_grant`; kept as the H18 entry point for the thesis.)
+        let dry = RunOptions::new(false);
+        assert!(!dry.apply);
+        assert!(!dry.apply_consented());
+        assert!(
+            !RunOptions::new(false)
+                .with_apply_grant(ApplyConsent::new())
+                .apply_consented()
+        );
+    }
+
+    // A tournament candidate that BOTH emits a patch (so an apply would write
+    // `mock-output.txt`) and LGTMs its opponent (so the tournament reaches a
+    // terminal-success verdict). This makes the tournament apply seam reachable
+    // with a real patch, so the "not applied" assertion below is non-vacuous.
+    #[derive(Debug)]
+    struct PatchTournamentAdapter {
+        id: &'static str,
+    }
+    #[async_trait::async_trait]
+    impl ModelAdapter for PatchTournamentAdapter {
+        fn id(&self) -> &str {
+            self.id
+        }
+        async fn implement(
+            &self,
+            _task: &Task,
+            _cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            let patch = NvPatch::new(vec![FilePatch::create(
+                "mock-output.txt",
+                "tournament patch\n",
+            )]);
+            Ok(AgentOutput::with_patch(self.id, "tournament patch", patch))
+        }
+        async fn review(
+            &self,
+            _task: &Task,
+            _lead_output: &AgentOutput,
+            _cwd: &Path,
+            _strictness: &str,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<ReviewerFeedback> {
+            Ok(ReviewerFeedback::lgtm(self.id, "LGTM"))
+        }
+        async fn refine(
+            &self,
+            _task: &Task,
+            _previous_output: &AgentOutput,
+            _feedback: &ReviewerFeedback,
+            _cwd: &Path,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentOutput> {
+            let patch = NvPatch::new(vec![FilePatch::create(
+                "mock-output.txt",
+                "tournament refined\n",
+            )]);
+            Ok(AgentOutput::with_patch(self.id, "tournament refine", patch))
+        }
+    }
+
+    // Shared body for the disk-approval invariant: forge an on-disk
+    // `ApprovalGrant` claiming apply-consent for the run, drive the run to a
+    // terminal-success verdict with apply=false and NO in-memory grant, and
+    // assert it still does not apply. Used for EVERY production apply seam so a
+    // regression wiring any one gate to read disk approvals is caught.
+    async fn assert_forged_disk_approval_never_applies(
+        config: &Config,
+        adapters: &[Box<dyn ModelAdapter>],
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("disk approval must be ignored", dir.path());
+        // Forge an on-disk approval record for this run id (apply_consent=true).
+        crate::store::NerveStore::new(dir.path())
+            .record_approval(&ApprovalGrant::apply(task.id.clone()))
+            .unwrap();
+
+        // Dry-run, NO in-memory grant — the only authoritative consent surface.
+        let report = run_synaptic_loop(task, config, adapters, RunOptions::new(false))
+            .await
+            .unwrap();
+
+        // Accepted, yet NOT applied: the disk grant is inert. The LGTM assertion
+        // keeps the no-apply assertion meaningful (the run really reached the
+        // apply seam with a patch present).
+        assert_eq!(
+            report.final_feedback.verdict,
+            Verdict::Lgtm,
+            "run must reach acceptance so the no-apply assertion is non-vacuous"
+        );
+        assert!(
+            !report.applied,
+            "a forged on-disk approval must never make an accepted dry-run apply"
+        );
+        assert!(!dir.path().join("mock-output.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn h18_invariant_disk_approval_record_is_never_read_by_apply_gate() {
+        // Regression guarded: "approvals read by the gate". The lead is an
+        // arbitrary subprocess with write access to `.nerve/` in `task.cwd`; if
+        // any apply gate ever consulted the on-disk `ApprovalGrant` the lead
+        // could forge operator consent and self-escalate dry-run -> apply. There
+        // are TWO production apply seams (consensus `run_synaptic_loop_inner` and
+        // `run_tournament_strategy`); exercise BOTH so a regression in either is
+        // caught (R2 of the H18 review found a single-seam test missed tournament).
+
+        // Consensus seam.
+        let consensus_adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(MockAdapter::lead()),
+            Box::new(MockAdapter::reviewer()),
+        ];
+        assert_forged_disk_approval_never_applies(&consensus_config(), &consensus_adapters).await;
+
+        // Tournament seam (a SEPARATE apply gate).
+        let tournament_config = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "tournament",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority"
+              },
+              "roles": { "architect": "cand-a", "reviewer": "cand-b" },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        let tournament_adapters: Vec<Box<dyn ModelAdapter>> = vec![
+            Box::new(PatchTournamentAdapter { id: "cand-a" }),
+            Box::new(PatchTournamentAdapter { id: "cand-b" }),
+        ];
+        assert_forged_disk_approval_never_applies(&tournament_config, &tournament_adapters).await;
+    }
+
     // --- S12: auto-mode classifier gate (implement↔apply) --------------------
 
     fn classifier_cfg(

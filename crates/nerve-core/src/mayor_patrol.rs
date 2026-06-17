@@ -2126,4 +2126,37 @@ mod tests {
         // Drain consumes: a second drain is empty.
         assert!(coord.drain_mail("p1").unwrap().is_empty());
     }
+
+    // ===== H18: standing thesis-invariant guard ==============================
+    #[test]
+    fn h18_invariant_mailkind_is_a_closed_set_with_no_consent_variant() {
+        // Regression guarded: "MailKind widened with a consent variant". The
+        // mailbox is coordination metadata ONLY; it must never become a covert
+        // channel by which the lead signals apply/consent (S11: apply consent is
+        // unforgeable in-memory state, never a disk/message signal). The match
+        // below is deliberately EXHAUSTIVE with no wildcard arm — adding any
+        // variant to `MailKind` (e.g. an `Approve`/`Consent` kind) makes this
+        // fail to COMPILE, which is the guard. We also pin the on-disk serde
+        // tags so the set cannot be widened by an alias.
+        fn tag_of(kind: MailKind) -> &'static str {
+            match kind {
+                MailKind::Note => "note",
+                MailKind::Progress => "progress",
+                MailKind::Reclaimed => "reclaimed",
+            }
+        }
+        for (kind, tag) in [
+            (MailKind::Note, "note"),
+            (MailKind::Progress, "progress"),
+            (MailKind::Reclaimed, "reclaimed"),
+        ] {
+            assert_eq!(tag_of(kind), tag);
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{tag}\""));
+            assert_eq!(serde_json::from_str::<MailKind>(&json).unwrap(), kind);
+        }
+        // Nothing outside the closed set parses — no covert consent variant.
+        assert!(serde_json::from_str::<MailKind>("\"approve\"").is_err());
+        assert!(serde_json::from_str::<MailKind>("\"consent\"").is_err());
+    }
 }

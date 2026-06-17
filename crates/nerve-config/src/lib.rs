@@ -18,6 +18,41 @@ const DEFAULT_CONFIG: &str = include_str!("../../../nerve.config.json");
 /// that enables an *executing* built-in verifier (S4 `Auto`/`Command` mode) is
 /// operator-controlled (trusted) or project-controlled — a cloned repo could
 /// ship `./nerve.config.json` to opt itself into running code.
+///
+/// # H18 — standing thesis invariants (reviewer checklist)
+///
+/// Nerve's safety thesis has a *negative space* that is easy to regress one
+/// field at a time: an active deterministic `/goal` check is **reject-authoritative**
+/// — a failing check always blocks acceptance and is never overridden by a
+/// reviewer LGTM or by any telemetry, and absent an active check the loop warns
+/// loudly that acceptance then rests on the reviewer verdict — and no telemetry
+/// (progress hints, the ledger, checkpoints, disk approval records) is ever an
+/// acceptance authority; execution and apply are **Off / dry-run by default** and
+/// a **loud opt-in**; repo-local (`Project`) config can NEVER opt the operator
+/// into code execution without out-of-band consent the repo cannot forge; the
+/// inter-agent mailbox is a **closed** channel with no consent variant; and disk
+/// approval records are **audit-only**, never read by the apply gate. H18
+/// mechanizes that negative space as standing invariant tests (run by CI's
+/// `cargo test`), each mapped to the regression it would catch:
+///
+/// - defaults stay Off / dry-run — `h18_invariant_execution_and_apply_defaults_remain_off`
+///   (nerve-config), `h18_invariant_run_options_default_is_dry_run` (nerve-core);
+/// - `Project`-sourced execution needs operator consent —
+///   `h18_invariant_project_sourced_execution_requires_operator_consent` (nerve-config),
+///   gated here by [`Config::builtin_verifier_exec_trusted`];
+/// - no apply gate (consensus AND tournament seams) reads `.nerve/approvals/` —
+///   `h18_invariant_disk_approval_record_is_never_read_by_apply_gate` (nerve-core);
+/// - `MailKind` stays closed (no consent variant) —
+///   `h18_invariant_mailkind_is_a_closed_set_with_no_consent_variant` (nerve-core).
+///
+/// **Reviewer rule for any NEW execution-enabling config field or disk-backed
+/// channel:** it MUST route its trust decision through this `ConfigSource`
+/// provenance (the [`Config::builtin_verifier_exec_trusted`] pattern: a `Project`
+/// source is refused unless the operator passes explicit consent). This is a
+/// *documented reviewer gate*, not an automated AST check — a brand-new surface
+/// that forgets to consult provenance is NOT auto-detected (grep-not-AST); the
+/// checklist plus the per-surface invariant tests above are the mechanism. Add a
+/// new surface ⇒ add its provenance routing AND its standing invariant test here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConfigSource {
     /// Repo-local `./nerve.config.json` — authored by whoever controls the
@@ -2833,5 +2868,71 @@ mod tests {
             }"#,
         );
         assert!(ok.is_ok());
+    }
+
+    // ===== H18: standing thesis-invariant guards =====================
+    // These pin the safety thesis's negative space (see `ConfigSource`'s
+    // doc comment). Several of these properties were already covered
+    // incidentally by the per-feature tests above; H18 consolidates the
+    // ones that gate code execution / apply into one documented, regression-
+    // mapped place so a future config field cannot silently weaken a default
+    // or a provenance gate without a clearly-named test going red. CI runs
+    // these via `cargo test`; there is no separate lint binary.
+
+    #[test]
+    fn h18_invariant_execution_and_apply_defaults_remain_off() {
+        // Regression guarded: "default flipped to On" / "apply defaulted true".
+        // The OS sandbox and the built-in verifier both default Off, and the
+        // shipped config opts nobody into repo-code execution or non-dry-run
+        // apply. Flipping any `#[default]` (or the embedded nerve.config.json)
+        // turns this red.
+        assert_eq!(SandboxMode::default(), SandboxMode::Off);
+        let sandbox = SandboxConfig::default();
+        assert_eq!(sandbox.mode, SandboxMode::Off);
+        assert!(!sandbox.allow_network);
+        assert!(!sandbox.strict);
+        assert!(!sandbox.is_enabled());
+
+        assert_eq!(BuiltinVerifierMode::default(), BuiltinVerifierMode::Off);
+        assert_eq!(BuiltinVerifierConfig::default().mode, BuiltinVerifierMode::Off);
+
+        let shipped = Config::from_json_str(DEFAULT_CONFIG).unwrap();
+        assert_eq!(
+            shipped.orchestration.builtin_verifier.mode,
+            BuiltinVerifierMode::Off
+        );
+        assert_eq!(shipped.orchestration.sandbox.mode, SandboxMode::Off);
+        // Apply is dry-run by default: worktree-isolated apply is opt-in, and
+        // nothing here turns the operator's `--apply`/grant into a default.
+        assert!(!shipped.orchestration.worktree_apply);
+    }
+
+    #[test]
+    fn h18_invariant_project_sourced_execution_requires_operator_consent() {
+        // Regression guarded: weakening the provenance gate (e.g. mapping
+        // `ConfigSource::Project => true`). A repo-local config can never be
+        // trusted to execute code without out-of-band operator consent, while
+        // operator-controlled sources are trusted. This is the typed gate that
+        // every NEW execution-enabling surface must route through.
+        for source in [ConfigSource::User, ConfigSource::Default] {
+            let mut cfg = Config::from_json_str(DEFAULT_CONFIG).unwrap();
+            cfg.source = source;
+            assert!(
+                cfg.builtin_verifier_exec_trusted(false),
+                "operator-controlled source {source:?} must be trusted without extra consent"
+            );
+            assert!(cfg.builtin_verifier_exec_trusted(true));
+        }
+
+        let mut project = Config::from_json_str(DEFAULT_CONFIG).unwrap();
+        project.source = ConfigSource::Project;
+        assert!(
+            !project.builtin_verifier_exec_trusted(false),
+            "a repo-local (Project) config must NOT be trusted to execute code without consent"
+        );
+        assert!(
+            project.builtin_verifier_exec_trusted(true),
+            "explicit out-of-band operator consent re-enables a Project source"
+        );
     }
 }
