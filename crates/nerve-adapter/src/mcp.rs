@@ -43,14 +43,16 @@
 //! Only the stdio transport is supported in v1.0 ([`McpTransport::Stdio`]).
 
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use nerve_types::{
-    McpReadOnlyPosture, McpRole, McpServerSpec, McpToolCall, McpToolInfo, McpToolResult,
-    McpTransport,
+    McpArgumentPolicy, McpReadOnlyPosture, McpRole, McpServerSpec, McpToolArgRules, McpToolCall,
+    McpToolInfo, McpToolResult, McpTransport,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -105,6 +107,8 @@ pub enum McpError {
          add it to `allowed_tools` or select the legacy denylist posture)"
     )]
     ToolNotReadOnly(String),
+    #[error("tool `{tool}` rejected by argument policy (H11): {reason}")]
+    ArgumentPolicy { tool: String, reason: String },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("spawn failed: {0}")]
@@ -135,6 +139,13 @@ pub struct McpClient {
     tools_cache: RwLock<Vec<McpToolInfo>>,
     write_tool_patterns: Vec<String>,
     read_only_posture: McpReadOnlyPosture,
+    /// H11: optional per-tool argument policy applied after name gating. Default
+    /// is empty (inert); set via [`McpClient::with_argument_policy`].
+    argument_policy: McpArgumentPolicy,
+    /// Project root used to confine path-typed arguments under the H11 policy.
+    /// `None` when no policy is configured; a declared path arg with no root
+    /// fails CLOSED (see [`enforce_argument_policy`]).
+    project_root: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -170,7 +181,24 @@ impl McpClient {
             tools_cache: RwLock::new(Vec::new()),
             write_tool_patterns,
             read_only_posture,
+            argument_policy: McpArgumentPolicy::default(),
+            project_root: None,
         }
+    }
+
+    /// Attach an H11 per-tool argument policy and the project root it confines
+    /// path arguments to. Additive and monotone-restrictive: tools without an
+    /// entry in `policy` are unaffected, and the policy can only ever REJECT a
+    /// call (never admit one name gating refused). The empty policy is inert, so
+    /// callers may apply this unconditionally.
+    pub fn with_argument_policy(
+        mut self,
+        policy: McpArgumentPolicy,
+        project_root: PathBuf,
+    ) -> Self {
+        self.argument_policy = policy;
+        self.project_root = Some(project_root);
+        self
     }
 
     /// Spawn the configured server, run the `initialize` handshake, list the
@@ -405,6 +433,24 @@ impl McpClient {
             }
         }
 
+        // H11 argument policy: defense-in-depth on top of name gating. Runs for
+        // BOTH read-only and non-read-only servers (an argument can be dangerous
+        // either way) and only ever REJECTS — a tool with no policy entry is
+        // unconstrained, so this never widens what name gating already admitted.
+        if let Some(rules) = self.argument_policy.tools.get(&call.tool)
+            && let Err(reason) = enforce_argument_policy(
+                &call.tool,
+                rules,
+                &call.arguments,
+                self.project_root.as_deref(),
+            )
+        {
+            return Err(McpError::ArgumentPolicy {
+                tool: call.tool.clone(),
+                reason,
+            });
+        }
+
         let start = std::time::Instant::now();
         let params = json!({
             "name": call.tool,
@@ -628,6 +674,121 @@ pub fn read_only_admits(posture: McpReadOnlyPosture, allowlisted: bool, evidence
     }
 }
 
+/// H11: enforce a single tool's argument [`McpToolArgRules`] against the JSON
+/// `arguments` of a call. Pure (no I/O, no live client) so the policy logic is
+/// unit-testable. Returns `Ok(())` to proceed to the SAME dispatch as before, or
+/// `Err(reason)` to REJECT — it never admits a call name gating refused.
+///
+/// - For each `path_args` key whose value is a string, the path must resolve
+///   inside `project_root` (see [`path_is_within_root`]). A declared path arg with
+///   no `project_root` configured fails CLOSED (we refuse rather than skip the
+///   confinement the operator asked for).
+/// - For each `deny_substrings` key whose value is a string, the value must not
+///   contain any listed substring (ASCII case-insensitive).
+///
+/// Keys that are absent or whose value is not a string are not checked by that
+/// rule (the policy constrains only arguments the call actually supplies), except
+/// for the fail-closed missing-root case above.
+pub fn enforce_argument_policy(
+    tool: &str,
+    rules: &McpToolArgRules,
+    arguments: &Value,
+    project_root: Option<&Path>,
+) -> Result<(), String> {
+    for key in &rules.path_args {
+        let Some(Value::String(raw)) = arguments.get(key) else {
+            continue;
+        };
+        // Fail closed: the operator declared a path-confinement rule but we have
+        // no root to confine against — refuse rather than silently allow.
+        let Some(root) = project_root else {
+            return Err(format!(
+                "path argument `{key}` is policy-confined for tool `{tool}` but no project \
+                 root is configured to confine it to"
+            ));
+        };
+        if !path_is_within_root(raw, root) {
+            return Err(format!(
+                "path argument `{key}` = `{raw}` escapes the project root `{}`",
+                root.display()
+            ));
+        }
+    }
+    for (key, needles) in &rules.deny_substrings {
+        let Some(Value::String(raw)) = arguments.get(key) else {
+            continue;
+        };
+        let haystack = raw.to_ascii_lowercase();
+        for needle in needles {
+            if !needle.is_empty() && haystack.contains(&needle.to_ascii_lowercase()) {
+                return Err(format!(
+                    "argument `{key}` contains denied substring `{needle}`"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Lexically decide whether `candidate` stays within `root`, WITHOUT touching the
+/// filesystem (TOCTOU-free; works for not-yet-created paths). A symlink inside
+/// `root` that points outward is NOT followed — this is defense-in-depth, not a
+/// complete capability model (documented on [`McpToolArgRules::path_args`]).
+///
+/// A candidate that begins with a filesystem **anchor** — a Unix root (`/…`), or
+/// on Windows a drive prefix (`C:…`) or a rooted path (`\…`) — is matched from its
+/// OWN anchor and must reproduce the root's full prefix. A purely-relative
+/// candidate (only `Normal`/`.`/`..` components) is anchored at the root. This
+/// split is load-bearing on Windows: `is_absolute()` is FALSE for drive-relative
+/// (`C:foo`) and rooted (`\foo`) paths, yet neither anchors under our root (they
+/// resolve against the process's per-drive / current-drive cwd), so treating them
+/// as relative would let them pass confinement while pointing elsewhere. Routing
+/// by the leading anchor sends them through the prefix check, which rejects them.
+///
+/// Either way the components are walked against a fixed `root_depth` boundary: any
+/// `..` that would pop at or below the boundary is REJECTED as an escape — even
+/// when later components would textually re-enter the root (`../../<root-tail>/x`).
+fn path_is_within_root(candidate: &str, root: &Path) -> bool {
+    // `root` is the trusted cwd (absolute, no `.`/`..` to collapse); take its
+    // components verbatim as the prefix every in-root path must carry.
+    let root_components: Vec<OsString> = root
+        .components()
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+    let root_depth = root_components.len();
+    let candidate = Path::new(candidate);
+
+    // Anchored (Prefix/RootDir-led) candidates build from their own anchor;
+    // purely-relative candidates build on top of the root.
+    let anchored = matches!(
+        candidate.components().next(),
+        Some(Component::Prefix(_) | Component::RootDir)
+    );
+    let mut stack: Vec<OsString> = if anchored {
+        Vec::new()
+    } else {
+        root_components.clone()
+    };
+    for component in candidate.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // A `..` at or below the root boundary climbs above the root: a
+                // real escape, regardless of any later re-entry. Fail closed.
+                if stack.len() <= root_depth {
+                    return false;
+                }
+                stack.pop();
+            }
+            other => stack.push(other.as_os_str().to_os_string()),
+        }
+    }
+    // Relative inputs are within root by construction (never popped below
+    // root_depth); for anchored inputs this is the actual prefix check, which
+    // also rejects a wrong/absent drive or a rooted-but-driveless path.
+    stack.starts_with(&root_components)
+}
+
 /// Returns true when an MCP server bound to `spec` should be visible to a
 /// caller acting as `role`. `Both` is visible to either reviewer or lead.
 pub fn role_matches(spec_role: &McpRole, requested: &McpRole) -> bool {
@@ -659,12 +820,15 @@ impl McpRegistry {
     /// resulting client. If any server fails to start, all previously-started
     /// servers are shut down before the error is returned — partial state is
     /// never observable outside this call.
+    #[allow(clippy::too_many_arguments)]
     pub async fn register_all(
         &mut self,
         specs: &[McpServerSpec],
         write_patterns: &[String],
         allow_tools: &[String],
         read_only_posture: McpReadOnlyPosture,
+        argument_policy: &McpArgumentPolicy,
+        project_root: &Path,
     ) -> Result<(), McpError> {
         let patterns = if write_patterns.is_empty() {
             default_write_tool_patterns()
@@ -674,11 +838,10 @@ impl McpRegistry {
         for spec in specs {
             let mut spec = spec.clone();
             scope_mcp_spec_to_allowlist(&mut spec, allow_tools);
-            let client = Arc::new(McpClient::new(
-                spec.clone(),
-                patterns.clone(),
-                read_only_posture,
-            ));
+            let client = Arc::new(
+                McpClient::new(spec.clone(), patterns.clone(), read_only_posture)
+                    .with_argument_policy(argument_policy.clone(), project_root.to_path_buf()),
+            );
             if let Err(err) = client.start().await {
                 // Tear down everything we already started so we don't leak
                 // a half-initialised registry.
@@ -886,6 +1049,182 @@ mod tests {
         // The hole the legacy posture leaves open is CLOSED by the new default.
         assert!(!read_only_admits(DenyByDefault, false, false));
         assert!(read_only_admits(LegacyDenylist, false, false));
+    }
+
+    // --- H11 argument policy --------------------------------------------
+
+    fn path_rules(keys: &[&str]) -> McpToolArgRules {
+        McpToolArgRules {
+            path_args: keys.iter().map(|s| s.to_string()).collect(),
+            deny_substrings: Default::default(),
+        }
+    }
+
+    #[test]
+    fn path_is_within_root_lexically_confines() {
+        let root = Path::new("/srv/project");
+        // In-root relative and absolute paths are admitted, including ones with
+        // interior `.`/`..` that resolve back inside.
+        assert!(path_is_within_root("src/main.rs", root));
+        assert!(path_is_within_root("./src/../src/lib.rs", root));
+        assert!(path_is_within_root("/srv/project/sub/file", root));
+        assert!(path_is_within_root("a/b/../c", root));
+        assert!(path_is_within_root(".", root)); // the root itself
+        // Traversal that escapes the root is rejected.
+        assert!(!path_is_within_root("../outside", root));
+        assert!(!path_is_within_root("src/../../etc/passwd", root));
+        // Absolute path outside the root is rejected.
+        assert!(!path_is_within_root("/etc/passwd", root));
+        // A sibling sharing a NAME PREFIX must not count as inside — confinement
+        // is component-wise, not raw-string, starts_with.
+        assert!(!path_is_within_root("/srv/project-evil/x", root));
+    }
+
+    #[test]
+    fn path_is_within_root_rejects_escape_and_reentry() {
+        // Regression: a `..` chain that climbs ABOVE the root and then textually
+        // re-enters it must be REJECTED. A naive join+normalize+starts_with would
+        // admit these (the `..` pops the root's own components, then matching
+        // components are re-pushed), contradicting the documented invariant.
+        let root = Path::new("/srv/project");
+        // Relative escape-and-reentry (the reviewer's exact repro).
+        assert!(!path_is_within_root("../../srv/project/secret", root));
+        assert!(!path_is_within_root("../project/secret", root));
+        // Absolute escape-and-reentry resolves textually inside but traverses
+        // above the root to get there — also rejected.
+        assert!(!path_is_within_root("/srv/project/../../srv/project/secret", root));
+        // A leading `..` above the filesystem anchor is likewise rejected.
+        assert!(!path_is_within_root("/../srv/project/x", root));
+        // Sanity: an interior `..` that never climbs above root is still admitted.
+        assert!(path_is_within_root("a/../b", root));
+        assert!(path_is_within_root("/srv/project/a/../b", root));
+    }
+
+    // Windows path confinement. `is_absolute()` is FALSE for drive-relative
+    // (`C:foo`) and rooted (`\foo`) paths, yet neither anchors under our root —
+    // routing by the leading filesystem anchor (not `is_absolute`) must reject
+    // them. Runs only on Windows (path parsing is platform-specific); cross-compile
+    // checks compile it on the other platforms.
+    #[cfg(windows)]
+    #[test]
+    fn path_is_within_root_confines_windows_rooted_and_drive_relative() {
+        let root = Path::new(r"C:\srv\project");
+        // In-root absolute and relative paths are admitted.
+        assert!(path_is_within_root(r"C:\srv\project\sub\file", root));
+        assert!(path_is_within_root(r"sub\file", root));
+        assert!(path_is_within_root(r"a\..\b", root));
+        // Rooted (no drive) `\temp` resolves on the current drive's root, NOT under
+        // the project root → rejected.
+        assert!(!path_is_within_root(r"\temp", root));
+        assert!(!path_is_within_root(r"\srv\project\x", root));
+        // Drive-relative `C:temp` resolves against the per-drive cwd → rejected.
+        assert!(!path_is_within_root(r"C:temp", root));
+        assert!(!path_is_within_root(r"C:srv\project\x", root));
+        // A different drive is outside the root.
+        assert!(!path_is_within_root(r"D:\srv\project\x", root));
+        // Absolute outside, prefix-sibling, and escape-and-reentry are all rejected.
+        assert!(!path_is_within_root(r"C:\Windows\system32", root));
+        assert!(!path_is_within_root(r"C:\srv\project-evil\x", root));
+        assert!(!path_is_within_root(r"..\..\srv\project\secret", root));
+        assert!(!path_is_within_root(r"C:\srv\project\..\..\srv\project\secret", root));
+    }
+
+    #[test]
+    fn enforce_argument_policy_rejects_path_traversal() {
+        let rules = path_rules(&["path"]);
+        let root = Path::new("/srv/project");
+        // In-root path proceeds to the same dispatch as before.
+        assert!(
+            enforce_argument_policy(
+                "read_file",
+                &rules,
+                &json!({ "path": "docs/readme.md" }),
+                Some(root),
+            )
+            .is_ok()
+        );
+        // `..` escape is rejected.
+        let err = enforce_argument_policy(
+            "read_file",
+            &rules,
+            &json!({ "path": "../../etc/passwd" }),
+            Some(root),
+        )
+        .unwrap_err();
+        assert!(err.contains("escapes the project root"), "got: {err}");
+        // Absolute escape is rejected.
+        assert!(
+            enforce_argument_policy(
+                "read_file",
+                &rules,
+                &json!({ "path": "/etc/passwd" }),
+                Some(root),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn enforce_argument_policy_fails_closed_without_root() {
+        let rules = path_rules(&["path"]);
+        // A declared path arg with NO configured root must REFUSE, not skip the
+        // confinement the operator asked for.
+        let err =
+            enforce_argument_policy("read_file", &rules, &json!({ "path": "anything" }), None)
+                .unwrap_err();
+        assert!(err.contains("no project root"), "got: {err}");
+        // But if the call doesn't actually supply that arg, there is nothing to
+        // confine, so the missing root is irrelevant → admitted.
+        assert!(
+            enforce_argument_policy("read_file", &rules, &json!({ "other": "x" }), None).is_ok()
+        );
+    }
+
+    #[test]
+    fn enforce_argument_policy_only_checks_string_args() {
+        let rules = path_rules(&["path"]);
+        let root = Path::new("/srv/project");
+        // Absent key → not checked.
+        assert!(enforce_argument_policy("t", &rules, &json!({}), Some(root)).is_ok());
+        // Non-string value → not checked (the rule only constrains string paths).
+        assert!(
+            enforce_argument_policy("t", &rules, &json!({ "path": 42 }), Some(root)).is_ok()
+        );
+    }
+
+    #[test]
+    fn enforce_argument_policy_denies_substrings_case_insensitively() {
+        let rules = McpToolArgRules {
+            path_args: Vec::new(),
+            deny_substrings: std::collections::BTreeMap::from([(
+                "cmd".to_string(),
+                vec![";".to_string(), "RM ".to_string()],
+            )]),
+        };
+        // Clean value proceeds (no path args → no root needed).
+        assert!(enforce_argument_policy("sh", &rules, &json!({ "cmd": "ls -la" }), None).is_ok());
+        // Denied substring, ASCII case-insensitive ("rm " vs configured "RM ").
+        let err = enforce_argument_policy("sh", &rules, &json!({ "cmd": "rm -rf /" }), None)
+            .unwrap_err();
+        assert!(err.contains("denied substring"), "got: {err}");
+        // Shell metacharacter denylist.
+        assert!(enforce_argument_policy("sh", &rules, &json!({ "cmd": "a; b" }), None).is_err());
+    }
+
+    #[test]
+    fn enforce_argument_policy_empty_rules_admit_everything() {
+        // An entry with neither path_args nor deny_substrings is inert: anything
+        // goes, even with no root configured.
+        let rules = McpToolArgRules::default();
+        assert!(
+            enforce_argument_policy(
+                "t",
+                &rules,
+                &json!({ "path": "/etc/passwd", "cmd": "rm -rf /" }),
+                None,
+            )
+            .is_ok()
+        );
     }
 
     // --- annotation parsing ---------------------------------------------

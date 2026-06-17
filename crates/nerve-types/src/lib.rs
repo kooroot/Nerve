@@ -390,6 +390,70 @@ pub enum McpReadOnlyPosture {
     LegacyDenylist,
 }
 
+/// H11: optional per-tool MCP **argument** policy applied AFTER name gating
+/// (allowlist + read-only posture + write-pattern veto), as defense-in-depth on
+/// top of them. Name gating only checks WHICH tool is called; this constrains the
+/// ARGUMENTS a tool receives, since a name-admitted tool may still accept a
+/// dangerous path or command-like argument.
+///
+/// Strictly ADDITIVE and MONOTONE-RESTRICTIVE: a tool with no entry here is
+/// unconstrained (byte-for-byte the pre-H11 behavior), and a present entry can
+/// only ever REJECT a call — there is no value that admits a name-gated-rejected
+/// tool or relaxes any existing check. Because it can only tighten, a repo-local
+/// (`Project`-source) config that enables it cannot opt the operator into broader
+/// tool access or looser arguments than the no-policy baseline (mirroring the
+/// `SandboxConfig.strict` rationale), so — unlike the weaker `LegacyDenylist`
+/// posture — it needs no operator-consent provenance gate.
+///
+/// Lives in `nerve-types` so `nerve-adapter` (which depends only on `nerve-types`)
+/// can hold the resolved policy without depending on `nerve-config`.
+///
+/// `deny_unknown_fields`: a misspelled rule key would otherwise deserialize into
+/// an *inert* rule, silently leaving the argument the operator meant to confine
+/// UNconfined (a fail-open footgun for a security control). Rejecting unknown
+/// keys makes a typo a loud parse error instead — matching the fail-closed posture
+/// of the top-level `McpConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct McpArgumentPolicy {
+    /// Per-tool argument rules keyed by tool name. An empty map (the default)
+    /// means no argument policy — every tool is unconstrained, as before H11.
+    #[serde(default)]
+    pub tools: BTreeMap<String, McpToolArgRules>,
+}
+
+/// Argument-validation rules for a single MCP tool (see [`McpArgumentPolicy`]).
+///
+/// Each rule keys off a JSON object key in [`McpToolCall::arguments`]. A key that
+/// is absent, or whose value is not a string, is simply not checked by that rule
+/// (the policy only constrains arguments the call actually supplies) — EXCEPT
+/// that a declared path argument with no configured project root fails CLOSED.
+///
+/// `deny_unknown_fields` here too: a typo like `path_arg` must not silently
+/// degrade a confinement rule to a no-op (see [`McpArgumentPolicy`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct McpToolArgRules {
+    /// Argument keys whose string values are treated as filesystem paths and must
+    /// resolve INSIDE the project root: an absolute path outside the root, or a
+    /// relative path whose `..` climbs above the root (even one that later
+    /// re-enters via matching components), is rejected. Matching is LEXICAL via
+    /// native [`std::path`] semantics (no filesystem access, so it is TOCTOU-free
+    /// and works for not-yet-created paths); a symlink inside the root that points
+    /// outward is NOT resolved, and a value is NOT parsed as a URI — a URI-style
+    /// string like `file:///etc/passwd` is treated as the relative filename
+    /// `file:/etc/passwd` (confined under the root), so if a server resolves a
+    /// `path_args` key as a URI rather than a path this lexical check does not
+    /// confine it. This is defense-in-depth, not a complete capability model.
+    #[serde(default)]
+    pub path_args: Vec<String>,
+    /// Argument keys whose string values must NOT contain any of the listed
+    /// substrings (ASCII case-insensitive) — a coarse denylist for command-like
+    /// arguments (e.g. refusing `;`, `rm `, `sudo`). Purely subtractive.
+    #[serde(default)]
+    pub deny_substrings: BTreeMap<String, Vec<String>>,
+}
+
 /// Default transport for newly-defined MCP server specs (stdio in v1.0).
 pub fn default_mcp_transport() -> McpTransport {
     McpTransport::Stdio
@@ -823,6 +887,58 @@ mod tests {
         let wire = serde_json::to_string(&result).expect("serialize tool result");
         let decoded: McpToolResult = serde_json::from_str(&wire).expect("decode tool result");
         assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn mcp_argument_policy_defaults_empty_and_round_trips() {
+        // Absent map → inert default (no per-tool rules).
+        let empty: McpArgumentPolicy =
+            serde_json::from_str("{}").expect("decode empty argument policy");
+        assert!(empty.tools.is_empty());
+        assert_eq!(empty, McpArgumentPolicy::default());
+
+        // A populated policy round-trips, including both rule kinds and the
+        // absent-field defaults.
+        let wire = json!({
+            "tools": {
+                "read_file": { "path_args": ["path", "uri"] },
+                "query": { "deny_substrings": { "sql": [";", "drop"] } },
+            }
+        })
+        .to_string();
+        let policy: McpArgumentPolicy =
+            serde_json::from_str(&wire).expect("decode argument policy");
+        let read = &policy.tools["read_file"];
+        assert_eq!(read.path_args, vec!["path".to_string(), "uri".to_string()]);
+        assert!(read.deny_substrings.is_empty(), "absent deny_substrings defaults empty");
+        let query = &policy.tools["query"];
+        assert!(query.path_args.is_empty(), "absent path_args defaults empty");
+        assert_eq!(query.deny_substrings["sql"], vec![";".to_string(), "drop".to_string()]);
+
+        let reser: McpArgumentPolicy = serde_json::from_str(
+            &serde_json::to_string(&policy).expect("serialize argument policy"),
+        )
+        .expect("re-decode argument policy");
+        assert_eq!(reser, policy);
+    }
+
+    #[test]
+    fn mcp_argument_policy_rejects_typoed_rule_keys() {
+        // A misspelled rule key must fail LOUDLY, not silently produce an inert
+        // (unconfined) rule — `deny_unknown_fields` on the nested structs.
+        let typo_rule = r#"{ "tools": { "read_file": { "path_arg": ["path"] } } }"#;
+        assert!(
+            serde_json::from_str::<McpArgumentPolicy>(typo_rule).is_err(),
+            "typo'd `path_arg` must be rejected, not silently inert"
+        );
+        let typo_top = r#"{ "tool": {} }"#;
+        assert!(
+            serde_json::from_str::<McpArgumentPolicy>(typo_top).is_err(),
+            "typo'd top-level `tool` must be rejected"
+        );
+        // The correctly-spelled form still parses.
+        let ok = r#"{ "tools": { "read_file": { "path_args": ["path"] } } }"#;
+        assert!(serde_json::from_str::<McpArgumentPolicy>(ok).is_ok());
     }
 
     #[test]

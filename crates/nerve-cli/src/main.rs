@@ -1125,7 +1125,14 @@ async fn run_mcp_subcommand(command: McpCommand) -> Result<()> {
         McpCommand::ListTools { json } => {
             let mut registry = McpRegistry::new();
             if let Err(err) = registry
-                .register_all(&mcp.servers, &mcp.write_tool_patterns, &mcp.allow_tools, posture)
+                .register_all(
+                    &mcp.servers,
+                    &mcp.write_tool_patterns,
+                    &mcp.allow_tools,
+                    posture,
+                    &mcp.argument_policy,
+                    &cwd,
+                )
                 .await
             {
                 anyhow::bail!("failed to start MCP servers: {err}");
@@ -1173,7 +1180,8 @@ async fn run_mcp_subcommand(command: McpCommand) -> Result<()> {
             } else {
                 mcp.write_tool_patterns.clone()
             };
-            let client = McpClient::new(spec, patterns, posture);
+            let client = McpClient::new(spec, patterns, posture)
+                .with_argument_policy(mcp.argument_policy.clone(), cwd.to_path_buf());
             client
                 .start()
                 .await
@@ -3610,7 +3618,14 @@ async fn handle_mcp_slash(raw_command: &str, args: Vec<&str>, cwd: &Path) -> Res
         "list" => {
             let mut registry = McpRegistry::new();
             registry
-                .register_all(&mcp.servers, &mcp.write_tool_patterns, &mcp.allow_tools, posture)
+                .register_all(
+                    &mcp.servers,
+                    &mcp.write_tool_patterns,
+                    &mcp.allow_tools,
+                    posture,
+                    &mcp.argument_policy,
+                    cwd,
+                )
                 .await
                 .context("/mcp list: failed to start configured servers")?;
             for (name, client) in registry.iter() {
@@ -3659,7 +3674,8 @@ async fn handle_mcp_slash(raw_command: &str, args: Vec<&str>, cwd: &Path) -> Res
             } else {
                 mcp.write_tool_patterns.clone()
             };
-            let client = McpClient::new(spec, patterns, posture);
+            let client = McpClient::new(spec, patterns, posture)
+                .with_argument_policy(mcp.argument_policy.clone(), cwd.to_path_buf());
             client.start().await?;
             let result = client
                 .call_tool(McpToolCall {

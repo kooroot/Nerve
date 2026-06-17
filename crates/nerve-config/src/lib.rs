@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSetBuilder};
-use nerve_types::{McpReadOnlyPosture, McpServerSpec, Task};
+use nerve_types::{McpArgumentPolicy, McpReadOnlyPosture, McpServerSpec, Task};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::env;
@@ -582,6 +582,16 @@ pub struct McpConfig {
     /// `DenyByDefault` unless the operator grants explicit out-of-band consent.
     #[serde(default)]
     pub read_only_posture: McpReadOnlyPosture,
+    /// H11: optional per-tool argument policy applied AFTER name gating
+    /// (allowlist + read-only posture + write-pattern veto) as defense-in-depth.
+    /// Absent key → empty (inert): every tool's arguments are unconstrained, the
+    /// byte-for-byte pre-H11 behavior. Because the policy is monotone-restrictive
+    /// — a present entry can only ever REJECT a call, never admit one name gating
+    /// refused — a repo-local (`Project`-source) config that enables it cannot
+    /// broaden tool access, so (unlike `read_only_posture`) it needs no
+    /// provenance/consent gate. See [`McpArgumentPolicy`].
+    #[serde(default)]
+    pub argument_policy: McpArgumentPolicy,
 }
 
 impl Default for McpConfig {
@@ -591,6 +601,7 @@ impl Default for McpConfig {
             allow_tools: Vec::new(),
             write_tool_patterns: default_mcp_write_patterns(),
             read_only_posture: McpReadOnlyPosture::default(),
+            argument_policy: McpArgumentPolicy::default(),
         }
     }
 }
@@ -1915,6 +1926,7 @@ mod tests {
             allow_tools: Vec::new(),
             write_tool_patterns: default_mcp_write_patterns(),
             read_only_posture: McpReadOnlyPosture::default(),
+            argument_policy: McpArgumentPolicy::default(),
         };
         assert!(matches!(
             mcp.validate(),
@@ -1947,6 +1959,7 @@ mod tests {
             allow_tools: Vec::new(),
             write_tool_patterns: default_mcp_write_patterns(),
             read_only_posture: McpReadOnlyPosture::default(),
+            argument_policy: McpArgumentPolicy::default(),
         };
         assert!(matches!(empty.validate(), Err(ConfigError::EmptyMcpName)));
 
@@ -1955,6 +1968,7 @@ mod tests {
             allow_tools: Vec::new(),
             write_tool_patterns: default_mcp_write_patterns(),
             read_only_posture: McpReadOnlyPosture::default(),
+            argument_policy: McpArgumentPolicy::default(),
         };
         assert!(matches!(
             duplicate.validate(),
@@ -1977,6 +1991,7 @@ mod tests {
             allow_tools: Vec::new(),
             write_tool_patterns: default_mcp_write_patterns(),
             read_only_posture: McpReadOnlyPosture::default(),
+            argument_policy: McpArgumentPolicy::default(),
         };
 
         assert!(matches!(
@@ -2001,6 +2016,34 @@ mod tests {
         // snake_case rename round-trips through serialization.
         let back = serde_json::to_string(&mcp).unwrap();
         assert!(back.contains("\"read_only_posture\":\"legacy_denylist\""), "got: {back}");
+    }
+
+    #[test]
+    fn mcp_argument_policy_defaults_empty_and_round_trips() {
+        // Absent key → empty/inert policy (no per-tool argument rules).
+        let mcp: McpConfig = serde_json::from_str("{}").unwrap();
+        assert!(mcp.argument_policy.tools.is_empty());
+        assert_eq!(McpConfig::default().argument_policy, McpArgumentPolicy::default());
+
+        // A populated policy parses (note `deny_unknown_fields` on McpConfig — so
+        // the field name must be exactly `argument_policy`) and round-trips.
+        let json = r#"{
+            "argument_policy": {
+                "tools": {
+                    "read_file": { "path_args": ["path"] },
+                    "shell": { "deny_substrings": { "cmd": [";", "rm "] } }
+                }
+            }
+        }"#;
+        let mcp: McpConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(mcp.argument_policy.tools["read_file"].path_args, vec!["path".to_string()]);
+        assert_eq!(
+            mcp.argument_policy.tools["shell"].deny_substrings["cmd"],
+            vec![";".to_string(), "rm ".to_string()]
+        );
+        let reser: McpConfig =
+            serde_json::from_str(&serde_json::to_string(&mcp).unwrap()).unwrap();
+        assert_eq!(reser.argument_policy, mcp.argument_policy);
     }
 
     #[test]

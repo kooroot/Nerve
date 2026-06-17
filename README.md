@@ -439,6 +439,19 @@ MCP servers default to `read_only: true`. Admission is **deny-by-default**: a to
 
 Annotation trust assumes a **semi-trusted** server — a hostile server can lie in `readOnlyHint`, so `allowed_tools` is the only hard guarantee. To restore the legacy substring-only blacklist (which fails *open* on unrecognized mutating tool names) set `mcp.read_only_posture: "legacy_denylist"`; this weaker posture is honored only from your own (`~/.config`) config — a repo-local `nerve.config.json` requesting it is ignored (and warns) unless you set `NERVE_TRUST_PROJECT_VERIFIER=1`, so a cloned repo can never silently weaken your write posture. This guard governs MCP dispatch only; it does not affect the deterministic acceptance gate.
 
+Name gating decides *which* tool runs, not *what arguments* it gets. As optional defense-in-depth, `mcp.argument_policy` constrains the arguments of named tools:
+
+```jsonc
+"argument_policy": {
+  "tools": {
+    "read_file": { "path_args": ["path"] },        // must resolve inside the project root
+    "run_query": { "deny_substrings": { "sql": [";", "drop "] } }  // case-insensitive
+  }
+}
+```
+
+`path_args` are checked **lexically** against the project root (the cwd Nerve loaded config from): an absolute path outside it, or a relative path whose `..` climbs above it — even one that later re-enters via matching components (`../../<root-tail>/x`) — is rejected, with no filesystem access, so it is TOCTOU-free and works for not-yet-created paths. Matching uses native filesystem-path semantics: it does **not** resolve symlinks (a symlink *inside* the root pointing outward is not caught) and does **not** parse URIs (a `file:///etc/passwd` value is treated as the relative filename `file:/etc/passwd` and confined under the root) — so if you name a `uri`-style key as a `path_arg` and the server resolves it as a URI, this lexical check won't confine it. It is hardening on top of name gating, not a complete capability sandbox. A rule only inspects arguments the call actually supplies *as strings* — an argument that is absent, or whose value is not a string (e.g. a number or array), is **not** checked by that rule (the one exception: a declared `path_args` rule with no resolvable root fails **closed**). This policy is strictly **monotone-restrictive** — an entry can only ever *reject* a call, never admit one name gating refused — so, unlike `read_only_posture`, it needs no provenance/consent gate: a repo-local config that enables it cannot broaden your tool access. A tool with no entry is unconstrained (byte-for-byte the pre-policy behavior), and a misspelled rule key is a loud config error, never a silently-inert rule. Like the other MCP guards it governs dispatch only and never touches the deterministic acceptance gate.
+
 ### Mayor/Patrol
 
 Mayor/Patrol is the v1.0 multi-instance queue primitive. The Mayor owns queue state on disk; Patrol workers atomically claim tasks, write results, and heartbeat for orphan recovery.
@@ -650,7 +663,7 @@ Set `orchestration.worktree_apply: true` to run apply attempts in an isolated Gi
 
 ### MCP Config
 
-Each MCP server needs a unique non-empty `name` and non-empty `command` argv. `read_only` defaults to `true`; keep it enabled unless the server is intentionally allowed to mutate state. Under `read_only`, admission is deny-by-default (see the MCP Attachment section above): set per-server `allowed_tools` to whitelist exact tool names, or rely on the server's `readOnlyHint`/`destructiveHint` annotations. `mcp.read_only_posture` (`deny_by_default` default, or `legacy_denylist`) selects the admission strategy and is provenance-gated. Global `allow_tools` is intersected with each server's `allowed_tools`.
+Each MCP server needs a unique non-empty `name` and non-empty `command` argv. `read_only` defaults to `true`; keep it enabled unless the server is intentionally allowed to mutate state. Under `read_only`, admission is deny-by-default (see the MCP Attachment section above): set per-server `allowed_tools` to whitelist exact tool names, or rely on the server's `readOnlyHint`/`destructiveHint` annotations. `mcp.read_only_posture` (`deny_by_default` default, or `legacy_denylist`) selects the admission strategy and is provenance-gated. Global `allow_tools` is intersected with each server's `allowed_tools`. Optional `mcp.argument_policy` adds per-tool argument confinement on top of name gating (`path_args` lexically confined to the project root, `deny_substrings` denylists); it is monotone-restrictive (can only reject), so it needs no provenance gate — see the MCP Attachment section above.
 
 ### Mayor/Patrol Config
 
@@ -709,7 +722,7 @@ Nerve is built around conservative file mutation:
 - `/goal` deterministic checks are argv-only, cwd-frozen, timeout-capped, output-capped, and can run under configured ulimits.
 - `/budget` changes are persisted as an append-only hash chain and checked by `nv doctor`; the chain is unkeyed SHA-256 by default (detects accidental/naive edits) and uses keyed HMAC-SHA-256 when `NERVE_BUDGET_AUDIT_KEY`/`NERVE_BUDGET_AUDIT_KEY_FILE` (absolute path) is set off the defended host — a non-key-holder then cannot forge or edit a link (including the unlinked tail entry, which carries its own self-MAC), keying over any pre-existing unkeyed log fails loudly (only an empty log can begin a keyed chain), and a misconfigured key fails closed rather than silently downgrading to unkeyed.
 - RPC tokens are stored under `.nerve/session-meta/` with restrictive permissions on Unix.
-- MCP servers default to read-only mode with deny-by-default admission (allowlist or read-only annotation evidence required), a write-tool blacklist veto, and a provenance-gated legacy posture.
+- MCP servers default to read-only mode with deny-by-default admission (allowlist or read-only annotation evidence required), a write-tool blacklist veto, and a provenance-gated legacy posture; an optional per-tool `argument_policy` adds lexical path-root confinement and substring denylists as monotone-restrictive defense-in-depth.
 - Mayor/Patrol queue identifiers are restricted to safe file-component characters and duplicate task IDs are rejected.
 - Generated runtime state under `.nerve/` is ignored by Git.
 
