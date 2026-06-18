@@ -175,19 +175,25 @@ impl GoalEvaluator {
             .as_ref()
             .map(|dir| vec![dir.path().to_path_buf()])
             .unwrap_or_default();
-        // H5: when Landlock is requested (Linux), resolve the trusted path to the
-        // running Nerve binary so `decide` can splice in the in-jail confinement
-        // helper. `None` (Landlock off, or `current_exe` unresolved) ⇒ no helper:
-        // under `Required` `decide` then refuses (fail closed); under `Auto` it
-        // falls back to bwrap-only, warned here.
+        // H5/H6: when Landlock and/or the seccomp denylist are requested (Linux),
+        // resolve the trusted path to the running Nerve binary so `decide` can
+        // splice in the in-jail confinement helper. `None` (neither requested, or
+        // `current_exe` unresolved) ⇒ no helper. `decide` then refuses (fail
+        // closed) ONLY for `Required` + Landlock — the one fail-closed basis among
+        // the layers; every other case (Auto, or seccomp-only) degrades to
+        // bwrap-only, warned here. We warn only when `decide` will actually run
+        // bwrap-only, never when it will refuse (which is its own loud signal).
         let confine_helper = confine_helper_path(&self.sandbox);
-        if self.sandbox.landlock
-            && confine_helper.is_none()
-            && self.sandbox.mode == nerve_config::SandboxMode::Auto
-        {
+        let wants_helper = self.sandbox.landlock || self.sandbox.seccomp;
+        // Shared predicate with `sandbox::bwrap_decide`: `decide` refuses (its own
+        // loud signal) only for Required+Landlock; every other unresolved-helper
+        // case degrades to bwrap-only, which is what we warn about here.
+        let decide_will_refuse =
+            sandbox::confine_unresolved_helper_refuses(self.sandbox.mode, self.sandbox.landlock);
+        if wants_helper && confine_helper.is_none() && !decide_will_refuse {
             tracing::warn!(
                 target: "nerve::sandbox",
-                "sandbox.landlock=true but the Nerve binary path could not be resolved; running under bwrap-only confinement (Auto best-effort)"
+                "sandbox.landlock/seccomp requested but the Nerve binary path could not be resolved; running under bwrap-only confinement (best-effort, the extra layer is dropped)"
             );
         }
         let decision = sandbox::decide(
@@ -380,13 +386,22 @@ impl GoalEvaluator {
         // the check's own stderr, so a hostile check can spoof a spurious — never
         // suppress a real — best-effort warning; it is fail-safe observability that
         // changes neither which command runs nor the pass/fail verdict.
-        if let Ok(stderr_text) = &stderr_res
-            && sandbox::stderr_signals_landlock_degraded(stderr_text)
-        {
-            tracing::warn!(
-                target: "nerve::sandbox",
-                "sandbox.landlock=true ran best-effort: the kernel could not fully enforce Landlock, so this check ran under bwrap-only confinement. Set sandbox.mode=required to fail closed instead."
-            );
+        if let Ok(stderr_text) = &stderr_res {
+            if sandbox::stderr_signals_landlock_degraded(stderr_text) {
+                tracing::warn!(
+                    target: "nerve::sandbox",
+                    "sandbox.landlock=true ran best-effort: the kernel could not fully enforce Landlock, so this check ran under bwrap-only confinement. Set sandbox.mode=required to fail closed instead."
+                );
+            }
+            // H6: seccomp is ALWAYS best-effort (never the fail-closed basis even
+            // under Required), so its degradation is only ever surfaced — never a
+            // refusal. Same captured-stderr re-emit contract as Landlock above.
+            if sandbox::stderr_signals_seccomp_degraded(stderr_text) {
+                tracing::warn!(
+                    target: "nerve::sandbox",
+                    "sandbox.seccomp=true ran best-effort: the kernel could not install the seccomp denylist, so this check ran without it (bwrap + any Landlock layer still applied)."
+                );
+            }
         }
 
         if let Err(OutputCapExceeded(byte_cap)) = stdout_res {
@@ -509,7 +524,7 @@ fn private_check_tmpdir(sandbox: &SandboxConfig) -> Result<Option<TempDir>, Goal
 /// itself). Kept here (production runtime) rather than in `decide` so `decide`
 /// stays pure and the helper path is test-injectable.
 fn confine_helper_path(sandbox: &SandboxConfig) -> Option<PathBuf> {
-    if !sandbox.landlock {
+    if !sandbox.landlock && !sandbox.seccomp {
         return None;
     }
     std::env::current_exe().ok()

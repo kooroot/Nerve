@@ -28,6 +28,10 @@ globset = "0.4"
 # Linux via a target-specific dependency; cross-compiles cleanly for clippy.
 landlock = "0.4"
 libc = "0.2"
+# H6: Linux seccomp-bpf syscall denylist (pure-Rust, no C link; the rust-vmm
+# crate behind Firecracker's jailer). Linux-only target dependency, like
+# `landlock`; cross-compiles cleanly for clippy.
+seccompiler = "0.5"
 hmac = "0.12"
 rand = "0.8"
 ratatui = "0.28"

@@ -375,6 +375,45 @@ pub struct SandboxConfig {
     /// See the `nerve_core::sandbox` module docs.
     #[serde(default)]
     pub landlock: bool,
+    /// H6 (Linux): opt-in SECCOMP-bpf syscall DENYLIST composed inside the same
+    /// in-jail helper (`nv __nv-confine`) as [`landlock`](Self::landlock).
+    /// Default `false`. When `true` and `mode != off` on a seccomp-capable
+    /// kernel, the confined check additionally self-restricts via a seccomp-bpf
+    /// filter that KILLS the process (`SECCOMP_RET_KILL_PROCESS`) if it invokes
+    /// one of a fixed set of dangerous escape-primitive syscalls — namespace and
+    /// mount control (`mount`, `umount2`, `pivot_root`, `chroot`, `unshare`,
+    /// `setns`), process tampering (`ptrace`, `process_vm_writev`), kernel-object
+    /// loading (`bpf`, `*_module`, `kexec_*`), the keyring (`add_key`,
+    /// `request_key`, `keyctl`), `userfaultfd`, and system control (`reboot`,
+    /// `swapon`/`swapoff`) — all of which a normal build/test workload never
+    /// issues. Everything else is allowed (this is a denylist, not an allowlist).
+    ///
+    /// SCOPE (no overclaim): a denylist is inherently INCOMPLETE — it blocks only
+    /// the enumerated syscalls, does NO argument-level filtering (e.g. it does not
+    /// inspect `clone`/`clone3` flags, so namespace *creation* via `clone(CLONE_NEW*)`
+    /// is contained by bwrap's own namespace setup and the `unshare`/`setns`
+    /// denial, not by this filter), and is defense-in-depth ON TOP OF bwrap +
+    /// Landlock, never a standalone boundary. Because it is opt-in and kills on a
+    /// denied call, an unusual workload that legitimately needs a denied syscall
+    /// (a debugger using `ptrace`, container/sandbox tooling using `unshare`) will
+    /// be killed — by design; do not enable it for such checks.
+    ///
+    /// Like [`strict`](Self::strict) and [`landlock`](Self::landlock) it is purely
+    /// confinement-TIGHTENING — it can only ever DENY syscalls, never enable
+    /// execution or weaken a gate — so a repo-local (Project-source) config
+    /// setting it needs no operator-consent provenance gate. Unlike Landlock it is
+    /// ALWAYS BEST-EFFORT, even under [`Required`](SandboxMode::Required): seccomp
+    /// is secondary hardening and is NEVER the fail-closed basis (that is bwrap +
+    /// Landlock), so a kernel that cannot install the filter falls back to running
+    /// without it and Nerve re-surfaces an operator warning through `tracing` (the
+    /// in-jail helper marks the degradation in the check's captured stderr and the
+    /// parent re-emits it, same mechanism as Landlock). It never gates acceptance
+    /// and never causes a refusal. Inert (byte-identical wrap argv) when `false`
+    /// or off-Linux. The runtime path is exercised only by the CI Linux
+    /// real-kernel test (H7); on non-Linux hosts it is cross-compile-checked but
+    /// never run. See the `nerve_core::sandbox` module docs.
+    #[serde(default)]
+    pub seccomp: bool,
 }
 
 impl SandboxConfig {
@@ -2660,6 +2699,7 @@ mod tests {
         assert!(!cfg.allow_network);
         assert!(!cfg.strict, "H3 strict mode is opt-in, default false");
         assert!(!cfg.landlock, "H5 Landlock layer is opt-in, default false");
+        assert!(!cfg.seccomp, "H6 seccomp denylist is opt-in, default false");
         assert!(!cfg.is_enabled());
     }
 
@@ -2701,6 +2741,48 @@ mod tests {
         .unwrap();
         assert!(landlock.orchestration.sandbox.landlock);
         assert!(landlock.orchestration.sandbox.is_enabled());
+    }
+
+    #[test]
+    fn sandbox_seccomp_round_trips_and_defaults_false() {
+        // Absent `seccomp` key => false (additive/inert; existing configs and the
+        // pre-H6 wrap argv are byte-identical).
+        let lax = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority",
+                "sandbox": { "mode": "required" }
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        assert!(!lax.orchestration.sandbox.seccomp, "absent seccomp => false");
+
+        // Explicit seccomp=true deserializes. Like `strict`/`landlock`, the seccomp
+        // denylist is CONFINEMENT-TIGHTENING ONLY — it can only deny syscalls,
+        // never enable execution or loosen a gate — so a repo-local (Project-source)
+        // config setting it needs no operator-consent provenance gate. It composes
+        // with landlock (both ride the same in-jail helper).
+        let seccomp = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority",
+                "sandbox": { "mode": "required", "landlock": true, "seccomp": true }
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        assert!(seccomp.orchestration.sandbox.seccomp);
+        assert!(seccomp.orchestration.sandbox.landlock);
+        assert!(seccomp.orchestration.sandbox.is_enabled());
     }
 
     #[test]
@@ -2979,6 +3061,8 @@ mod tests {
         assert_eq!(sandbox.mode, SandboxMode::Off);
         assert!(!sandbox.allow_network);
         assert!(!sandbox.strict);
+        assert!(!sandbox.landlock);
+        assert!(!sandbox.seccomp);
         assert!(!sandbox.is_enabled());
 
         assert_eq!(BuiltinVerifierMode::default(), BuiltinVerifierMode::Off);

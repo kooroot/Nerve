@@ -27,11 +27,12 @@ tracing.workspace = true
 ulid.workspace = true
 uuid.workspace = true
 
-# H5: Landlock is a Linux-only LSM. The dependency is gated to Linux so non-Linux
-# builds neither pull nor compile it; the `nerve_core::sandbox` Landlock code is
-# correspondingly `#[cfg(target_os = "linux")]`.
+# H5/H6: Landlock and seccomp-bpf are Linux-only. These dependencies are gated to
+# Linux so non-Linux builds neither pull nor compile them; the corresponding
+# `nerve_core::sandbox` code is `#[cfg(target_os = "linux")]`.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
+seccompiler.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

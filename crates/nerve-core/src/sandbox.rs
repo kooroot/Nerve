@@ -469,31 +469,40 @@ fn bwrap_decide(
         return no_backend_decide(config.mode);
     };
     let writable = canonical_writable_roots(cwd, extra_writable_roots);
-    // H5: when Landlock is requested, the check does not run directly under
-    // bwrap — it runs under the in-jail helper (`nv __nv-confine … -- check`)
-    // that bwrap execs, which applies a Landlock write-confinement ruleset
-    // (matching `writable`, plus bwrap's minimal `/dev`) then execs the check.
-    // Landlock MUST NOT be applied to bwrap itself: a write-restriction scoped to
-    // the writable roots would deny bwrap's OWN unprivileged-userns setup writes
-    // (e.g. `/proc/self/uid_map`), breaking the jail. So it is composed INSIDE
-    // the jail. When Landlock is off the argv is byte-identical to the pre-H5
-    // build (the helper is never spliced in).
-    let inner: std::borrow::Cow<'_, [String]> = if config.landlock {
+    // H5/H6: when Landlock and/or the seccomp denylist are requested, the check
+    // does not run directly under bwrap — it runs under the in-jail helper
+    // (`nv __nv-confine … -- check`) that bwrap execs, which applies the requested
+    // layers (Landlock write-confinement matching `writable` plus bwrap's minimal
+    // `/dev`, and/or the seccomp syscall denylist) then execs the check. These
+    // layers MUST NOT be applied to bwrap itself: Landlock scoped to the writable
+    // roots would deny bwrap's OWN unprivileged-userns setup writes (e.g.
+    // `/proc/self/uid_map`), and a seccomp denylist of mount/unshare/etc. would
+    // block bwrap's own namespace/mount setup — either breaks the jail. So they
+    // are composed INSIDE the jail. When neither is requested the argv is
+    // byte-identical to the pre-H5/H6 build (the helper is never spliced in).
+    let inner: std::borrow::Cow<'_, [String]> = if config.landlock || config.seccomp {
         match confine_helper {
             Some(nv) => std::borrow::Cow::Owned(build_confine_helper_argv(
                 nv,
                 config.mode,
+                config.landlock,
+                config.seccomp,
                 &writable,
                 check_cmd,
             )),
             None => {
-                if config.mode == SandboxMode::Required {
+                // Only LANDLOCK under `Required` is a fail-closed basis: if the
+                // helper can't be spliced, the requested Landlock layer is absent,
+                // so `Required` refuses rather than run weaker-than-asked. Seccomp
+                // is ALWAYS best-effort (never the fail-closed basis), so a
+                // seccomp-only request never refuses here.
+                if confine_unresolved_helper_refuses(config.mode, config.landlock) {
                     return SandboxDecision::Refuse {
                         reason: LANDLOCK_HELPER_UNRESOLVED.to_string(),
                     };
                 }
-                // Auto: best-effort — fall back to bwrap-only. The caller
-                // (`goal.rs`) surfaces the warning.
+                // Auto, or seccomp-only under Required: best-effort — fall back to
+                // bwrap-only. The caller (`goal.rs`) surfaces the warning.
                 std::borrow::Cow::Borrowed(check_cmd)
             }
         }
@@ -670,6 +679,20 @@ pub fn confine_should_refuse(required: bool, enforcement: LandlockEnforcement) -
     }
 }
 
+/// Whether an UNRESOLVED in-jail helper (the running `nv` path could not be
+/// found, so the helper cannot be spliced) must make the decision REFUSE (fail
+/// closed) rather than fall back to bwrap-only. Only LANDLOCK under `Required` is
+/// a fail-closed basis: if the helper is missing the requested Landlock layer is
+/// simply absent, so `Required` must not run weaker-than-asked. The seccomp
+/// denylist is ALWAYS best-effort and is NEVER a fail-closed basis, so a
+/// seccomp-only request (Landlock off) never refuses here — it degrades to
+/// bwrap-only with an operator warning. The single source of truth shared by the
+/// decision layer ([`bwrap_decide`]) and the parent's warning gate (`goal.rs`), so
+/// the two cannot drift. Pure; tested on every platform.
+pub fn confine_unresolved_helper_refuses(mode: SandboxMode, landlock: bool) -> bool {
+    matches!(mode, SandboxMode::Required) && landlock
+}
+
 /// The stderr line the helper emits under `Required` when Landlock could not be
 /// fully enforced and it REFUSES to run the check (fail closed). Pure so the
 /// message contract is testable on every platform. Deliberately does NOT carry
@@ -704,6 +727,86 @@ pub fn stderr_signals_landlock_degraded(stderr: &str) -> bool {
     stderr.contains(CONFINE_DEGRADED_MARKER)
 }
 
+/// Machine-greppable marker the in-jail helper embeds in its stderr line when a
+/// requested seccomp denylist could not be installed and the check runs without
+/// it. Seccomp is ALWAYS best-effort (even under `Required` — it is never the
+/// fail-closed basis), so unlike Landlock there is no "refused" counterpart: the
+/// helper only ever degrades, never refuses, on a seccomp failure. The parent
+/// re-scans the captured stderr for this marker ([`stderr_signals_seccomp_degraded`])
+/// and re-emits an operator-facing warning on every outcome where the check's
+/// stderr was captured (a normal pass or fail) — same captured-stderr contract as
+/// [`CONFINE_DEGRADED_MARKER`]; the only outcomes it is not re-emitted on are a
+/// timeout or a stderr-cap abort (no stderr to scan), which already fail loudly.
+/// Distinct from the Landlock marker so the two layers' degradations are
+/// independently observable. Stable string (an internal contract between
+/// [`confine_seccomp_degraded_message`] and the parent scan).
+pub const CONFINE_SECCOMP_DEGRADED_MARKER: &str = "[nv-confine:seccomp-degraded]";
+
+/// The stderr line the helper emits when a requested seccomp denylist could not be
+/// installed (old kernel, filter rejected) and the check runs without it. Carries
+/// [`CONFINE_SECCOMP_DEGRADED_MARKER`] so the parent can re-surface the degradation
+/// even on a passing check. Pure so the marker contract is testable on every
+/// platform.
+pub fn confine_seccomp_degraded_message() -> String {
+    format!(
+        "nv {CONFINE_HELPER_TOKEN}: {CONFINE_SECCOMP_DEGRADED_MARKER} seccomp denylist could not be installed; continuing best-effort without it (it is never the fail-closed basis)"
+    )
+}
+
+/// Whether `stderr` (the confined check's captured stderr) carries the in-jail
+/// helper's seccomp best-effort degradation marker. The parent uses this to
+/// re-emit an operator-facing warning on every outcome where the check's stderr
+/// was captured. Pure; tested on every platform.
+pub fn stderr_signals_seccomp_degraded(stderr: &str) -> bool {
+    stderr.contains(CONFINE_SECCOMP_DEGRADED_MARKER)
+}
+
+/// The fixed set of dangerous escape-primitive syscalls the opt-in H6 seccomp
+/// DENYLIST blocks (by NAME — platform-independent, so the denylist's CONTENTS are
+/// unit-testable on every platform; the Linux backend maps each name to its
+/// syscall number via [`seccomp_syscall_number`]). Every entry is a syscall a
+/// normal build/test workload never issues but that a hostile check could use to
+/// escape or tamper:
+///   - namespace / mount control: `mount`, `umount2`, `pivot_root`, `chroot`,
+///     `unshare`, `setns`
+///   - process tampering: `ptrace`, `process_vm_writev`
+///   - kernel-object loading: `bpf`, `init_module`, `finit_module`,
+///     `delete_module`, `kexec_load`, `kexec_file_load`
+///   - kernel keyring: `add_key`, `request_key`, `keyctl`
+///   - exotic exploit primitive: `userfaultfd`
+///   - system control: `reboot`, `swapon`, `swapoff`
+///
+/// SCOPE (no overclaim): this is a DENYLIST, so it is inherently incomplete — it
+/// blocks only these named syscalls and does NO argument-level filtering. In
+/// particular `clone`/`clone3` are NOT denied (a build must spawn processes), so
+/// namespace *creation* via `clone(CLONE_NEW*)` is contained by bwrap's own
+/// namespace setup plus the `unshare`/`setns` denial, not by this list inspecting
+/// clone flags. The list is defense-in-depth layered on bwrap + Landlock, never a
+/// standalone boundary.
+pub const SECCOMP_DENYLIST: &[&str] = &[
+    "mount",
+    "umount2",
+    "pivot_root",
+    "chroot",
+    "unshare",
+    "setns",
+    "ptrace",
+    "process_vm_writev",
+    "bpf",
+    "init_module",
+    "finit_module",
+    "delete_module",
+    "kexec_load",
+    "kexec_file_load",
+    "add_key",
+    "request_key",
+    "keyctl",
+    "userfaultfd",
+    "reboot",
+    "swapon",
+    "swapoff",
+];
+
 /// Map a [`SandboxMode`] to the helper's `--mode` token. Only `Required` carries
 /// the strict fail-closed contract; everything else (including `Off`, which never
 /// reaches the helper) is best-effort `auto`. Pure.
@@ -726,19 +829,25 @@ fn confine_required_from_token(token: &str) -> Option<bool> {
 }
 
 /// Build the confinement-helper segment Nerve splices between bwrap's `--` and
-/// the real check: `<nv> __nv-confine --mode <m> (--root <p>)* -- <check…>`.
+/// the real check:
+/// `<nv> __nv-confine --mode <m> [--landlock] [--seccomp] (--root <p>)* -- <check…>`.
 ///
 /// `nv` is the trusted absolute path to the running Nerve binary (resolved by the
-/// caller via `current_exe`); bwrap execs it INSIDE the jail, where it applies a
-/// Landlock ruleset then `execve`s the check. `roots` are the same writable roots
-/// bwrap rw-binds (operator/system-controlled — `cwd` + the private temp dir —
-/// never lead-controlled), so the Landlock write grant matches the mount grant.
+/// caller via `current_exe`); bwrap execs it INSIDE the jail, where it applies the
+/// requested confinement layers then `execve`s the check. `--landlock` and
+/// `--seccomp` are independent opt-in flags (at least one is set wherever this
+/// argv is spliced, but the function does not assume that). `roots` — the same
+/// writable roots bwrap rw-binds (operator/system-controlled: `cwd` + the private
+/// temp dir, never lead-controlled) — are emitted ONLY when `landlock` is set,
+/// since they configure the Landlock write grant and are meaningless without it.
 /// The trailing `--` terminates the helper's own option parsing, so a `check[0]`
 /// beginning with `-` is treated as the command, never a helper flag (same
 /// discipline as the bwrap/sandbox-exec `--`). Pure; tested on every platform.
 pub fn build_confine_helper_argv(
     nv: &Path,
     mode: SandboxMode,
+    landlock: bool,
+    seccomp: bool,
     roots: &[PathBuf],
     check_cmd: &[String],
 ) -> Vec<String> {
@@ -748,9 +857,17 @@ pub fn build_confine_helper_argv(
         "--mode".to_string(),
         confine_mode_token(mode).to_string(),
     ];
-    for root in roots {
-        argv.push("--root".to_string());
-        argv.push(root.to_string_lossy().into_owned());
+    if landlock {
+        argv.push("--landlock".to_string());
+    }
+    if seccomp {
+        argv.push("--seccomp".to_string());
+    }
+    if landlock {
+        for root in roots {
+            argv.push("--root".to_string());
+            argv.push(root.to_string_lossy().into_owned());
+        }
     }
     argv.push("--".to_string());
     argv.extend(check_cmd.iter().cloned());
@@ -761,22 +878,39 @@ pub fn build_confine_helper_argv(
 /// token).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfineSpec {
-    /// `true` ⇒ `sandbox.mode=required`: Landlock must be fully enforced or the
-    /// helper refuses (fail closed). `false` ⇒ best-effort (`Auto`).
+    /// `true` ⇒ `sandbox.mode=required`. Governs ONLY the Landlock fail-closed
+    /// decision ([`confine_should_refuse`]): under `Required`, Landlock that is
+    /// not fully enforced makes the helper refuse. Seccomp ignores this flag — it
+    /// is always best-effort, never the fail-closed basis. `false` ⇒ best-effort
+    /// (`Auto`) for every layer.
     pub required: bool,
-    /// Writable roots to grant Landlock file-write beneath.
+    /// Apply the Landlock write-confinement (the `--landlock` flag was present).
+    /// When `false` the helper applies no Landlock ruleset and `roots` is unused.
+    pub landlock: bool,
+    /// Apply the seccomp syscall denylist (the `--seccomp` flag was present).
+    /// Always best-effort regardless of `required`.
+    pub seccomp: bool,
+    /// Writable roots to grant Landlock file-write beneath. Only consumed when
+    /// `landlock` is `true`.
     pub roots: Vec<PathBuf>,
-    /// The real check command to `execve` once Landlock is applied.
+    /// The real check command to `execve` once confinement is applied.
     pub check_cmd: Vec<String>,
 }
 
 /// Parse the confinement-helper argv tail (everything after `__nv-confine`):
-/// `--mode <required|auto> (--root <path>)* -- <check> [args…]`. Returns `None`
-/// on ANY malformed input — unknown flag, missing/duplicate `--mode`, missing
-/// value, empty root, no `--` terminator, or an empty check — so the helper fails
-/// closed rather than guess. Pure; tested on every platform.
+/// `--mode <required|auto> [--landlock] [--seccomp] (--root <path>)* -- <check> [args…]`.
+/// Returns `None` on ANY malformed input — unknown flag, missing/duplicate
+/// `--mode`, a duplicated `--landlock`/`--seccomp`, missing value, empty root, no
+/// `--` terminator, or an empty check — so the helper fails closed rather than
+/// guess. Note it does NOT require at least one of `--landlock`/`--seccomp`: the
+/// SPLICE condition in [`bwrap_decide`] is the sole authority for when the helper
+/// is inserted (only when a layer is requested), so a flagless helper would simply
+/// apply nothing and `execve` the check under bwrap (already the confinement) — a
+/// harmless no-op, never a fail-open. Pure; tested on every platform.
 pub fn parse_confine_args(tail: &[String]) -> Option<ConfineSpec> {
     let mut required: Option<bool> = None;
+    let mut landlock = false;
+    let mut seccomp = false;
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut i = 0;
     loop {
@@ -793,6 +927,20 @@ pub fn parse_confine_args(tail: &[String]) -> Option<ConfineSpec> {
                 }
                 required = Some(confine_required_from_token(value)?);
                 i += 2;
+            }
+            "--landlock" => {
+                if landlock {
+                    return None; // duplicate --landlock
+                }
+                landlock = true;
+                i += 1;
+            }
+            "--seccomp" => {
+                if seccomp {
+                    return None; // duplicate --seccomp
+                }
+                seccomp = true;
+                i += 1;
             }
             "--root" => {
                 let value = tail.get(i + 1)?;
@@ -812,6 +960,8 @@ pub fn parse_confine_args(tail: &[String]) -> Option<ConfineSpec> {
     }
     Some(ConfineSpec {
         required,
+        landlock,
+        seccomp,
         roots,
         check_cmd,
     })
@@ -845,23 +995,42 @@ pub fn maybe_run_confine_helper() {
     run_confine_helper(&spec);
 }
 
-/// Apply the Landlock write-confinement for `spec`, then `execve` the real check.
-/// Diverges: it either becomes the check (success) or exits the process.
+/// Apply the requested confinement layers for `spec` (Landlock and/or the seccomp
+/// denylist), then `execve` the real check. Diverges: it either becomes the check
+/// (success) or exits the process.
+///
+/// Ordering matters: Landlock is applied FIRST, then seccomp. This is forward-safe
+/// because the denylist never blocks `prctl`/`seccomp`/`landlock_*`, so installing
+/// seccomp second cannot have blocked any syscall Landlock needs (and Landlock,
+/// being filesystem-only, never blocks the seccomp syscall). Both restrictions
+/// survive the final `execve`.
 #[cfg(target_os = "linux")]
 fn run_confine_helper(spec: &ConfineSpec) -> ! {
     use std::os::unix::process::CommandExt;
-    let enforcement = apply_landlock_write_confinement(&spec.roots);
-    if confine_should_refuse(spec.required, enforcement) {
-        eprintln!("{}", confine_refused_message(enforcement));
-        std::process::exit(CONFINE_EXIT_REFUSED);
+    // --- Landlock (fail-closed basis under Required) ---
+    if spec.landlock {
+        let enforcement = apply_landlock_write_confinement(&spec.roots);
+        if confine_should_refuse(spec.required, enforcement) {
+            eprintln!("{}", confine_refused_message(enforcement));
+            std::process::exit(CONFINE_EXIT_REFUSED);
+        }
+        if enforcement != LandlockEnforcement::Full {
+            // Auto best-effort: carries CONFINE_DEGRADED_MARKER so the parent
+            // re-surfaces this through tracing even when the check passes.
+            eprintln!("{}", confine_degraded_message(enforcement));
+        }
     }
-    if enforcement != LandlockEnforcement::Full {
-        // Auto best-effort: carries CONFINE_DEGRADED_MARKER so the parent
-        // re-surfaces this through tracing even when the check passes.
-        eprintln!("{}", confine_degraded_message(enforcement));
+    // --- Seccomp denylist (ALWAYS best-effort, never the fail-closed basis) ---
+    if spec.seccomp && apply_seccomp_denylist().is_err() {
+        // A kernel that cannot install the filter (too old, filter rejected)
+        // degrades to running without it. Seccomp is secondary hardening and is
+        // never the basis for `Required`, so this NEVER refuses — it carries
+        // CONFINE_SECCOMP_DEGRADED_MARKER so the parent re-surfaces it through
+        // tracing even when the check passes.
+        eprintln!("{}", confine_seccomp_degraded_message());
     }
     // `exec` replaces this process image with the check, preserving the Landlock
-    // restriction (Landlock survives execve). It only returns on failure.
+    // and seccomp restrictions (both survive execve). It only returns on failure.
     let error = std::process::Command::new(&spec.check_cmd[0])
         .args(&spec.check_cmd[1..])
         .exec();
@@ -931,6 +1100,96 @@ fn apply_landlock_write_confinement(roots: &[PathBuf]) -> LandlockEnforcement {
         },
         Err(_) => LandlockEnforcement::Error,
     }
+}
+
+// ---------------------------------------------------------------------------
+// H6: Linux seccomp-bpf syscall denylist (composed INSIDE the bwrap jail)
+// ---------------------------------------------------------------------------
+//
+// Like Landlock, the denylist is applied INSIDE the jail by the same helper, not
+// to bwrap: denying mount/unshare/setns/etc. on bwrap itself would block bwrap's
+// own namespace and mount setup. The helper installs the filter on its single
+// (pre-tokio) thread, after Landlock, then `execve`s the check, which inherits the
+// filter (seccomp survives execve once `no_new_privs` is set — which `seccompiler`
+// does for us). It is ALWAYS best-effort: a failure to install degrades to running
+// without it, never refuses, and is never the basis for `Required`.
+
+/// Map a denylist syscall NAME to its number on this Linux build. Explicit and
+/// auditable (no name-table magic); a name with no `libc::SYS_*` constant returns
+/// `None`. The numbers are arch-specific but `libc` resolves the right ones for
+/// the target, so the same name list works on every Linux arch. A Linux-only test
+/// asserts every [`SECCOMP_DENYLIST`] entry resolves (catches a typo or a renamed
+/// constant at build time).
+#[cfg(target_os = "linux")]
+fn seccomp_syscall_number(name: &str) -> Option<i64> {
+    let nr: libc::c_long = match name {
+        "mount" => libc::SYS_mount,
+        "umount2" => libc::SYS_umount2,
+        "pivot_root" => libc::SYS_pivot_root,
+        "chroot" => libc::SYS_chroot,
+        "unshare" => libc::SYS_unshare,
+        "setns" => libc::SYS_setns,
+        "ptrace" => libc::SYS_ptrace,
+        "process_vm_writev" => libc::SYS_process_vm_writev,
+        "bpf" => libc::SYS_bpf,
+        "init_module" => libc::SYS_init_module,
+        "finit_module" => libc::SYS_finit_module,
+        "delete_module" => libc::SYS_delete_module,
+        "kexec_load" => libc::SYS_kexec_load,
+        "kexec_file_load" => libc::SYS_kexec_file_load,
+        "add_key" => libc::SYS_add_key,
+        "request_key" => libc::SYS_request_key,
+        "keyctl" => libc::SYS_keyctl,
+        "userfaultfd" => libc::SYS_userfaultfd,
+        "reboot" => libc::SYS_reboot,
+        "swapon" => libc::SYS_swapon,
+        "swapoff" => libc::SYS_swapoff,
+        _ => return None,
+    };
+    Some(nr as i64)
+}
+
+/// Compile the [`SECCOMP_DENYLIST`] into a BPF program: every listed syscall →
+/// `KillProcess` (the process is killed with `SIGSYS` if it issues one), every
+/// other syscall → `Allow`. Returns `Err(())` if a name fails to resolve or the
+/// filter cannot be built/compiled. Kept SEPARATE from [`apply_seccomp_denylist`]
+/// so the (allocating) compile step can run in a parent process and the
+/// (syscall-only) install step can run in a forked child — the real-kernel test
+/// relies on exactly that split to apply the filter without killing the test
+/// runner.
+#[cfg(target_os = "linux")]
+fn build_seccomp_denylist_program() -> Result<seccompiler::BpfProgram, ()> {
+    use seccompiler::{SeccompAction, SeccompFilter};
+    use std::collections::BTreeMap;
+    let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
+    for name in SECCOMP_DENYLIST {
+        let nr = seccomp_syscall_number(name).ok_or(())?;
+        // Empty rule vec ⇒ match the syscall unconditionally (no arg filtering).
+        rules.insert(nr, Vec::new());
+    }
+    let arch = std::env::consts::ARCH.try_into().map_err(|_| ())?;
+    // new(rules, mismatch_action, match_action, arch): non-listed syscalls Allow,
+    // listed syscalls KillProcess. The two actions must differ (they do).
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::KillProcess,
+        arch,
+    )
+    .map_err(|_| ())?;
+    filter.try_into().map_err(|_| ())
+}
+
+/// Install the [`SECCOMP_DENYLIST`] filter on the current process (all threads via
+/// TSYNC). `seccompiler::apply_filter*` sets `PR_SET_NO_NEW_PRIVS` for us, so the
+/// filter is honored unprivileged and survives the helper's subsequent `execve`.
+/// Best-effort: returns `Err(())` on any failure so the caller degrades rather
+/// than refuses. Runs on a real Linux kernel only (CI / the calling helper inside
+/// bwrap); exercised by the H7 real-kernel test, never on the macOS/Windows host.
+#[cfg(target_os = "linux")]
+fn apply_seccomp_denylist() -> Result<(), ()> {
+    let program = build_seccomp_denylist_program()?;
+    seccompiler::apply_filter_all_threads(&program).map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -1539,6 +1798,22 @@ mod tests {
     }
 
     #[test]
+    fn confine_unresolved_helper_refuses_only_for_required_landlock() {
+        use SandboxMode::*;
+        // The ONLY unresolved-helper case that refuses is Required + Landlock.
+        assert!(confine_unresolved_helper_refuses(Required, true));
+        // Required with seccomp-only (Landlock off) must NOT refuse — seccomp is
+        // never the fail-closed basis; it degrades to bwrap-only best-effort.
+        assert!(!confine_unresolved_helper_refuses(Required, false));
+        // Auto never refuses regardless of which layer was requested.
+        assert!(!confine_unresolved_helper_refuses(Auto, true));
+        assert!(!confine_unresolved_helper_refuses(Auto, false));
+        // Off never reaches a backend, but the predicate must still be benign.
+        assert!(!confine_unresolved_helper_refuses(Off, true));
+        assert!(!confine_unresolved_helper_refuses(Off, false));
+    }
+
+    #[test]
     fn landlock_degradation_marker_contract() {
         use LandlockEnforcement::*;
         // Every Auto-degradation message carries the marker, so the parent
@@ -1572,7 +1847,8 @@ mod tests {
         let nv = Path::new("/usr/local/bin/nv");
         let roots = [PathBuf::from("/work"), PathBuf::from("/tmp/priv")];
         let check = ["cargo".to_string(), "test".to_string()];
-        let argv = build_confine_helper_argv(nv, SandboxMode::Required, &roots, &check);
+        // Landlock only: `--landlock` flag, then roots (roots ride Landlock).
+        let argv = build_confine_helper_argv(nv, SandboxMode::Required, true, false, &roots, &check);
         assert_eq!(
             argv,
             vec![
@@ -1580,6 +1856,7 @@ mod tests {
                 "__nv-confine",
                 "--mode",
                 "required",
+                "--landlock",
                 "--root",
                 "/work",
                 "--root",
@@ -1592,24 +1869,66 @@ mod tests {
     }
 
     #[test]
-    fn confine_args_round_trip_required_and_auto() {
+    fn confine_helper_argv_seccomp_only_omits_roots() {
+        // Seccomp-only: `--seccomp` flag and NO `--root`/`--landlock` (roots are a
+        // Landlock concept and are meaningless — so not emitted — without it).
+        let nv = Path::new("/nv");
+        let roots = [PathBuf::from("/work")];
+        let check = ["true".to_string()];
+        let argv = build_confine_helper_argv(nv, SandboxMode::Auto, false, true, &roots, &check);
+        assert_eq!(
+            argv,
+            vec!["/nv", "__nv-confine", "--mode", "auto", "--seccomp", "--", "true"]
+        );
+        // Both layers: both flags, then roots.
+        let both = build_confine_helper_argv(nv, SandboxMode::Required, true, true, &roots, &check);
+        assert_eq!(
+            both,
+            vec![
+                "/nv",
+                "__nv-confine",
+                "--mode",
+                "required",
+                "--landlock",
+                "--seccomp",
+                "--root",
+                "/work",
+                "--",
+                "true",
+            ]
+        );
+    }
+
+    #[test]
+    fn confine_args_round_trip_all_layer_combinations() {
         let nv = Path::new("/nv");
         for (mode, required) in [(SandboxMode::Required, true), (SandboxMode::Auto, false)] {
-            let roots = [PathBuf::from("/a"), PathBuf::from("/b")];
-            let check = ["sh".to_string(), "-c".to_string(), "true".to_string()];
-            let argv = build_confine_helper_argv(nv, mode, &roots, &check);
-            // The helper consumes argv AFTER `nv __nv-confine`.
-            assert_eq!(argv[0], "/nv");
-            assert_eq!(argv[1], CONFINE_HELPER_TOKEN);
-            let spec = parse_confine_args(&argv[2..]).expect("round-trip must parse");
-            assert_eq!(
-                spec,
-                ConfineSpec {
-                    required,
-                    roots: roots.to_vec(),
-                    check_cmd: check.to_vec(),
+            for landlock in [false, true] {
+                for seccomp in [false, true] {
+                    let roots = [PathBuf::from("/a"), PathBuf::from("/b")];
+                    let check = ["sh".to_string(), "-c".to_string(), "true".to_string()];
+                    let argv =
+                        build_confine_helper_argv(nv, mode, landlock, seccomp, &roots, &check);
+                    // The helper consumes argv AFTER `nv __nv-confine`.
+                    assert_eq!(argv[0], "/nv");
+                    assert_eq!(argv[1], CONFINE_HELPER_TOKEN);
+                    let spec = parse_confine_args(&argv[2..]).expect("round-trip must parse");
+                    // Roots only round-trip when Landlock is on (they're not
+                    // emitted otherwise).
+                    let expected_roots = if landlock { roots.to_vec() } else { Vec::new() };
+                    assert_eq!(
+                        spec,
+                        ConfineSpec {
+                            required,
+                            landlock,
+                            seccomp,
+                            roots: expected_roots,
+                            check_cmd: check.to_vec(),
+                        },
+                        "mode={mode:?} landlock={landlock} seccomp={seccomp}"
+                    );
                 }
-            );
+            }
         }
     }
 
@@ -1619,10 +1938,12 @@ mod tests {
         // so a `check[0]` like `--` is the command, never a helper flag.
         let nv = Path::new("/nv");
         let check = ["--".to_string(), "weird".to_string()];
-        let argv = build_confine_helper_argv(nv, SandboxMode::Auto, &[], &check);
+        let argv = build_confine_helper_argv(nv, SandboxMode::Auto, true, true, &[], &check);
         let spec = parse_confine_args(&argv[2..]).unwrap();
         assert_eq!(spec.check_cmd, check.to_vec());
         assert!(!spec.required);
+        assert!(spec.landlock);
+        assert!(spec.seccomp);
         assert!(spec.roots.is_empty());
     }
 
@@ -1650,6 +1971,26 @@ mod tests {
             parse_confine_args(&s(&["--mode", "auto", "--mode", "required", "--", "true"]))
                 .is_none()
         );
+        // Duplicate `--landlock` / `--seccomp` (fail closed rather than guess).
+        assert!(
+            parse_confine_args(&s(&["--mode", "auto", "--landlock", "--landlock", "--", "true"]))
+                .is_none()
+        );
+        assert!(
+            parse_confine_args(&s(&["--mode", "auto", "--seccomp", "--seccomp", "--", "true"]))
+                .is_none()
+        );
+        // `--landlock` / `--seccomp` take NO value: a following token is parsed as
+        // the next flag, and an unknown one still fails closed.
+        assert!(
+            parse_confine_args(&s(&["--mode", "auto", "--seccomp", "--bogus", "--", "true"]))
+                .is_none()
+        );
+        // Well-formed with both layer flags parses (sanity floor for the negatives).
+        assert!(
+            parse_confine_args(&s(&["--mode", "required", "--landlock", "--seccomp", "--", "true"]))
+                .is_some()
+        );
     }
 
     /// On Linux, with Landlock requested and a helper path available, the bwrap
@@ -1671,7 +2012,7 @@ mod tests {
         assert_eq!(off_tail, &check, "landlock off must not alter the inner argv");
 
         // Landlock ON: inner == the helper segment wrapping the check.
-        let inner = build_confine_helper_argv(nv, SandboxMode::Required, &roots, &check);
+        let inner = build_confine_helper_argv(nv, SandboxMode::Required, true, false, &roots, &check);
         let on = bwrap_args(&roots, cwd, &inner, false);
         let on_tail = &on[on.iter().position(|a| a == "--").unwrap() + 1..];
         assert_eq!(on_tail[0], "/usr/bin/nv");
@@ -1715,5 +2056,172 @@ mod tests {
                 assert!(out_denied, "out-of-grant write must be DENIED by Landlock");
             }
         }
+    }
+
+    #[test]
+    fn seccomp_denylist_contents_are_sane() {
+        // Non-empty, no duplicates, and contains the canonical escape primitives.
+        assert!(!SECCOMP_DENYLIST.is_empty());
+        let mut seen = std::collections::HashSet::new();
+        for name in SECCOMP_DENYLIST {
+            assert!(seen.insert(*name), "duplicate entry in SECCOMP_DENYLIST: {name}");
+        }
+        for must in ["mount", "ptrace", "bpf", "unshare", "setns", "keyctl"] {
+            assert!(SECCOMP_DENYLIST.contains(&must), "denylist must include {must}");
+        }
+        // It must NOT deny syscalls a normal build/test workload depends on —
+        // denying these would break every check (false positives that defeat the
+        // opt-in) and is exactly the over-reach the denylist is documented to
+        // avoid (no clone-flag filtering, processes must spawn).
+        for must_not in [
+            "clone", "clone3", "execve", "execveat", "openat", "read", "write", "mmap", "futex",
+            "fork", "vfork",
+        ] {
+            assert!(
+                !SECCOMP_DENYLIST.contains(&must_not),
+                "denylist must NOT include the normal-workload syscall {must_not}"
+            );
+        }
+    }
+
+    #[test]
+    fn seccomp_degraded_marker_contract() {
+        // The seccomp degradation message carries its marker, so the parent
+        // (`goal.rs`) re-surfaces it even on a passing check. Seccomp is always
+        // best-effort, so — unlike Landlock — there is no refusal counterpart.
+        let msg = confine_seccomp_degraded_message();
+        assert!(
+            stderr_signals_seccomp_degraded(&msg),
+            "seccomp degraded message must carry its marker: {msg}"
+        );
+        // The two layers' markers are independent channels: a seccomp message must
+        // not trip the Landlock scan and vice-versa, so the parent attributes the
+        // right warning to the right layer.
+        assert!(
+            !stderr_signals_landlock_degraded(&msg),
+            "seccomp message must not trip the Landlock scan: {msg}"
+        );
+        use LandlockEnforcement::*;
+        for e in [Partial, None, Error] {
+            assert!(!stderr_signals_seccomp_degraded(&confine_degraded_message(e)));
+            assert!(!stderr_signals_seccomp_degraded(&confine_refused_message(e)));
+        }
+        // Arbitrary check output never trips it.
+        assert!(!stderr_signals_seccomp_degraded(""));
+        assert!(!stderr_signals_seccomp_degraded("error[E0382]: borrow of moved value"));
+    }
+
+    /// Every name in the platform-independent denylist must map to a real syscall
+    /// number on this Linux build — catches a typo or a renamed `libc::SYS_*`
+    /// constant at build time, and proves the filter actually compiles.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_denylist_all_names_resolve_and_compile() {
+        for name in SECCOMP_DENYLIST {
+            assert!(
+                seccomp_syscall_number(name).is_some(),
+                "denylist name has no libc::SYS_* on this arch: {name}"
+            );
+        }
+        // A clearly-bogus name does NOT resolve (guards the match fall-through).
+        assert!(seccomp_syscall_number("definitely_not_a_syscall").is_none());
+        // The compiled BPF program builds (numbers + arch valid).
+        assert!(
+            build_seccomp_denylist_program().is_ok(),
+            "the denylist must compile into a BPF program"
+        );
+    }
+
+    /// H6 real-kernel proof (CI Linux; ties to H7). With the denylist installed, a
+    /// DENIED syscall (`mount`) must terminate the process by `SIGSYS` while a
+    /// workload using only ALLOWED syscalls runs to a clean exit. The filter is
+    /// built in the parent (that step allocates) and installed in forked children
+    /// that then issue only async-signal-safe syscalls — so applying a
+    /// process-killing filter never takes down the test runner. SKIPPED (not
+    /// failed) where seccomp filtering is unavailable, so it never breaks an
+    /// incapable runner.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_denylist_kills_denied_syscall_but_allows_normal_real_kernel() {
+        let program = match build_seccomp_denylist_program() {
+            Ok(program) => program,
+            Err(()) => {
+                eprintln!("SKIP seccomp real-kernel: denylist did not compile on this build");
+                return;
+            }
+        };
+
+        // --- Child A: install the filter, then attempt a DENIED syscall (mount).
+        // Exit 101 = filter could not be installed (skip); exit 102 = reached only
+        // if mount was NOT blocked (it must instead be killed by SIGSYS).
+        let pid_a = unsafe { libc::fork() };
+        assert!(pid_a >= 0, "fork failed");
+        if pid_a == 0 {
+            // CHILD — async-signal-safe only: no allocation, no panic, no stdio.
+            if seccompiler::apply_filter_all_threads(&program).is_err() {
+                unsafe { libc::_exit(101) };
+            }
+            unsafe {
+                libc::syscall(
+                    libc::SYS_mount,
+                    0 as libc::c_long,
+                    0 as libc::c_long,
+                    0 as libc::c_long,
+                    0 as libc::c_long,
+                    0 as libc::c_long,
+                );
+                libc::_exit(102);
+            }
+        }
+        let mut status_a: libc::c_int = 0;
+        unsafe { libc::waitpid(pid_a, &mut status_a, 0) };
+
+        // --- Child B: install the filter, then issue only ALLOWED syscalls.
+        let pid_b = unsafe { libc::fork() };
+        assert!(pid_b >= 0, "fork failed");
+        if pid_b == 0 {
+            if seccompiler::apply_filter_all_threads(&program).is_err() {
+                unsafe { libc::_exit(101) };
+            }
+            unsafe {
+                libc::syscall(libc::SYS_getpid);
+                // close a bogus fd: returns EBADF, but the syscall is ALLOWED so
+                // the process is not killed.
+                libc::syscall(libc::SYS_close, 999 as libc::c_long);
+                libc::_exit(0);
+            }
+        }
+        let mut status_b: libc::c_int = 0;
+        unsafe { libc::waitpid(pid_b, &mut status_b, 0) };
+
+        // If either child could not install the filter, this kernel lacks usable
+        // seccomp filtering -> skip rather than fail.
+        let install_failed = |status: libc::c_int| {
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 101
+        };
+        if install_failed(status_a) || install_failed(status_b) {
+            eprintln!(
+                "SKIP seccomp real-kernel: the filter could not be installed on this kernel"
+            );
+            return;
+        }
+
+        // The denied syscall must have KILLED the process via SIGSYS (KILL_PROCESS,
+        // or KILL_THREAD on pre-4.14 kernels — both terminate this single-threaded
+        // child with SIGSYS). It must NOT have exited 102 (mount having run).
+        assert!(
+            libc::WIFSIGNALED(status_a),
+            "a denied syscall must terminate the process by signal; status={status_a:#x}"
+        );
+        assert_eq!(
+            libc::WTERMSIG(status_a),
+            libc::SIGSYS,
+            "a denied syscall must be killed with SIGSYS"
+        );
+        // The normal workload must run unaffected.
+        assert!(
+            libc::WIFEXITED(status_b) && libc::WEXITSTATUS(status_b) == 0,
+            "a workload using only allowed syscalls must exit cleanly; status={status_b:#x}"
+        );
     }
 }
