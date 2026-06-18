@@ -53,16 +53,31 @@ jobs:
         # base it can create per-check leaf cgroups under, with the pids+memory
         # controllers delegated to the runner user. On a unified-hierarchy systemd
         # host (ubuntu-latest) we create a base under the root cgroup, make the
-        # controllers available to it, and hand ownership to the runner. We then
-        # SELF-TEST, as the runner, that a child cgroup can actually be created and
-        # pids.max written — mirroring exactly what the production code does. Only
-        # if that succeeds do we export NERVE_CGROUP_PARENT, which makes the Rust
-        # proof RUN (and it PANICS if it then cannot create a cgroup — so once we
-        # claim delegation works there is no silent green-skip). If a future runner
-        # image withdraws delegation we log a loud warning and leave the env unset,
-        # so the proof SKIPS rather than failing CI on an environment limitation;
-        # the degrade-with-note path is covered by an always-on unit test
-        # (degrades_with_surfaced_note_when_base_unusable) regardless.
+        # controllers available to it, and hand ownership to the runner.
+        #
+        # We then SELF-TEST, as the runner, TWO things the production path needs:
+        #   (1) a child cgroup can be created and pids.max written (controller
+        #       delegation), and
+        #   (2) a process living INSIDE the subtree can migrate a child into a
+        #       SIBLING leaf without sudo. (2) is the part a leaf-create-only
+        #       self-test missed: cgroup v2 "delegation containment" allows a
+        #       migration only when the writer also has write access to the
+        #       common ancestor of the source and destination cgroups. A process
+        #       in the runner's default cgroup (outside the subtree) shares only
+        #       the ROOT cgroup with our leaves, whose cgroup.procs the runner
+        #       cannot write — so the canary's pre_exec join EACCESes even though
+        #       the leaf itself is writable. Mirroring the real migration here is
+        #       what proves the proof will actually run.
+        #
+        # Only if BOTH succeed do we export NERVE_CGROUP_PARENT, which makes the
+        # Rust proof RUN (and it PANICS if it then cannot create a cgroup — so once
+        # we claim delegation works there is no silent green-skip). The test step
+        # below moves the test process into the `runner` leaf created here so its
+        # canary migration shares a runner-owned common ancestor with the per-check
+        # leaves. If a future runner image withdraws delegation or migration we log
+        # a loud warning and leave the env unset, so the proof SKIPS rather than
+        # failing CI on an environment limitation; the degrade-with-note path is
+        # covered by an always-on unit test (degrades_with_surfaced_note_when_base_unusable).
         run: |
           set -x
           if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
@@ -73,15 +88,39 @@ jobs:
           sudo mkdir -p "$base"
           echo "+pids +memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null || true
           sudo chown -R "$(id -u):$(id -g)" "$base"
-          if mkdir "$base/selftest" 2>/dev/null \
-             && echo "+pids +memory" > "$base/cgroup.subtree_control" 2>/dev/null \
-             && echo 6 > "$base/selftest/pids.max" 2>/dev/null; then
-            echo "cgroup delegation OK; controllers: $(cat "$base"/cgroup.controllers)"
-            rmdir "$base/selftest" 2>/dev/null || true
+          ok=1
+          # (1) leaf creation + controller delegation. `runner` is the leaf the
+          # test process will live in; `selftest` is a throwaway migration target.
+          # Writing pids.max also PROVES the pids controller is delegated (the
+          # interface file is absent — ENOENT — if it is not).
+          mkdir "$base/runner"   2>/dev/null || ok=0
+          mkdir "$base/selftest" 2>/dev/null || ok=0
+          echo "+pids +memory" > "$base/cgroup.subtree_control" 2>/dev/null || ok=0
+          echo 6 > "$base/selftest/pids.max" 2>/dev/null || ok=0
+          # (2) in-subtree migration — the exact permission the canary's pre_exec
+          # join needs. Move THIS shell into the runner leaf via ONE root-privileged
+          # bootstrap (root is exempt from delegation containment), then — as the
+          # runner uid, NO sudo — migrate a child into the SIBLING selftest leaf.
+          # That unprivileged write succeeds only when the common ancestor (base)
+          # is runner-writable, which is precisely what production relies on.
+          if [ "$ok" = 1 ]; then
+            if sudo sh -c "echo $$ > '$base/runner/cgroup.procs'" 2>/dev/null \
+               && grep -qF '/nerve.test/runner' /proc/self/cgroup; then
+              sleep 30 &
+              helper=$!
+              echo "$helper" > "$base/selftest/cgroup.procs" 2>/dev/null || ok=0
+              kill "$helper" 2>/dev/null || true
+              wait "$helper" 2>/dev/null || true
+            else
+              ok=0
+            fi
+          fi
+          rmdir "$base/selftest" 2>/dev/null || true
+          if [ "$ok" = 1 ]; then
+            echo "cgroup delegation + in-subtree migration OK; controllers: $(cat "$base"/cgroup.controllers)"
             echo "NERVE_CGROUP_PARENT=$base" >> "$GITHUB_ENV"
           else
-            echo "::warning::cgroup v2 delegation unavailable to the runner; H15 fork-bomb cap proof will SKIP (degrade path is unit-tested). controllers: $(cat "$base"/cgroup.controllers 2>/dev/null || echo none)"
-            rmdir "$base/selftest" 2>/dev/null || true
+            echo "::warning::cgroup v2 delegation/migration unavailable to the runner; H15 fork-bomb cap proof will SKIP (degrade path is unit-tested). controllers: $(cat "$base"/cgroup.controllers 2>/dev/null || echo none)"
           fi
 
       - name: Versions
@@ -100,12 +139,29 @@ jobs:
         # this job cannot silently green-skip any confinement proof on a runner
         # that has those features. The H15 cgroup fork-bomb cap proof keys on its
         # own opt-in signal instead: NERVE_CGROUP_PARENT (exported by the step
-        # above only after a successful delegation self-test) makes it RUN and
-        # PANIC if the cgroup cannot be created. `--nocapture` surfaces each
-        # proof's run/skip line.
+        # above only after a successful delegation + migration self-test) makes it
+        # RUN and PANIC if the cgroup cannot be created.
+        #
+        # When that env is set we first move THIS shell into the delegated `runner`
+        # leaf so the canary's unprivileged pre_exec cgroup.procs migration shares
+        # a runner-owned common ancestor (the base) with the per-check leaves —
+        # cgroup v2 delegation containment denies the migration with EACCES
+        # otherwise, even though the leaf itself is writable. One root-privileged
+        # bootstrap move; everything the proof itself does stays unprivileged,
+        # exactly like production. If the move fails we fail loudly rather than run
+        # the proof outside the subtree (which would EACCES and look like a code
+        # bug). `--nocapture` surfaces each proof's run/skip line.
         env:
           NERVE_CI_REAL_KERNEL: "1"
-        run: cargo test --workspace --locked -- --nocapture
+        run: |
+          set -x
+          if [ -n "${NERVE_CGROUP_PARENT:-}" ]; then
+            sudo mkdir -p "$NERVE_CGROUP_PARENT/runner"
+            sudo sh -c "echo $$ > '$NERVE_CGROUP_PARENT/runner/cgroup.procs'" \
+              || { echo "::error::could not move test process into $NERVE_CGROUP_PARENT/runner"; exit 1; }
+            echo "test process cgroup: $(cat /proc/self/cgroup)"
+          fi
+          cargo test --workspace --locked -- --nocapture
 
   # H9: prove the Windows RPC-token owner-only DACL on a real Windows kernel.
   # The owner-only SDDL is unit-tested on every platform and the Win32 path is
