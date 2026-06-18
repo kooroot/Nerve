@@ -765,7 +765,7 @@ no-op, `cancelled` 항상 false ⇒ S15 이전과 비트 동일. (N5) **bulk can
 | H4 | Wave 1 | M | ✅ | Add a runtime confinement self-test so Required fails closed when a wrap is silently ineffective |
 | H5 | Wave 2 | L | ✅ | Add an optional Linux Landlock filesystem layer (BestEffort) composed over the existing bwrap jail |
 | H6 | Wave 2 | M | ✅ | Add an opt-in seccomp-bpf denylist of dangerous syscalls (off by default, never gates acceptance) |
-| H7 | Wave 2 | M | ⬜ | Add a Linux real-kernel confinement proof test in CI (mirror the macOS proof) |
+| H7 | Wave 2 | M | ✅ | Add a Linux real-kernel confinement proof test in CI (mirror the macOS proof) |
 | H8 | Wave 2 | M | ✅ | Harden the macOS SBPL baseline and add a sandbox-exec deprecation canary |
 | H9 | Wave 3 | M | ⬜ | Apply an owner-only ACL to the Windows RPC token file (platform parity for a stated guard) |
 | H10 | Wave 3 | M | ✅ | HMAC the budget audit hash chain (or external anchor) and soften 'tampering' wording |
@@ -866,7 +866,7 @@ no-op, `cancelled` 항상 false ⇒ S15 이전과 비트 동일. (N5) **bulk can
 
 #### H7 — Add a Linux real-kernel confinement proof test in CI (mirror the macOS proof)
 
-**Wave 2 · effort M · ⬜ 미착수** · 의존: —
+**Wave 2 · effort M · ✅ DONE** · 의존: —
 
 - **왜(보안 근거):** Required mode promises fail-closed confinement on Linux, but today only the bwrap ARGV is unit-tested — the runtime path is never exercised on a real kernel. A bwrap version/flag drift, a missing namespace capability, or a distro with unprivileged userns disabled could silently degrade confinement while still emitting the expected args, so the gate could run project code effectively unconfined while reporting success-direction results.
 - **현재 상태:** The real-kernel proof (seatbelt_profile_denies_direct_out_of_root_write, sandbox.rs:470-505) is macOS-only (cfg(target_os="macos")). bwrap is validated only at arg-generation level (sandbox.rs:39-45 docstring concedes this).
@@ -875,6 +875,8 @@ no-op, `cancelled` 항상 false ⇒ S15 이전과 비트 동일. (N5) **bulk can
 - **파일 seam:** crates/nerve-core/src/sandbox.rs:470-505 (test region); crates/nerve-core/src/sandbox.rs:240-295 (bwrap path under test); CI workflow (Linux runner)
 - **리스크:** CI runners may lack unprivileged userns; the test must skip-with-message rather than false-fail, while still failing loudly when bwrap IS available but does NOT confine. Care to keep it deterministic and fast.
 - **수락 기준:** cargo build/test green + clippy -D warnings; the Linux real-kernel test passes on a CI Linux runner and proves out-of-root write denial + net unshare; it skips cleanly (not silently passes) where the kernel lacks support; two consecutive no-blocking codex reviews; invariant: purely additive test coverage, no production behavior change, accept gate untouched.
+
+> **진행 로그 (✅ DONE):** **신규 `#[cfg(target_os="linux")]` 실커널 프루프** `bwrap_confines_writes_and_unshares_network_real_kernel`를 macOS 프루프(`seatbelt_profile_denies_direct_out_of_root_write`)의 Linux 대응으로 추가 — **production 결정 경로**(`decide`→`bwrap_decide`→`bwrap_args`, 신뢰 bwrap 해석)로 canary를 `Required`에서 실행해 ① in-root write 성공(**positive control** — bwrap가 자식을 실제 spawn했음도 입증), ② out-of-root write **DENIED**(host `/`가 ro-bind), ③ 자식 network namespace **UNSHARED**(`net:[inode]`가 host와 상이, `--unshare-net`)를 실커널에서 검증. **skip/fail 규율:** `decide`가 `Wrap` 미반환(신뢰 bwrap 없음)이거나 positive-control write 미착지(userns 불가)면 **SKIP**(dev host false-fail 없음), 그러나 bwrap가 자식을 띄웠는데 escape write가 착지하면 = 실제 confinement 회귀 → **loud FAIL**(파일 존재=ground truth, exit code 불신). **CI green-skip 방지:** 공유 게이트 `skip_or_require_real_kernel`가 `NERVE_CI_REAL_KERNEL` 비어있지 않을 때 SKIP→**panic** 전환 — **세 실커널 프루프(H5 Landlock·H6 seccomp·H7 bwrap)의 모든 skip 경로**(netns host-read 실패 포함)가 이 단일 게이트를 경유 → 문서가 "Linux 실커널 프루프가 CI에서 실제 실행"을 모든 프루프에 대해 **참으로 만들어 정직**. **신규 `.github/workflows/ci.yml`**: ubuntu 잡이 bubblewrap 설치 + unprivileged userns 활성화(Ubuntu 24.04 AppArmor 제한 해제, `|| true`) 후 `NERVE_CI_REAL_KERNEL=1`로 `cargo test --workspace` → H4/H5/H6/H7 cfg(linux) 프루프 실제 실행. **Windows 테스트 잡은 의도적 제외**(테스트 빌드 Windows 크로스 미정리, task #33) → CI는 Windows-runtime 무주장. **불변식:** 순수 가산적 테스트+CI, **production 동작 무변경**(`decide`/`bwrap_decide`/`bwrap_args` 및 결정적 accept gate byte-unchanged), H5/H6 production 코드·dev-host skip 의미 불변. 검증: host build/test(nerve-core 271)/clippy + **Linux cross-clippy `--all-targets`**(Linux-gated H5/H6/H7 테스트 본문 type/borrow/lint 검증) + Windows cross-clippy 전부 green(매 사이클); Linux `--no-run`은 macOS GNU 크로스링커 부재로 링크만 실패 = 환경 제약(코드 결함 아님). **게이트 통과:** DOUBLE 3사이클 — c1(`8aa8809`) r1 REQUEST_CHANGES(오버클레임: H7만 env 게이트 읽고 H5/H6 무성 skip) → 전 skip 경로를 공유 게이트로 라우팅; c2(`389f81c`) r1+r2 ACCEPT_WITH_NITS(netns 서브프루프 host-read 실패 시 무성 no-op) → netns Err도 게이트 경유; **c3(`4d2c13a`) r1=LGTM, r2=LGTM(2연속 no-blocking, 0 findings)**. 양 리뷰어 file:line으로 재확인: production 경로 무변경, 전 skip 경로 게이트 경유(2051/2150/2206/2300/2321/2350), 헬퍼는 `NERVE_CI_REAL_KERNEL` 비어있지 않을 때만 panic(2242), CI가 `"1"` 설정, `run:` 스텝에 untrusted `github.event.*` 보간 없음, README 범위가 코드와 일치(Landlock/seccomp runtime은 여전히 best-effort로 정직). 코드 커밋 `4d2c13a`(sandbox.rs 테스트 + README + ci.yml). 산출물 `/tmp/codex-security-scans/Nerve/4d2c13a_h7_r{1,2}`.
 
 #### H8 — Harden the macOS SBPL baseline and add a sandbox-exec deprecation canary
 
