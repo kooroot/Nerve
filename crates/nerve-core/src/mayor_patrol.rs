@@ -1429,34 +1429,25 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Test helper: rewind `path`'s mtime + atime by `seconds`. We hit
-    /// `utimes(2)` directly so the test suite does not need the
-    /// `filetime` crate as a workspace dep.
-    #[cfg(unix)]
+    /// Test helper: rewind `path`'s mtime + atime by `seconds`. Uses the
+    /// portable `File::set_times` (stable std) so this compiles on every
+    /// target — the previous `utimes(2)` path was `#[cfg(unix)]` yet the
+    /// callers are not, which broke the Windows cross-compile of the test
+    /// build (no `filetime` dep is needed either way).
     fn backdate_to_seconds_ago(path: &Path, seconds: u64) {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock before epoch")
-            .as_secs();
-        let target = now.saturating_sub(seconds) as libc::time_t;
-        let times = [
-            libc::timeval {
-                tv_sec: target,
-                tv_usec: 0,
-            },
-            libc::timeval {
-                tv_sec: target,
-                tv_usec: 0,
-            },
-        ];
-        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
-        // SAFETY: `c_path` is a valid C string; `times` is a 2-element
-        // timeval array of the expected length.
-        let rc = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
-        assert_eq!(rc, 0, "utimes failed: {}", std::io::Error::last_os_error());
+        let target = SystemTime::now()
+            .checked_sub(Duration::from_secs(seconds))
+            .expect("backdated time underflows the clock");
+        let times = fs::FileTimes::new()
+            .set_accessed(target)
+            .set_modified(target);
+        // Open for write: Windows requires write/attribute access to update a
+        // file's timestamps; Unix is permissive but write is harmless here.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open file to backdate its timestamps");
+        file.set_times(times).expect("set_times failed");
     }
 
     fn cfg() -> MayorPatrolConfig {
