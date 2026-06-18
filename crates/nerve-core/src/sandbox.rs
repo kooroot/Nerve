@@ -2048,8 +2048,9 @@ mod tests {
         .unwrap();
 
         match observed {
-            None => eprintln!(
-                "SKIP landlock_denies_out_of_grant_write_real_kernel: Landlock not fully enforced on this kernel"
+            None => skip_or_require_real_kernel(
+                "landlock_denies_out_of_grant_write_real_kernel",
+                "Landlock not fully enforced on this kernel",
             ),
             Some((in_ok, out_denied)) => {
                 assert!(in_ok, "in-grant write must succeed under Landlock");
@@ -2146,8 +2147,10 @@ mod tests {
         let program = match build_seccomp_denylist_program() {
             Ok(program) => program,
             Err(()) => {
-                eprintln!("SKIP seccomp real-kernel: denylist did not compile on this build");
-                return;
+                return skip_or_require_real_kernel(
+                    "seccomp_denylist_kills_denied_syscall_but_allows_normal_real_kernel",
+                    "the seccomp denylist did not compile on this build",
+                );
             }
         };
 
@@ -2200,10 +2203,10 @@ mod tests {
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 101
         };
         if install_failed(status_a) || install_failed(status_b) {
-            eprintln!(
-                "SKIP seccomp real-kernel: the filter could not be installed on this kernel"
+            return skip_or_require_real_kernel(
+                "seccomp_denylist_kills_denied_syscall_but_allows_normal_real_kernel",
+                "the seccomp filter could not be installed on this kernel",
             );
-            return;
         }
 
         // The denied syscall must have KILLED the process via SIGSYS (KILL_PROCESS,
@@ -2222,6 +2225,152 @@ mod tests {
         assert!(
             libc::WIFEXITED(status_b) && libc::WEXITSTATUS(status_b) == 0,
             "a workload using only allowed syscalls must exit cleanly; status={status_b:#x}"
+        );
+    }
+
+    /// Skip/require gate shared by ALL the Linux real-kernel proofs (H5 Landlock,
+    /// H6 seccomp, H7 bwrap). On a dev host (env unset) a missing-support condition
+    /// SKIPS (prints, returns) so it never false-fails a workstation lacking the
+    /// relevant kernel feature (bwrap/user-namespaces, Landlock, or seccomp
+    /// filtering). In CI we set `NERVE_CI_REAL_KERNEL=1` on a runner where those
+    /// features are present, which turns the same condition into a PANIC —
+    /// otherwise a confinement proof could silently green-skip and prove nothing.
+    /// Routing every proof's skip through this one gate is what makes the CI claim
+    /// ("the Linux real-kernel proofs actually run") true for all of them, not just
+    /// the bwrap proof.
+    #[cfg(target_os = "linux")]
+    fn skip_or_require_real_kernel(test: &str, reason: &str) {
+        if std::env::var_os("NERVE_CI_REAL_KERNEL").is_some_and(|v| !v.is_empty()) {
+            panic!(
+                "NERVE_CI_REAL_KERNEL is set but the real-kernel confinement proof `{test}` could not run: {reason}"
+            );
+        }
+        eprintln!("SKIP {test}: {reason}");
+    }
+
+    /// H7 real-kernel proof (CI Linux; the Linux mirror of
+    /// [`seatbelt_profile_denies_direct_out_of_root_write`]). Runs a canary
+    /// through the PRODUCTION decision path (`decide` → `bwrap_decide` →
+    /// `bwrap_args`, resolving a trusted `bwrap`) under `Required` and asserts the
+    /// jail actually confines on a real kernel:
+    ///   * a write INSIDE the only writable root succeeds (positive control — also
+    ///     proves bwrap launched the child at all),
+    ///   * a write OUTSIDE every writable root is DENIED (the host `/` is bound
+    ///     read-only),
+    ///   * the child's network namespace is UNSHARED — a different `net:[inode]`
+    ///     than the host (`--unshare-net`).
+    ///
+    /// This is the bwrap-LEVEL proof (no Landlock/seccomp helper spliced in; H5/H6
+    /// prove their own layers' real-kernel behaviour). Skip-vs-fail discipline: if
+    /// `decide` does not return `Wrap` (no trusted bwrap) or the positive-control
+    /// write does not land (bwrap could not create an unprivileged user
+    /// namespace), the proof SKIPS — it never false-fails a host without
+    /// bwrap/userns. But if bwrap DID launch the child and the out-of-root write
+    /// nonetheless succeeds, that is a real confinement regression and the test
+    /// FAILS loudly. In CI, `NERVE_CI_REAL_KERNEL` converts the "support missing"
+    /// skip into a hard failure so the CI proof can never silently green-skip.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bwrap_confines_writes_and_unshares_network_real_kernel() {
+        use std::process::Command as StdCommand;
+
+        const TEST: &str = "bwrap_confines_writes_and_unshares_network_real_kernel";
+
+        let work = tempfile::tempdir().unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        // Canonicalize so the rw-bind path matches the kernel's symlink-resolved
+        // view (mirrors the macOS proof).
+        let work = std::fs::canonicalize(work.path()).unwrap();
+        let sibling = std::fs::canonicalize(sibling.path()).unwrap();
+
+        // Production decision path: Required, no network, no Landlock/seccomp
+        // helper — the bwrap-level proof.
+        let config = cfg(SandboxMode::Required, false);
+
+        // Build the bwrap argv for `inner` via `decide`: the wrapper program+args,
+        // or `None` when no trusted bwrap is resolvable.
+        let wrap = |inner: &[String]| -> Option<(String, Vec<String>)> {
+            match decide(&config, &work, inner, &[], None) {
+                SandboxDecision::Wrap { program, args } => Some((program, args)),
+                _ => None,
+            }
+        };
+
+        if wrap(&["true".to_string()]).is_none() {
+            return skip_or_require_real_kernel(
+                TEST,
+                "no trusted bwrap binary is installed (decide did not return Wrap)",
+            );
+        }
+
+        let run_status = |inner: &[String]| {
+            let (program, args) = wrap(inner).expect("wrap resolved above");
+            let _ = StdCommand::new(program).args(args).status();
+        };
+
+        // Positive control: a write inside the writable root. If it does not land,
+        // bwrap could not set up the namespace on this kernel -> skip (or, in CI,
+        // fail because the proof did not actually run).
+        let ok = work.join("ok.txt");
+        run_status(&[
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo hi > {}", ok.display()),
+        ]);
+        if !ok.exists() {
+            return skip_or_require_real_kernel(
+                TEST,
+                "bwrap could not launch a confined child (unprivileged user namespaces disabled?)",
+            );
+        }
+
+        // Confinement proof #1: a write OUTSIDE every writable root must be denied
+        // by the read-only host bind.
+        let escape = sibling.join("escape.txt");
+        run_status(&[
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo hi > {}", escape.display()),
+        ]);
+        assert!(
+            !escape.exists(),
+            "out-of-root write must be DENIED inside the bwrap jail; the host filesystem is bound read-only"
+        );
+
+        // Confinement proof #2: the network namespace must be unshared. The child
+        // sees a different `net:[inode]` than the host (`--unshare-net`). /proc is
+        // freshly mounted in the jail, so /proc/self/ns/net is the child's. If the
+        // HOST's own `/proc/self/ns/net` is unreadable (a kernel without namespace
+        // support — never a normal CI runner), route that support gap through the
+        // shared gate too, so this sub-proof can't silently no-op under
+        // `NERVE_CI_REAL_KERNEL` (it would otherwise quietly skip the netns check).
+        let host_ns = match std::fs::read_link("/proc/self/ns/net") {
+            Ok(ns) => ns,
+            Err(_) => {
+                return skip_or_require_real_kernel(
+                    TEST,
+                    "host /proc/self/ns/net is unreadable (kernel without namespace support?)",
+                );
+            }
+        };
+        let (program, args) = wrap(&[
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "readlink /proc/self/ns/net".to_string(),
+        ])
+        .expect("wrap resolved above");
+        let out = StdCommand::new(program).args(args).output().unwrap();
+        let child_ns = String::from_utf8_lossy(&out.stdout);
+        let child_ns = child_ns.trim();
+        assert!(
+            !child_ns.is_empty(),
+            "could not read the child's network namespace; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_ne!(
+            child_ns,
+            host_ns.to_string_lossy().trim(),
+            "the child's network namespace must be UNSHARED (a different inode from the host)"
         );
     }
 }

@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # H7: run the Linux real-kernel confinement proofs on an actual kernel. The
+  # bwrap argv (H5/H6/H7) and decision logic are unit-tested on every platform,
+  # but the runtime jail — out-of-root write denial, network unshare, Landlock
+  # write-confinement, the seccomp denylist — can only be PROVEN on a real Linux
+  # kernel with bubblewrap installed. This job installs bwrap, enables
+  # unprivileged user namespaces, and runs the workspace tests so the
+  # `#[cfg(target_os = "linux")]` real-kernel proofs in `nerve-core::sandbox`
+  # actually execute instead of compiling-only on the macOS/Windows dev host.
+  #
+  # Scope: Linux only. A Windows test job is intentionally NOT added here yet —
+  # the test build does not cross-compile clean for Windows (tracked separately),
+  # so adding it would make CI permanently red rather than prove anything.
+  linux-real-kernel:
+    name: Linux real-kernel confinement proofs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install bubblewrap (the Linux sandbox backend under test)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+
+      - name: Enable unprivileged user namespaces
+        # The bwrap proof (H7) needs unprivileged user namespaces; Ubuntu 24.04
+        # restricts them via AppArmor by default, which would make the proof SKIP.
+        # Clearing the restriction lets it RUN. `|| true`: these keys do not exist
+        # on older kernels, where userns is already unrestricted.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+
+      - name: Versions
+        run: |
+          uname -a
+          cargo --version
+          bwrap --version
+
+      - name: Build (workspace)
+        run: cargo build --workspace --locked
+
+      - name: Run tests — real-kernel confinement proofs must actually run here
+        # NERVE_CI_REAL_KERNEL turns a "kernel lacks support" SKIP into a loud
+        # FAILURE for EVERY Linux real-kernel proof (bwrap [H7], Landlock [H5],
+        # seccomp [H6]) — they all route their skip through one shared gate — so
+        # this job cannot silently green-skip any confinement proof on a runner
+        # that has those features. `--nocapture` surfaces each proof's run/skip line.
+        env:
+          NERVE_CI_REAL_KERNEL: "1"
+        run: cargo test --workspace --locked -- --nocapture
