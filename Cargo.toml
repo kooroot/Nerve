@@ -32,6 +32,16 @@ libc = "0.2"
 # crate behind Firecracker's jailer). Linux-only target dependency, like
 # `landlock`; cross-compiles cleanly for clippy.
 seccompiler = "0.5"
+# H9: Win32 security APIs for the Windows-only owner-only DACL on the RPC token
+# file (parity with the Unix 0o600 guard). Windows-only target dependency;
+# cross-compiles cleanly for clippy on the macOS dev host (no link needed).
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
 hmac = "0.12"
 rand = "0.8"
 ratatui = "0.28"

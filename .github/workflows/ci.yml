@@ -21,9 +21,9 @@ jobs:
   # `#[cfg(target_os = "linux")]` real-kernel proofs in `nerve-core::sandbox`
   # actually execute instead of compiling-only on the macOS/Windows dev host.
   #
-  # Scope: Linux only. A Windows test job is intentionally NOT added here yet —
-  # the test build does not cross-compile clean for Windows (tracked separately),
-  # so adding it would make CI permanently red rather than prove anything.
+  # Scope: this job is Linux-only (macOS Seatbelt has its own macOS-host tests).
+  # The Windows runtime is covered by the separate `windows-token-acl` job below
+  # (H9), which proves the Windows RPC-token owner-only DACL on `windows-latest`.
   linux-real-kernel:
     name: Linux real-kernel confinement proofs
     runs-on: ubuntu-latest
@@ -106,3 +106,42 @@ jobs:
         env:
           NERVE_CI_REAL_KERNEL: "1"
         run: cargo test --workspace --locked -- --nocapture
+
+  # H9: prove the Windows RPC-token owner-only DACL on a real Windows kernel.
+  # The owner-only SDDL is unit-tested on every platform and the Win32 path is
+  # cross-compile/clippy-checked on the macOS dev host, but the actual
+  # CreateFileW-with-SECURITY_ATTRIBUTES + GetNamedSecurityInfoW read-back can
+  # only be PROVEN on Windows. The `rpc::` tests include
+  # `windows_token_file_is_owner_only_real`, which writes a token through the
+  # production path and asserts the on-disk DACL is exactly one owner ACE on a
+  # PROTECTED DACL (with a negative control that a default-ACL file is rejected),
+  # plus two regressions: an existing non-owner-only token is rotated rather than
+  # reused on startup, and the CREATE_NEW staging refuses a pre-existing file so
+  # token bytes never land under a stale/planted wider ACL.
+  #
+  # Scope: this job runs ONLY the `nerve-core` `rpc::` tests, not the whole
+  # workspace, so it proves H9 without coupling to unrelated Windows-runtime
+  # behaviour of other modules. The test target still fully compiles for Windows
+  # (which is what the macOS `--target x86_64-pc-windows-msvc --all-targets`
+  # clippy gate checks), so a Windows-only compile regression is caught here too.
+  windows-token-acl:
+    name: Windows RPC token owner-only ACL proof
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Versions
+        run: |
+          cargo --version
+          rustc --version
+
+      - name: Run the Windows RPC token owner-only DACL proof
+        # `rpc::` selects both the platform-independent owner_only_sddl unit test
+        # and the Windows-only owner-only DACL runtime proof. `--nocapture`
+        # surfaces the assertion lines.
+        run: |
+          cargo test -p nerve-core --locked --lib rpc:: -- --nocapture
