@@ -175,8 +175,28 @@ impl GoalEvaluator {
             .as_ref()
             .map(|dir| vec![dir.path().to_path_buf()])
             .unwrap_or_default();
-        let decision =
-            sandbox::decide(&self.sandbox, &self.cwd, &self.goal.check_cmd, &extra_writable);
+        // H5: when Landlock is requested (Linux), resolve the trusted path to the
+        // running Nerve binary so `decide` can splice in the in-jail confinement
+        // helper. `None` (Landlock off, or `current_exe` unresolved) ⇒ no helper:
+        // under `Required` `decide` then refuses (fail closed); under `Auto` it
+        // falls back to bwrap-only, warned here.
+        let confine_helper = confine_helper_path(&self.sandbox);
+        if self.sandbox.landlock
+            && confine_helper.is_none()
+            && self.sandbox.mode == nerve_config::SandboxMode::Auto
+        {
+            tracing::warn!(
+                target: "nerve::sandbox",
+                "sandbox.landlock=true but the Nerve binary path could not be resolved; running under bwrap-only confinement (Auto best-effort)"
+            );
+        }
+        let decision = sandbox::decide(
+            &self.sandbox,
+            &self.cwd,
+            &self.goal.check_cmd,
+            &extra_writable,
+            confine_helper.as_deref(),
+        );
         // H13: capture the additive degrade signal BEFORE the match consumes the
         // decision. True ONLY for the `Auto` no-backend degrade
         // (`Unconfined { warning: Some(_) }`) — never for `Off` (intentionally
@@ -345,6 +365,30 @@ impl GoalEvaluator {
         };
 
         let (stdout_res, stderr_res) = drained;
+
+        // H5: re-surface the in-jail Landlock best-effort degradation through the
+        // operator's tracing channel BEFORE the output-cap early-returns below, so
+        // it fires on every outcome where the check's stderr was captured — a
+        // normal pass OR fail, and even a stdout-cap abort. The helper stamps the
+        // marker only under `Auto` (`Required` refuses before the check ever runs);
+        // the captured child stderr is otherwise echoed only on the failure path,
+        // so without this a *passing* check on a Landlock-less kernel would be
+        // silently un-hardened. The only outcomes that cannot be scanned are a
+        // timeout (child killed mid-drain, no captured stderr) and a stderr-cap
+        // abort (`stderr_res` is `Err`) — both already fail the check loudly. The
+        // `&stderr_res` borrow ends before the cap checks read it. The marker rides
+        // the check's own stderr, so a hostile check can spoof a spurious — never
+        // suppress a real — best-effort warning; it is fail-safe observability that
+        // changes neither which command runs nor the pass/fail verdict.
+        if let Ok(stderr_text) = &stderr_res
+            && sandbox::stderr_signals_landlock_degraded(stderr_text)
+        {
+            tracing::warn!(
+                target: "nerve::sandbox",
+                "sandbox.landlock=true ran best-effort: the kernel could not fully enforce Landlock, so this check ran under bwrap-only confinement. Set sandbox.mode=required to fail closed instead."
+            );
+        }
+
         if let Err(OutputCapExceeded(byte_cap)) = stdout_res {
             return Ok(CheckOutcome {
                 result: CheckResult::Fail {
@@ -456,6 +500,21 @@ fn private_check_tmpdir(sandbox: &SandboxConfig) -> Result<Option<TempDir>, Goal
     Ok(Some(dir))
 }
 
+/// H5: resolve the trusted path to the running Nerve binary, used to splice the
+/// in-jail Landlock confinement helper into the bwrap wrap argv. Returns `None`
+/// when Landlock is not requested (so the helper is never spliced in) or when
+/// `current_exe` cannot be resolved. `current_exe` reads the actual running image
+/// (Linux: `/proc/self/exe`), which the operator launched — a trusted root (an
+/// attacker who can replace it has already won, the same trust class as bwrap
+/// itself). Kept here (production runtime) rather than in `decide` so `decide`
+/// stays pure and the helper path is test-injectable.
+fn confine_helper_path(sandbox: &SandboxConfig) -> Option<PathBuf> {
+    if !sandbox.landlock {
+        return None;
+    }
+    std::env::current_exe().ok()
+}
+
 /// H4 verdict (keyed on FILE PRESENCE, never an exit code — exit codes are
 /// invertible, file presence is not). The wrap is confining iff the out-of-grant
 /// ESCAPE write was DENIED (no file) AND the in-grant LIVE marker proves the
@@ -499,14 +558,21 @@ async fn run_confinement_probe(
         "-c".to_string(),
         script.to_string(),
     ];
-    let (program, args) = match sandbox::decide(config, cwd, &canary_cmd, profile_writable) {
-        SandboxDecision::Wrap { program, args } => (program, args),
-        // We are only called on the real check's `Wrap` path, and `decide` keys
-        // its Wrap/Refuse choice on backend availability (not the inner command),
-        // so the canary also decides `Wrap`. Any other decision means we cannot
-        // prove confinement -> fail closed.
-        _ => return Ok(false),
-    };
+    // H5: the canary must run under the SAME wrap the real check will use,
+    // including the in-jail Landlock helper, so it proves the COMPOSED stack
+    // (bwrap + Landlock) denies the out-of-grant write. Resolve the helper the
+    // same way the real path does.
+    let confine_helper = confine_helper_path(config);
+    let (program, args) =
+        match sandbox::decide(config, cwd, &canary_cmd, profile_writable, confine_helper.as_deref())
+        {
+            SandboxDecision::Wrap { program, args } => (program, args),
+            // We are only called on the real check's `Wrap` path, and `decide`
+            // keys its Wrap/Refuse choice on backend availability (not the inner
+            // command), so the canary also decides `Wrap`. Any other decision
+            // means we cannot prove confinement -> fail closed.
+            _ => return Ok(false),
+        };
     let mut command = Command::new(&program);
     command
         .args(&args)

@@ -417,8 +417,25 @@ enum TemplateCommand {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // H5: if this process was started as the in-jail Landlock confinement helper
+    // (`nv __nv-confine … -- <check>`, spliced into Nerve's own bwrap wrap argv on
+    // Linux), apply the Landlock ruleset on this sole thread and `execve` the
+    // real check — BEFORE building the tokio runtime, so no worker thread exists
+    // when Landlock is applied and the exec replaces a single-threaded image. On
+    // success it never returns; on refusal it exits non-zero (fail closed). A
+    // normal `nv` invocation returns immediately and proceeds to the runtime.
+    #[cfg(target_os = "linux")]
+    nerve_core::sandbox::maybe_run_confine_helper();
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the async runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("NERVE_LOG")

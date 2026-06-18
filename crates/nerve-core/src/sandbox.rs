@@ -127,26 +127,34 @@ pub enum SandboxDecision {
 /// program) in `cwd` under `config`. `extra_writable_roots` are absolute
 /// directories — in addition to `cwd`, which is always writable — that the check
 /// may write to (production passes the system temp dir so build tools work).
+///
+/// H5: `confine_helper`, when `Some`, is the trusted absolute path to the running
+/// Nerve binary, used ONLY on Linux when `config.landlock` is set — it is spliced
+/// into the bwrap argv as the in-jail Landlock helper (`bwrap … -- <nv>
+/// __nv-confine … -- <check>`). It is ignored on macOS and when Landlock is off.
 pub fn decide(
     config: &SandboxConfig,
     cwd: &Path,
     check_cmd: &[String],
     extra_writable_roots: &[PathBuf],
+    confine_helper: Option<&Path>,
 ) -> SandboxDecision {
     if !config.is_enabled() {
         return SandboxDecision::Unconfined { warning: None };
     }
     #[cfg(target_os = "macos")]
     {
+        // Landlock is Linux-only; the macOS Seatbelt backend ignores the helper.
+        let _ = confine_helper;
         seatbelt_decide(config, cwd, check_cmd, extra_writable_roots)
     }
     #[cfg(target_os = "linux")]
     {
-        bwrap_decide(config, cwd, check_cmd, extra_writable_roots)
+        bwrap_decide(config, cwd, check_cmd, extra_writable_roots, confine_helper)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (cwd, check_cmd, extra_writable_roots);
+        let _ = (cwd, check_cmd, extra_writable_roots, confine_helper);
         no_backend_decide(config.mode)
     }
 }
@@ -440,12 +448,20 @@ pub fn seatbelt_enforcement_canary() -> std::io::Result<bool> {
 // Linux bwrap backend (arg-generation unit-tested; runtime unverified on macOS)
 // ---------------------------------------------------------------------------
 
+/// Distinguished refusal reason when `Required` + `landlock` is requested but the
+/// running Nerve binary path could not be resolved to insert the in-jail helper.
+/// Refusing (rather than silently dropping the requested Landlock layer) keeps
+/// `Required` from running under weaker-than-asked confinement.
+#[cfg(target_os = "linux")]
+const LANDLOCK_HELPER_UNRESOLVED: &str = "sandbox.mode=required with sandbox.landlock=true, but the Nerve binary path could not be resolved to insert the in-jail Landlock helper; refusing to run the check (fail closed)";
+
 #[cfg(target_os = "linux")]
 fn bwrap_decide(
     config: &SandboxConfig,
     cwd: &Path,
     check_cmd: &[String],
     extra_writable_roots: &[PathBuf],
+    confine_helper: Option<&Path>,
 ) -> SandboxDecision {
     let Some(bwrap) = trusted_bwrap() else {
         // bwrap is not in a trusted system location — fail closed under
@@ -453,7 +469,38 @@ fn bwrap_decide(
         return no_backend_decide(config.mode);
     };
     let writable = canonical_writable_roots(cwd, extra_writable_roots);
-    let args = bwrap_args(&writable, cwd, check_cmd, config.allow_network);
+    // H5: when Landlock is requested, the check does not run directly under
+    // bwrap — it runs under the in-jail helper (`nv __nv-confine … -- check`)
+    // that bwrap execs, which applies a Landlock write-confinement ruleset
+    // (matching `writable`, plus bwrap's minimal `/dev`) then execs the check.
+    // Landlock MUST NOT be applied to bwrap itself: a write-restriction scoped to
+    // the writable roots would deny bwrap's OWN unprivileged-userns setup writes
+    // (e.g. `/proc/self/uid_map`), breaking the jail. So it is composed INSIDE
+    // the jail. When Landlock is off the argv is byte-identical to the pre-H5
+    // build (the helper is never spliced in).
+    let inner: std::borrow::Cow<'_, [String]> = if config.landlock {
+        match confine_helper {
+            Some(nv) => std::borrow::Cow::Owned(build_confine_helper_argv(
+                nv,
+                config.mode,
+                &writable,
+                check_cmd,
+            )),
+            None => {
+                if config.mode == SandboxMode::Required {
+                    return SandboxDecision::Refuse {
+                        reason: LANDLOCK_HELPER_UNRESOLVED.to_string(),
+                    };
+                }
+                // Auto: best-effort — fall back to bwrap-only. The caller
+                // (`goal.rs`) surfaces the warning.
+                std::borrow::Cow::Borrowed(check_cmd)
+            }
+        }
+    } else {
+        std::borrow::Cow::Borrowed(check_cmd)
+    };
+    let args = bwrap_args(&writable, cwd, inner.as_ref(), config.allow_network);
     SandboxDecision::Wrap {
         program: bwrap.to_string_lossy().into_owned(),
         args,
@@ -520,6 +567,372 @@ fn trusted_bwrap() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+// ---------------------------------------------------------------------------
+// H5: Linux Landlock filesystem layer (composed INSIDE the bwrap jail)
+// ---------------------------------------------------------------------------
+//
+// Landlock is an LSM that lets a process irrevocably self-restrict its own
+// filesystem access. bwrap already confines writes via a mount namespace; the
+// Landlock layer is kernel-mediated defense-in-depth that an in-namespace daemon
+// reachable over a bound socket cannot defeat.
+//
+// It CANNOT be applied to the bwrap process: a write-restriction scoped to the
+// writable roots would deny bwrap's own unprivileged-userns setup writes (e.g.
+// `/proc/self/uid_map`). So the check is run, inside the jail, through a tiny
+// helper — the `nv` binary re-invoked as `nv __nv-confine … -- <check>`, which
+// bwrap execs. The helper applies the Landlock ruleset on its single (pre-tokio)
+// thread, then `execve`s the real check, which inherits the restriction.
+//
+// Only the ABI-V1 WRITE rights are handled, so reads/execs stay unrestricted (the
+// check must read toolchains; bwrap already read-only-binds the host). Those
+// rights are denied everywhere except beneath the granted roots (the same roots
+// bwrap rw-binds: `cwd` + the H2 private temp dir) plus bwrap's minimal `/dev` (so
+// `/dev/null` etc. work — bwrap's `--dev` exposes only safe pseudo-devices, no
+// block devices).
+//
+// SCOPE (no overclaim): later-ABI rights — `Truncate`, `Refer` (cross-directory
+// rename/link), `IoctlDev` — are intentionally NOT handled by this layer. They are
+// backstopped by bwrap's read-only host bind, which already denies out-of-root
+// host modification at the mount layer, so the COMPOSED bwrap+Landlock stack is
+// the boundary (not Landlock alone). Handling `Refer` in particular would risk
+// denying legitimate cross-directory renames a check makes, and the marginal
+// Landlock-only gain over bwrap does not justify that on a CI-only-verifiable
+// path. "Fully enforced" therefore means every *handled* (V1) right is enforced,
+// not that every write vector is covered by Landlock alone.
+//
+// HONEST SCOPE: the argv-shape and fail-closed DECISION logic below is pure and
+// unit-tested on every platform, but the actual `restrict_self()`/`execve` path
+// runs ONLY on a real Linux kernel — it is exercised by the CI Linux real-kernel
+// test (H7), never on the macOS/Windows dev host (there it is cross-compile- and
+// clippy-checked only). The exact path-grant set (notably `/dev`) is provisional:
+// real-kernel CI is where toolchain-specific write needs (e.g. extra device
+// nodes) get shaken out.
+
+/// The hidden subcommand token marking a confinement-helper invocation. Nerve's
+/// own sandbox wrap argv inserts `<nv> __nv-confine …` between bwrap's `--` and
+/// the real check; the `nv` binary detects this token at startup (before tokio)
+/// and routes into the Landlock helper. NEVER a user-facing command — it is only
+/// ever produced by [`build_confine_helper_argv`] and consumed by
+/// [`parse_confine_args`]. Always compiled so the argv-shape invariant is
+/// unit-testable on every platform.
+pub const CONFINE_HELPER_TOKEN: &str = "__nv-confine";
+
+/// Exit code the confinement helper uses when it REFUSES to run the check
+/// (Landlock not fully enforced under `Required`, a malformed invocation, or an
+/// exec failure). The gate sees a non-zero exit and reports the check as failed —
+/// fail closed. Distinct from a project's own exit codes only by intent; the
+/// helper also logs a distinguished message to stderr.
+pub const CONFINE_EXIT_REFUSED: i32 = 70;
+
+/// Machine-greppable marker the in-jail helper embeds in its stderr line when,
+/// under `Auto`, Landlock could not be fully enforced and the check runs
+/// bwrap-only (best-effort). The helper `execve`s the check and never reports
+/// back to the parent, and the parent surfaces a child's captured stderr ONLY on
+/// a failing check — so without this marker an Auto degradation on a *passing*
+/// check would be silently swallowed. The parent re-scans the captured stderr for
+/// this marker ([`stderr_signals_landlock_degraded`]) and re-emits an
+/// operator-facing warning on every outcome WHERE THE CHECK'S STDERR WAS CAPTURED
+/// (a normal pass or fail) — NOT on a timeout (child killed mid-drain) or a
+/// stderr-cap abort (stderr unavailable to scan), which already fail the check
+/// loudly. This makes the "surfaced warning" contract true on the captured-stderr
+/// path rather than fail-path-only. Stable string (an internal contract between
+/// [`confine_degraded_message`] and the parent scan); only ever emitted by the
+/// `Auto` degradation path, never by the `Required` refusal, so it cannot fire a
+/// spurious best-effort warning for a fail-closed refusal.
+pub const CONFINE_DEGRADED_MARKER: &str = "[nv-confine:landlock-auto-degraded]";
+
+/// Platform-independent classification of a Landlock enforcement attempt. Kept
+/// free of the `landlock` crate's types so the fail-closed DECISION
+/// ([`confine_should_refuse`]) is unit-testable on every platform; the Linux
+/// backend maps `RulesetStatus`/errors onto it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LandlockEnforcement {
+    /// Every requested write restriction is enforced by the kernel.
+    Full,
+    /// Only some requested restrictions are enforced (older ABI) — partial.
+    Partial,
+    /// The kernel does not support Landlock (or enforced nothing).
+    None,
+    /// Building or applying the ruleset errored.
+    Error,
+}
+
+/// Fail-closed decision for the confinement helper. Under `Required`
+/// (`required == true`) anything short of fully-enforced Landlock means the check
+/// must NOT run (the helper exits non-zero → the gate fails closed). Under
+/// best-effort/`Auto` (`required == false`) Landlock is never a reason to
+/// refuse — the run continues under bwrap-only confinement. Pure; the SOLE
+/// authority for whether the helper proceeds, tested on every platform.
+pub fn confine_should_refuse(required: bool, enforcement: LandlockEnforcement) -> bool {
+    match enforcement {
+        LandlockEnforcement::Full => false,
+        _ => required,
+    }
+}
+
+/// The stderr line the helper emits under `Required` when Landlock could not be
+/// fully enforced and it REFUSES to run the check (fail closed). Pure so the
+/// message contract is testable on every platform. Deliberately does NOT carry
+/// [`CONFINE_DEGRADED_MARKER`] — a refusal is a fail-closed Fail, not a
+/// best-effort degradation, so it must never trip the parent's best-effort
+/// warning scan.
+pub fn confine_refused_message(enforcement: LandlockEnforcement) -> String {
+    format!(
+        "nv {CONFINE_HELPER_TOKEN}: Landlock confinement could not be fully enforced ({enforcement:?}) under sandbox.mode=required; refusing to run the check unconfined (fail closed)"
+    )
+}
+
+/// The stderr line the helper emits under `Auto` when Landlock could not be fully
+/// enforced but the check still runs (bwrap-only, best-effort). Carries
+/// [`CONFINE_DEGRADED_MARKER`] so the parent can re-surface the degradation on a
+/// passing check. Pure so the marker contract is testable on every platform.
+pub fn confine_degraded_message(enforcement: LandlockEnforcement) -> String {
+    format!(
+        "nv {CONFINE_HELPER_TOKEN}: {CONFINE_DEGRADED_MARKER} Landlock not fully enforced ({enforcement:?}); continuing best-effort under bwrap-only confinement"
+    )
+}
+
+/// Whether `stderr` (the confined check's captured stderr) carries the in-jail
+/// helper's `Auto` best-effort degradation marker. The parent uses this to
+/// re-emit an operator-facing warning on every outcome where the check's stderr
+/// was captured (a normal pass or fail) — the captured child stderr is otherwise
+/// echoed only on a failing check, which would swallow the warning on a passing
+/// one. A timeout or a stderr-cap abort (no captured stderr to scan) are the only
+/// outcomes it is not re-emitted on; both already fail the check loudly. Pure;
+/// tested on every platform.
+pub fn stderr_signals_landlock_degraded(stderr: &str) -> bool {
+    stderr.contains(CONFINE_DEGRADED_MARKER)
+}
+
+/// Map a [`SandboxMode`] to the helper's `--mode` token. Only `Required` carries
+/// the strict fail-closed contract; everything else (including `Off`, which never
+/// reaches the helper) is best-effort `auto`. Pure.
+fn confine_mode_token(mode: SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::Required => "required",
+        SandboxMode::Auto | SandboxMode::Off => "auto",
+    }
+}
+
+/// Parse the helper's `--mode` token back into the fail-closed flag. `required`
+/// ⇒ `true`, `auto` ⇒ `false`, anything else ⇒ `None` (malformed → the helper
+/// fails closed rather than guess). Pure.
+fn confine_required_from_token(token: &str) -> Option<bool> {
+    match token {
+        "required" => Some(true),
+        "auto" => Some(false),
+        _ => None,
+    }
+}
+
+/// Build the confinement-helper segment Nerve splices between bwrap's `--` and
+/// the real check: `<nv> __nv-confine --mode <m> (--root <p>)* -- <check…>`.
+///
+/// `nv` is the trusted absolute path to the running Nerve binary (resolved by the
+/// caller via `current_exe`); bwrap execs it INSIDE the jail, where it applies a
+/// Landlock ruleset then `execve`s the check. `roots` are the same writable roots
+/// bwrap rw-binds (operator/system-controlled — `cwd` + the private temp dir —
+/// never lead-controlled), so the Landlock write grant matches the mount grant.
+/// The trailing `--` terminates the helper's own option parsing, so a `check[0]`
+/// beginning with `-` is treated as the command, never a helper flag (same
+/// discipline as the bwrap/sandbox-exec `--`). Pure; tested on every platform.
+pub fn build_confine_helper_argv(
+    nv: &Path,
+    mode: SandboxMode,
+    roots: &[PathBuf],
+    check_cmd: &[String],
+) -> Vec<String> {
+    let mut argv = vec![
+        nv.to_string_lossy().into_owned(),
+        CONFINE_HELPER_TOKEN.to_string(),
+        "--mode".to_string(),
+        confine_mode_token(mode).to_string(),
+    ];
+    for root in roots {
+        argv.push("--root".to_string());
+        argv.push(root.to_string_lossy().into_owned());
+    }
+    argv.push("--".to_string());
+    argv.extend(check_cmd.iter().cloned());
+    argv
+}
+
+/// A parsed confinement-helper invocation (the argv AFTER the `__nv-confine`
+/// token).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfineSpec {
+    /// `true` ⇒ `sandbox.mode=required`: Landlock must be fully enforced or the
+    /// helper refuses (fail closed). `false` ⇒ best-effort (`Auto`).
+    pub required: bool,
+    /// Writable roots to grant Landlock file-write beneath.
+    pub roots: Vec<PathBuf>,
+    /// The real check command to `execve` once Landlock is applied.
+    pub check_cmd: Vec<String>,
+}
+
+/// Parse the confinement-helper argv tail (everything after `__nv-confine`):
+/// `--mode <required|auto> (--root <path>)* -- <check> [args…]`. Returns `None`
+/// on ANY malformed input — unknown flag, missing/duplicate `--mode`, missing
+/// value, empty root, no `--` terminator, or an empty check — so the helper fails
+/// closed rather than guess. Pure; tested on every platform.
+pub fn parse_confine_args(tail: &[String]) -> Option<ConfineSpec> {
+    let mut required: Option<bool> = None;
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut i = 0;
+    loop {
+        let token = tail.get(i)?; // ran out before a `--` terminator ⇒ malformed
+        match token.as_str() {
+            "--" => {
+                i += 1;
+                break;
+            }
+            "--mode" => {
+                let value = tail.get(i + 1)?;
+                if required.is_some() {
+                    return None; // duplicate --mode
+                }
+                required = Some(confine_required_from_token(value)?);
+                i += 2;
+            }
+            "--root" => {
+                let value = tail.get(i + 1)?;
+                if value.is_empty() {
+                    return None;
+                }
+                roots.push(PathBuf::from(value));
+                i += 2;
+            }
+            _ => return None, // unknown flag
+        }
+    }
+    let required = required?; // --mode is mandatory
+    let check_cmd = tail[i..].to_vec();
+    if check_cmd.is_empty() {
+        return None;
+    }
+    Some(ConfineSpec {
+        required,
+        roots,
+        check_cmd,
+    })
+}
+
+/// H5 entry point: if this process was started as the confinement helper
+/// (`nv __nv-confine …`, inserted by Nerve's own bwrap wrap argv), apply the
+/// Landlock ruleset and `execve` the real check; otherwise return so normal CLI
+/// startup proceeds.
+///
+/// MUST be called at the very top of `main`, BEFORE any tokio worker thread
+/// exists, so Landlock is applied on the sole (main) thread and the `execve`
+/// replaces a single-threaded image. On success it never returns (it becomes the
+/// check); on refusal or exec failure it exits the process non-zero (fail
+/// closed). Linux only — the helper is injected only on Linux.
+#[cfg(target_os = "linux")]
+pub fn maybe_run_confine_helper() {
+    let mut argv = std::env::args();
+    let _bin = argv.next();
+    match argv.next() {
+        Some(token) if token == CONFINE_HELPER_TOKEN => {}
+        _ => return,
+    }
+    let tail: Vec<String> = argv.collect();
+    let Some(spec) = parse_confine_args(&tail) else {
+        eprintln!(
+            "nv {CONFINE_HELPER_TOKEN}: malformed confinement invocation; refusing to run (fail closed)"
+        );
+        std::process::exit(CONFINE_EXIT_REFUSED);
+    };
+    run_confine_helper(&spec);
+}
+
+/// Apply the Landlock write-confinement for `spec`, then `execve` the real check.
+/// Diverges: it either becomes the check (success) or exits the process.
+#[cfg(target_os = "linux")]
+fn run_confine_helper(spec: &ConfineSpec) -> ! {
+    use std::os::unix::process::CommandExt;
+    let enforcement = apply_landlock_write_confinement(&spec.roots);
+    if confine_should_refuse(spec.required, enforcement) {
+        eprintln!("{}", confine_refused_message(enforcement));
+        std::process::exit(CONFINE_EXIT_REFUSED);
+    }
+    if enforcement != LandlockEnforcement::Full {
+        // Auto best-effort: carries CONFINE_DEGRADED_MARKER so the parent
+        // re-surfaces this through tracing even when the check passes.
+        eprintln!("{}", confine_degraded_message(enforcement));
+    }
+    // `exec` replaces this process image with the check, preserving the Landlock
+    // restriction (Landlock survives execve). It only returns on failure.
+    let error = std::process::Command::new(&spec.check_cmd[0])
+        .args(&spec.check_cmd[1..])
+        .exec();
+    eprintln!(
+        "nv {CONFINE_HELPER_TOKEN}: failed to exec check `{}`: {error}",
+        spec.check_cmd[0]
+    );
+    std::process::exit(CONFINE_EXIT_REFUSED);
+}
+
+/// Build and `restrict_self()` a Landlock ruleset that denies the ABI-V1 file
+/// WRITE rights everywhere except beneath `roots` (plus bwrap's minimal `/dev`,
+/// best-effort). Reads/execs and later-ABI rights (`Truncate`/`Refer`/`IoctlDev`)
+/// are NOT handled, so they stay unrestricted at this layer — bwrap's read-only
+/// host bind backstops them (the composed stack is the boundary, not Landlock
+/// alone). Returns how fully the
+/// kernel enforced it. Runs on a real Linux kernel only (CI / the calling helper
+/// inside bwrap); never invoked on the macOS/Windows dev host.
+#[cfg(target_os = "linux")]
+fn apply_landlock_write_confinement(roots: &[PathBuf]) -> LandlockEnforcement {
+    use landlock::{
+        ABI, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus,
+    };
+    // ABI V1 (Linux 5.13+) basic filesystem write rights. Later-ABI write rights
+    // (Refer=V2, Truncate=V3, IoctlDev=V5) are deliberately NOT requested: they
+    // are backstopped by bwrap's read-only host bind, and requesting them would
+    // both raise the kernel-version floor under Required and risk denying
+    // legitimate cross-directory renames (Refer) on a path only CI can verify.
+    let abi = ABI::V1;
+    let write = AccessFs::from_write(abi);
+    let created = Ruleset::default()
+        .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(write)
+        .and_then(|ruleset| ruleset.create());
+    let mut created = match created {
+        Ok(created) => created,
+        Err(_) => return LandlockEnforcement::Error,
+    };
+    // Mandatory roots (the writable roots bwrap rw-binds). A missing one is an
+    // error → fail closed under Required.
+    for root in roots {
+        let path_fd = match PathFd::new(root) {
+            Ok(path_fd) => path_fd,
+            Err(_) => return LandlockEnforcement::Error,
+        };
+        created = match created.add_rule(PathBeneath::new(path_fd, write)) {
+            Ok(created) => created,
+            Err(_) => return LandlockEnforcement::Error,
+        };
+    }
+    // Grant writes to bwrap's minimal `/dev` (only safe pseudo-devices) so the
+    // check can write `/dev/null` etc. The grant is SKIPPED only if `/dev` is
+    // absent (e.g. a unit context outside bwrap); if `/dev` exists but the rule
+    // cannot be added, that is an error → fail closed under Required.
+    if let Ok(dev_fd) = PathFd::new("/dev") {
+        created = match created.add_rule(PathBeneath::new(dev_fd, write)) {
+            Ok(with_dev) => with_dev,
+            Err(_) => return LandlockEnforcement::Error,
+        };
+    }
+    match created.restrict_self() {
+        Ok(status) => match status.ruleset {
+            RulesetStatus::FullyEnforced => LandlockEnforcement::Full,
+            RulesetStatus::PartiallyEnforced => LandlockEnforcement::Partial,
+            RulesetStatus::NotEnforced => LandlockEnforcement::None,
+        },
+        Err(_) => LandlockEnforcement::Error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,6 +952,7 @@ mod tests {
             Path::new("/tmp/work"),
             &["true".to_string()],
             &[],
+            None,
         );
         assert_eq!(d, SandboxDecision::Unconfined { warning: None });
     }
@@ -1072,6 +1486,7 @@ mod tests {
             &work,
             &["--".to_string(), "true".to_string()],
             &[],
+            None,
         );
         let SandboxDecision::Wrap { program, args } = decision else {
             panic!("expected Wrap, got {decision:?}");
@@ -1096,5 +1511,209 @@ mod tests {
         let p = seatbelt_profile(&[], false, false, &[]);
         assert!(p.contains("(deny file-write*)"));
         assert!(!p.contains("(allow file-write*"), "no roots => no re-allow block");
+    }
+
+    // --- H5: Landlock confinement helper (pure logic; tested on every platform) ---
+
+    #[test]
+    fn confine_mode_token_maps_required_strict_else_auto() {
+        assert_eq!(confine_mode_token(SandboxMode::Required), "required");
+        assert_eq!(confine_mode_token(SandboxMode::Auto), "auto");
+        // `Off` never reaches the helper but must not map to the strict token.
+        assert_eq!(confine_mode_token(SandboxMode::Off), "auto");
+    }
+
+    #[test]
+    fn confine_should_refuse_truth_table() {
+        use LandlockEnforcement::*;
+        // Required: only fully-enforced Landlock may proceed; everything else
+        // refuses (fail closed).
+        assert!(!confine_should_refuse(true, Full));
+        assert!(confine_should_refuse(true, Partial));
+        assert!(confine_should_refuse(true, None));
+        assert!(confine_should_refuse(true, Error));
+        // Auto/best-effort: Landlock is never a reason to refuse.
+        for e in [Full, Partial, None, Error] {
+            assert!(!confine_should_refuse(false, e), "auto must never refuse on landlock grounds: {e:?}");
+        }
+    }
+
+    #[test]
+    fn landlock_degradation_marker_contract() {
+        use LandlockEnforcement::*;
+        // Every Auto-degradation message carries the marker, so the parent
+        // (`goal.rs`) re-surfaces it on a passing check.
+        for e in [Partial, None, Error] {
+            let msg = confine_degraded_message(e);
+            assert!(
+                stderr_signals_landlock_degraded(&msg),
+                "degraded message must carry the marker: {msg}"
+            );
+            let level = format!("{e:?}");
+            assert!(msg.contains(level.as_str()), "degraded message must name the level: {msg}");
+        }
+        // The Required REFUSAL message must NOT carry the marker — a fail-closed
+        // refusal is a Fail, never a best-effort degradation, so it must never
+        // trip the parent's best-effort warning even though both mention Landlock.
+        for e in [Partial, None, Error] {
+            let msg = confine_refused_message(e);
+            assert!(
+                !stderr_signals_landlock_degraded(&msg),
+                "refusal message must NOT carry the degradation marker: {msg}"
+            );
+        }
+        // Arbitrary check output never trips it.
+        assert!(!stderr_signals_landlock_degraded(""));
+        assert!(!stderr_signals_landlock_degraded("error[E0382]: borrow of moved value"));
+    }
+
+    #[test]
+    fn confine_helper_argv_has_exact_shape() {
+        let nv = Path::new("/usr/local/bin/nv");
+        let roots = [PathBuf::from("/work"), PathBuf::from("/tmp/priv")];
+        let check = ["cargo".to_string(), "test".to_string()];
+        let argv = build_confine_helper_argv(nv, SandboxMode::Required, &roots, &check);
+        assert_eq!(
+            argv,
+            vec![
+                "/usr/local/bin/nv",
+                "__nv-confine",
+                "--mode",
+                "required",
+                "--root",
+                "/work",
+                "--root",
+                "/tmp/priv",
+                "--",
+                "cargo",
+                "test",
+            ]
+        );
+    }
+
+    #[test]
+    fn confine_args_round_trip_required_and_auto() {
+        let nv = Path::new("/nv");
+        for (mode, required) in [(SandboxMode::Required, true), (SandboxMode::Auto, false)] {
+            let roots = [PathBuf::from("/a"), PathBuf::from("/b")];
+            let check = ["sh".to_string(), "-c".to_string(), "true".to_string()];
+            let argv = build_confine_helper_argv(nv, mode, &roots, &check);
+            // The helper consumes argv AFTER `nv __nv-confine`.
+            assert_eq!(argv[0], "/nv");
+            assert_eq!(argv[1], CONFINE_HELPER_TOKEN);
+            let spec = parse_confine_args(&argv[2..]).expect("round-trip must parse");
+            assert_eq!(
+                spec,
+                ConfineSpec {
+                    required,
+                    roots: roots.to_vec(),
+                    check_cmd: check.to_vec(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn confine_args_preserve_dash_prefixed_check_program() {
+        // Everything after `--` is the verbatim check, including a leading `-`,
+        // so a `check[0]` like `--` is the command, never a helper flag.
+        let nv = Path::new("/nv");
+        let check = ["--".to_string(), "weird".to_string()];
+        let argv = build_confine_helper_argv(nv, SandboxMode::Auto, &[], &check);
+        let spec = parse_confine_args(&argv[2..]).unwrap();
+        assert_eq!(spec.check_cmd, check.to_vec());
+        assert!(!spec.required);
+        assert!(spec.roots.is_empty());
+    }
+
+    #[test]
+    fn parse_confine_args_rejects_malformed() {
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Missing `--mode`.
+        assert!(parse_confine_args(&s(&["--root", "/a", "--", "true"])).is_none());
+        // Unknown mode token.
+        assert!(parse_confine_args(&s(&["--mode", "yolo", "--", "true"])).is_none());
+        // Missing value for `--mode`.
+        assert!(parse_confine_args(&s(&["--mode"])).is_none());
+        // Missing value for `--root`.
+        assert!(parse_confine_args(&s(&["--mode", "auto", "--root"])).is_none());
+        // Empty root.
+        assert!(parse_confine_args(&s(&["--mode", "auto", "--root", "", "--", "true"])).is_none());
+        // Unknown flag.
+        assert!(parse_confine_args(&s(&["--mode", "auto", "--bogus", "--", "true"])).is_none());
+        // No `--` terminator.
+        assert!(parse_confine_args(&s(&["--mode", "auto", "--root", "/a"])).is_none());
+        // Empty check after `--`.
+        assert!(parse_confine_args(&s(&["--mode", "auto", "--"])).is_none());
+        // Duplicate `--mode`.
+        assert!(
+            parse_confine_args(&s(&["--mode", "auto", "--mode", "required", "--", "true"]))
+                .is_none()
+        );
+    }
+
+    /// On Linux, with Landlock requested and a helper path available, the bwrap
+    /// argv must run the check THROUGH the helper (`… -- <nv> __nv-confine …
+    /// -- <check>`); with Landlock off it must be byte-identical to the pre-H5
+    /// argv (helper never spliced in). Verified at the arg-composition level
+    /// (`bwrap_args` over the inner command), which needs no installed bwrap.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_injection_wraps_check_only_when_enabled() {
+        let cwd = Path::new("/work");
+        let roots = [PathBuf::from("/work")];
+        let check = ["cargo".to_string(), "test".to_string()];
+        let nv = Path::new("/usr/bin/nv");
+
+        // Landlock OFF: inner == check, byte-identical to the historical argv.
+        let off = bwrap_args(&roots, cwd, &check, false);
+        let off_tail = &off[off.iter().position(|a| a == "--").unwrap() + 1..];
+        assert_eq!(off_tail, &check, "landlock off must not alter the inner argv");
+
+        // Landlock ON: inner == the helper segment wrapping the check.
+        let inner = build_confine_helper_argv(nv, SandboxMode::Required, &roots, &check);
+        let on = bwrap_args(&roots, cwd, &inner, false);
+        let on_tail = &on[on.iter().position(|a| a == "--").unwrap() + 1..];
+        assert_eq!(on_tail[0], "/usr/bin/nv");
+        assert_eq!(on_tail[1], CONFINE_HELPER_TOKEN);
+        // The real check still terminates the argv, after the helper's own `--`.
+        assert_eq!(&on_tail[on_tail.len() - 2..], &check);
+    }
+
+    /// H5 real-kernel proof (CI Linux; ties to H7). When Landlock is fully
+    /// enforced on this kernel, an out-of-grant write must be DENIED while an
+    /// in-grant write succeeds. Applied on a dedicated thread (Landlock restricts
+    /// the calling thread + its children only, so it cannot leak into the test
+    /// harness). SKIPPED, not failed, where Landlock is unavailable, so it never
+    /// breaks a non-Landlock dev host or CI runner.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_denies_out_of_grant_write_real_kernel() {
+        let grant = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let grant_path = grant.path().to_path_buf();
+        let outside_path = outside.path().to_path_buf();
+
+        let observed = std::thread::spawn(move || {
+            let enforcement = apply_landlock_write_confinement(std::slice::from_ref(&grant_path));
+            if enforcement != LandlockEnforcement::Full {
+                return None; // Landlock unavailable on this kernel -> skip.
+            }
+            let in_ok = std::fs::write(grant_path.join("in.txt"), b"x").is_ok();
+            let out_denied = std::fs::write(outside_path.join("out.txt"), b"x").is_err();
+            Some((in_ok, out_denied))
+        })
+        .join()
+        .unwrap();
+
+        match observed {
+            None => eprintln!(
+                "SKIP landlock_denies_out_of_grant_write_real_kernel: Landlock not fully enforced on this kernel"
+            ),
+            Some((in_ok, out_denied)) => {
+                assert!(in_ok, "in-grant write must succeed under Landlock");
+                assert!(out_denied, "out-of-grant write must be DENIED by Landlock");
+            }
+        }
     }
 }

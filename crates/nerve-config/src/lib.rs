@@ -328,6 +328,53 @@ pub struct SandboxConfig {
     /// non-macOS. See the `nerve_core::sandbox` module docs.
     #[serde(default)]
     pub strict: bool,
+    /// H5 (Linux): opt-in LANDLOCK filesystem layer composed over the `bwrap`
+    /// jail. Default `false`. When `true` and `mode != off` on a Landlock-capable
+    /// kernel (ABI ≥ V1, Linux 5.13+), the confined check additionally
+    /// self-restricts via an LSM-enforced Landlock ruleset that grants the
+    /// ABI-V1 filesystem write rights (file create/write/remove and the
+    /// `make_*` rights) only beneath the check's writable roots (its `cwd` and
+    /// the H2 private temp dir, plus the bwrap-provided minimal `/dev`) and
+    /// denies those rights everywhere else — kernel-mediated defense-in-depth
+    /// that an in-namespace daemon cannot defeat, layered on top of bwrap's
+    /// mount namespace. Reads/execs stay unrestricted (the check must read
+    /// toolchains; bwrap already read-only-binds the host). It is applied INSIDE
+    /// the jail by a helper (`nv __nv-confine`) that bwrap execs, never to bwrap
+    /// itself.
+    ///
+    /// SCOPE OF THE LANDLOCK LAYER (no overclaim): only the ABI-V1 write rights
+    /// are handled. Later-ABI rights — `Truncate`, `Refer` (cross-directory
+    /// rename/link), and `IoctlDev` — are intentionally NOT handled by this
+    /// layer; they are backstopped by bwrap's read-only host bind, which already
+    /// denies out-of-root host modification at the mount layer. So
+    /// "fully enforced" below means every *handled* (V1) right is enforced by
+    /// the kernel — NOT that every conceivable write vector is covered by
+    /// Landlock alone. The composed bwrap+Landlock stack is the boundary; the
+    /// Landlock layer is defense-in-depth, not a standalone write jail.
+    ///
+    /// Like [`strict`](Self::strict) it is purely confinement-TIGHTENING: it can
+    /// only ever make execution MORE restricted (deny more writes), never enable
+    /// execution or weaken a gate, so — unlike the verifier-execution opt-ins —
+    /// it needs no operator-consent provenance gate (a repo-local config can at
+    /// most tighten its own checks). Under [`Auto`](SandboxMode::Auto) it is
+    /// BEST-EFFORT: a kernel without Landlock falls back to bwrap-only, and Nerve
+    /// re-surfaces an operator warning through its `tracing` log on every outcome
+    /// where the check's stderr was captured — a passing check included, not only
+    /// a failing one (the in-jail helper marks the degradation in the check's
+    /// captured stderr and the parent re-emits it). The only outcomes it is NOT
+    /// separately re-emitted on are a timeout or an output-cap abort, where the
+    /// stderr stream isn't available to scan — both already fail the check loudly.
+    /// The marker rides the check's own stderr, so a hostile check can spoof a
+    /// spurious warning but can never SUPPRESS a real one (fail-safe). Under
+    /// [`Required`](SandboxMode::Required) it is
+    /// FAIL-CLOSED: if the handled rights cannot be fully enforced the check is
+    /// refused and the code never runs (it ties into the H4 confinement
+    /// self-test). Inert (byte-identical wrap argv) when `false` or off-Linux.
+    /// The Landlock runtime path is exercised only by the CI Linux real-kernel
+    /// test (H7); on non-Linux hosts it is cross-compile-checked but never run.
+    /// See the `nerve_core::sandbox` module docs.
+    #[serde(default)]
+    pub landlock: bool,
 }
 
 impl SandboxConfig {
@@ -2612,7 +2659,48 @@ mod tests {
         assert_eq!(cfg.mode, SandboxMode::Off);
         assert!(!cfg.allow_network);
         assert!(!cfg.strict, "H3 strict mode is opt-in, default false");
+        assert!(!cfg.landlock, "H5 Landlock layer is opt-in, default false");
         assert!(!cfg.is_enabled());
+    }
+
+    #[test]
+    fn sandbox_landlock_round_trips_and_defaults_false() {
+        // Absent `landlock` key => false (additive/inert; existing configs and
+        // the pre-H5 wrap argv are byte-identical).
+        let lax = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority",
+                "sandbox": { "mode": "required" }
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        assert!(!lax.orchestration.sandbox.landlock, "absent landlock => false");
+
+        // Explicit landlock=true deserializes. Like `strict`, the Landlock layer
+        // is CONFINEMENT-TIGHTENING ONLY — it can only deny more writes, never
+        // enable execution or loosen a gate — so a repo-local (Project-source)
+        // config setting it needs no operator-consent provenance gate.
+        let landlock = Config::from_json_str(
+            r#"{
+              "orchestration": {
+                "default_strategy": "consensus",
+                "max_refinement_rounds": 2,
+                "conflict_policy": "lead_priority",
+                "sandbox": { "mode": "required", "landlock": true }
+              },
+              "roles": { "architect": "claude-code", "reviewer": "codex" },
+              "profiles": []
+            }"#,
+        )
+        .unwrap();
+        assert!(landlock.orchestration.sandbox.landlock);
+        assert!(landlock.orchestration.sandbox.is_enabled());
     }
 
     #[test]
