@@ -22,6 +22,10 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::{Duration, sleep};
 
 pub mod budget_audit;
+// H15: Linux cgroups v2 per-check resource enforcement. Linux-only; other
+// platforms never reference it (`goal` gates its use behind cfg(linux)).
+#[cfg(target_os = "linux")]
+pub mod cgroup;
 pub mod goal;
 pub mod goal_intent;
 pub mod mayor_patrol;

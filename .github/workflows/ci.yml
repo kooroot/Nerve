@@ -48,6 +48,42 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
 
+      - name: Set up a delegated cgroup v2 base (H15 fork-bomb cap proof)
+        # The H15 proof (cgroup_pids_max_caps_fork_real_kernel) needs a cgroup v2
+        # base it can create per-check leaf cgroups under, with the pids+memory
+        # controllers delegated to the runner user. On a unified-hierarchy systemd
+        # host (ubuntu-latest) we create a base under the root cgroup, make the
+        # controllers available to it, and hand ownership to the runner. We then
+        # SELF-TEST, as the runner, that a child cgroup can actually be created and
+        # pids.max written — mirroring exactly what the production code does. Only
+        # if that succeeds do we export NERVE_CGROUP_PARENT, which makes the Rust
+        # proof RUN (and it PANICS if it then cannot create a cgroup — so once we
+        # claim delegation works there is no silent green-skip). If a future runner
+        # image withdraws delegation we log a loud warning and leave the env unset,
+        # so the proof SKIPS rather than failing CI on an environment limitation;
+        # the degrade-with-note path is covered by an always-on unit test
+        # (degrades_with_surfaced_note_when_base_unusable) regardless.
+        run: |
+          set -x
+          if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+            echo "::warning::not a cgroup v2 unified host; H15 cgroup cap proof will skip"
+            exit 0
+          fi
+          base=/sys/fs/cgroup/nerve.test
+          sudo mkdir -p "$base"
+          echo "+pids +memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" "$base"
+          if mkdir "$base/selftest" 2>/dev/null \
+             && echo "+pids +memory" > "$base/cgroup.subtree_control" 2>/dev/null \
+             && echo 6 > "$base/selftest/pids.max" 2>/dev/null; then
+            echo "cgroup delegation OK; controllers: $(cat "$base"/cgroup.controllers)"
+            rmdir "$base/selftest" 2>/dev/null || true
+            echo "NERVE_CGROUP_PARENT=$base" >> "$GITHUB_ENV"
+          else
+            echo "::warning::cgroup v2 delegation unavailable to the runner; H15 fork-bomb cap proof will SKIP (degrade path is unit-tested). controllers: $(cat "$base"/cgroup.controllers 2>/dev/null || echo none)"
+            rmdir "$base/selftest" 2>/dev/null || true
+          fi
+
       - name: Versions
         run: |
           uname -a
@@ -59,10 +95,14 @@ jobs:
 
       - name: Run tests — real-kernel confinement proofs must actually run here
         # NERVE_CI_REAL_KERNEL turns a "kernel lacks support" SKIP into a loud
-        # FAILURE for EVERY Linux real-kernel proof (bwrap [H7], Landlock [H5],
+        # FAILURE for EVERY Linux confinement proof (bwrap [H7], Landlock [H5],
         # seccomp [H6]) — they all route their skip through one shared gate — so
         # this job cannot silently green-skip any confinement proof on a runner
-        # that has those features. `--nocapture` surfaces each proof's run/skip line.
+        # that has those features. The H15 cgroup fork-bomb cap proof keys on its
+        # own opt-in signal instead: NERVE_CGROUP_PARENT (exported by the step
+        # above only after a successful delegation self-test) makes it RUN and
+        # PANIC if the cgroup cannot be created. `--nocapture` surfaces each
+        # proof's run/skip line.
         env:
           NERVE_CI_REAL_KERNEL: "1"
         run: cargo test --workspace --locked -- --nocapture

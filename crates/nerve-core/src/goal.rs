@@ -314,6 +314,57 @@ impl GoalEvaluator {
             return Err(GoalError::Ulimit(UlimitError::Unsupported));
         }
 
+        // H15: surface any configured limit this platform will NOT enforce (e.g.
+        // macOS rejects RLIMIT_NPROC for unprivileged callers) so it degrades
+        // visibly, not silently. Observability only — it changes neither which
+        // command runs nor the pass/fail verdict.
+        #[cfg(unix)]
+        if let Some(spec) = &self.ulimit {
+            for field in crate::ulimit::unenforced_notes(spec) {
+                tracing::warn!(
+                    target: "nerve::ulimit",
+                    "check_ulimit.{field} is not enforced on this platform: it was requested but the OS does not apply it for unprivileged callers; the other configured ulimits still apply."
+                );
+            }
+        }
+
+        // H15: on Linux, add aggregate cgroup v2 caps (pids.max/memory.max) over
+        // the whole check subtree — additive to the per-process setrlimit below,
+        // resisting fork bombs that evade per-process limits. The child joins the
+        // cgroup in a pre_exec registered BEFORE the setrlimit one, so it is
+        // confined before `exec` (race-free). Opt-in via NERVE_CGROUP_PARENT;
+        // when absent or unusable we degrade to setrlimit-only with a surfaced
+        // note — never silently, and a resource-enforcement gap never moves the
+        // verdict toward acceptance. The guard tears the cgroup down on drop, so
+        // every spawn path (success, timeout, output-cap, error) cleans up.
+        #[cfg(target_os = "linux")]
+        let _cgroup_guard = {
+            let setup = match self.ulimit.as_ref() {
+                Some(spec) => crate::cgroup::prepare(spec),
+                None => crate::cgroup::CgroupSetup::Inactive { note: None },
+            };
+            match setup {
+                crate::cgroup::CgroupSetup::Active(guard) => {
+                    let fd = guard.procs_fd();
+                    // SAFETY: join_via_fd is async-signal-safe (only getpid + a
+                    // write to the pre-opened cgroup.procs fd). A join failure
+                    // aborts the spawn → the check Fails, which is fail-safe: it
+                    // never proceeds as if confined, and a failure is away from
+                    // acceptance.
+                    unsafe {
+                        command.pre_exec(move || crate::cgroup::join_via_fd(fd));
+                    }
+                    Some(guard)
+                }
+                crate::cgroup::CgroupSetup::Inactive { note } => {
+                    if let Some(note) = note {
+                        tracing::warn!(target: "nerve::cgroup", "{note}");
+                    }
+                    None
+                }
+            }
+        };
+
         #[cfg(unix)]
         if let Some(spec) = self.ulimit.clone() {
             // SAFETY: pre_exec runs in the child after fork() and before the
