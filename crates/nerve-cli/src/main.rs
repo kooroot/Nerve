@@ -1,26 +1,31 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerve_adapter::{
-    McpClient, McpRegistry, ModelAdapter, SubprocessAdapter, default_adapters_with_limits,
-    default_write_tool_patterns, scope_mcp_spec_to_allowlist,
+    AdapterLimits, McpClient, McpRegistry, ModelAdapter, SubprocessAdapter,
+    default_adapters_with_limits, default_write_tool_patterns, scope_mcp_spec_to_allowlist,
 };
 use nerve_config::{
-    Config, DaemonProtocol, GoalIntent, GoalSpec, McpConfig, PlanStrategy, RpcConfig,
+    BuiltinVerifierMode, Config, DaemonProtocol, GoalIntent, GoalSpec, McpConfig, PlanStrategy,
+    RpcConfig, resolve_mcp_read_only_posture,
 };
 use nerve_core::session_fork::{ForkOptions as CoreForkOptions, SessionTree};
-use nerve_core::store::NerveStore;
+use nerve_core::store::{ApprovalGrant, NerveStore, RunCheckpoint};
 use nerve_core::{
-    AuditChainState, BudgetAuditEntry, BudgetSnapshot, ChainStatus, DoctorCheck, DoctorStatus,
-    ForkConfig as CoreForkConfig, GoalIntentConverter, Mayor, Patrol, PatrolTask, PlanError,
-    PlanRunOptions, RpcBus, RunOptions, RunReport, SessionForker, append_budget_audit_entry,
-    doctor_checks, format_chain_broken, run_plan_mode, run_synaptic_loop,
+    ApplyConsent, AuditChainState, BudgetAuditEntry, BudgetSnapshot, CancelToken, ChainStatus,
+    DoctorCheck, DoctorStatus, ForkConfig as CoreForkConfig, GoalIntentConverter, Mayor,
+    PROJECT_VERIFIER_CONSENT_ENV, Patrol, PatrolTask, PlanError, PlanRunOptions, RpcBus,
+    RunOptions, RunReport, SessionForker, append_budget_audit_entry, doctor_checks,
+    format_chain_broken, is_valid_queue_id, parse_plan_steps_from_markdown,
+    plan_step_to_patrol_task, project_verifier_consent_from_env, resolve_builtin_verifier,
+    run_plan_mode, run_synaptic_loop, run_synaptic_loop_streaming, validate_plan_markdown,
 };
 use nerve_tui::{TuiApp, TuiAppOptions, TuiState};
 use nerve_types::{
-    AgentEvent, McpToolCall, PlanReport, RPC_SCHEMA_VERSION, RpcEnvelope, Task, Verdict,
+    AgentEvent, McpReadOnlyPosture, McpToolCall, PlanReport, RPC_SCHEMA_VERSION, RoundRecord,
+    RpcEnvelope, Task, Verdict,
 };
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
@@ -29,9 +34,15 @@ use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{self, AsyncBufReadExt};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio::task::JoinHandle;
 
 const SURFACE_WIDTH: usize = 78;
+
+/// S13 RPC event kind emitted when a plan's steps are enqueued for the loop.
+/// Defined locally because the `nerve_types::rpc_kinds` catalog does not (yet)
+/// own this name — mirrors `mayor_patrol`'s local `RPC_MAYOR_ORPHAN_RECOVERED`.
+const RPC_PLAN_DISPATCHED: &str = "plan.dispatched";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -219,6 +230,11 @@ enum Command {
     /// v1.0 Tier 3j: Patrol worker bound to a slot id.
     #[command(about = "Run a Patrol worker (Tier 3j)")]
     Patrol(PatrolArgs),
+    /// S13: hand a stored plan's steps off to the loop as queued PatrolTasks.
+    #[command(
+        about = "Enqueue a stored plan's steps as Patrol tasks (S13; dry-run, never auto-applies)"
+    )]
+    DispatchPlan(DispatchPlanArgs),
 }
 
 /// Tier 3h `nv fork` arguments. Defaults preserve byte-identical legacy
@@ -285,6 +301,22 @@ struct MayorArgs {
     results_dir: Option<PathBuf>,
     #[arg(long, help = "Print the queue status and exit (no dispatch)")]
     status_only: bool,
+    #[arg(
+        long,
+        help = "S14: print the coordination ledger (task states) and exit (no dispatch)"
+    )]
+    ledger: bool,
+    #[arg(
+        long,
+        help = "H17: rebuild the coordination ledger from the queue directories (dirs win on disagreement), print it, and exit (no dispatch)"
+    )]
+    reconcile: bool,
+    #[arg(
+        long,
+        value_name = "PATROL_ID",
+        help = "S14: drain and print the given recipient's coordination mailbox, then exit"
+    )]
+    mailbox: Option<String>,
 }
 
 /// Tier 3j `nv patrol` arguments.
@@ -328,6 +360,23 @@ struct PlanArgs {
     cwd: Option<PathBuf>,
 }
 
+/// S13 `nv dispatch-plan` arguments. Loads a stored [`PlanReport`], parses its
+/// `## Steps` deterministically, and enqueues one [`PatrolTask`] per step on the
+/// Mayor queue. Enqueue only — it never runs a loop and never applies; Patrol
+/// workers execute the queued tasks in dry-run mode (the full verification gate
+/// stays intact; apply remains the per-run S11 consent decision).
+#[derive(Debug, clap::Args)]
+struct DispatchPlanArgs {
+    #[arg(help = "Stored plan id (the plan/task id printed by `nv plan`)")]
+    plan_id: String,
+    #[arg(long, help = "Per-task budget ceiling in micro-USD")]
+    budget_microusd: Option<u64>,
+    #[arg(long, help = "Enqueue at most this many steps (default: all)")]
+    max_steps: Option<usize>,
+    #[arg(long, help = "Override the workspace directory (defaults to cwd)")]
+    cwd: Option<PathBuf>,
+}
+
 /// `nv rpc` family. Currently exposes the v0.5.0 bearer-token rotation
 /// helper; future maintenance subcommands hang off this enum.
 #[derive(Debug, Subcommand)]
@@ -368,8 +417,25 @@ enum TemplateCommand {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // H5: if this process was started as the in-jail Landlock confinement helper
+    // (`nv __nv-confine … -- <check>`, spliced into Nerve's own bwrap wrap argv on
+    // Linux), apply the Landlock ruleset on this sole thread and `execve` the
+    // real check — BEFORE building the tokio runtime, so no worker thread exists
+    // when Landlock is applied and the exec replaces a single-threaded image. On
+    // success it never returns; on refusal it exits non-zero (fail closed). A
+    // normal `nv` invocation returns immediately and proceeds to the runtime.
+    #[cfg(target_os = "linux")]
+    nerve_core::sandbox::maybe_run_confine_helper();
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the async runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("NERVE_LOG")
@@ -576,6 +642,7 @@ async fn main() -> Result<()> {
         Some(Command::Patrol(args)) => {
             run_patrol_subcommand(args, matches!(cli.adapter, AdapterMode::Mock)).await
         }
+        Some(Command::DispatchPlan(args)) => run_dispatch_plan_subcommand(args).await,
         None => {
             let Some(prompt) = cli.prompt else {
                 if std::io::stdin().is_terminal() {
@@ -697,7 +764,10 @@ async fn run_pi_benchmark(iterations: u16, live: bool, mock: bool) -> Result<PiB
         let report = run_synaptic_loop(task, &config, &adapters, RunOptions::new(false)).await?;
         store.save_report(&report)?;
         let patch_id = report.final_patch.as_ref().map(|patch| patch.id.clone());
-        let loop_ok = report.final_feedback.verdict == Verdict::Lgtm
+        let loop_ok = report
+            .final_feedback
+            .verdict
+            .accepts_under(report.selection.review_strictness.permits_nits())
             && !report.blocked
             && !report.rounds.is_empty()
             && patch_id.is_some();
@@ -1043,6 +1113,27 @@ fn active_mcp_config(config: &Config) -> Option<&McpConfig> {
     config.roles.mcp.as_ref()
 }
 
+/// Resolve the effective MCP `read_only` posture (H1) under the config's S4
+/// provenance, emitting a LOUD warning when a repo-local config's weaker
+/// `legacy_denylist` request is refused. Centralized so every MCP entry point
+/// applies the same provenance gate and the same operator-facing warning.
+fn resolve_mcp_posture(config: &Config, mcp: &McpConfig) -> McpReadOnlyPosture {
+    let consent = project_verifier_consent_from_env();
+    let effective = resolve_mcp_read_only_posture(config.source(), mcp.read_only_posture, consent);
+    if effective != mcp.read_only_posture {
+        // The only downgrade is Project-source + LegacyDenylist without consent.
+        eprintln!(
+            "{}",
+            warn(format!(
+                "mcp: ignoring `read_only_posture = legacy_denylist` from project-local config \
+                 (untrusted source — a cloned repo could weaken your write posture); using \
+                 deny-by-default. Set {PROJECT_VERIFIER_CONSENT_ENV}=1 to honor it."
+            ))
+        );
+    }
+    effective
+}
+
 async fn run_mcp_subcommand(command: McpCommand) -> Result<()> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let config = Config::load_from(&cwd)?;
@@ -1050,12 +1141,20 @@ async fn run_mcp_subcommand(command: McpCommand) -> Result<()> {
         println!("mcp: no servers configured (roles.mcp / profiles[].mcp empty)");
         return Ok(());
     };
+    let posture = resolve_mcp_posture(&config, &mcp);
 
     match command {
         McpCommand::ListTools { json } => {
             let mut registry = McpRegistry::new();
             if let Err(err) = registry
-                .register_all(&mcp.servers, &mcp.write_tool_patterns, &mcp.allow_tools)
+                .register_all(
+                    &mcp.servers,
+                    &mcp.write_tool_patterns,
+                    &mcp.allow_tools,
+                    posture,
+                    &mcp.argument_policy,
+                    &cwd,
+                )
                 .await
             {
                 anyhow::bail!("failed to start MCP servers: {err}");
@@ -1103,7 +1202,8 @@ async fn run_mcp_subcommand(command: McpCommand) -> Result<()> {
             } else {
                 mcp.write_tool_patterns.clone()
             };
-            let client = McpClient::new(spec, patterns);
+            let client = McpClient::new(spec, patterns, posture)
+                .with_argument_policy(mcp.argument_policy.clone(), cwd.to_path_buf());
             client
                 .start()
                 .await
@@ -1182,6 +1282,32 @@ async fn run_mayor_subcommand(args: MayorArgs, _mock: bool) -> Result<()> {
     );
     let total = config.orchestration.budget_cost_microusd_ceiling;
     let mayor = Mayor::new(mp, cwd.clone(), total);
+
+    // S14: observability-only subcommands — print coordination state and exit
+    // without draining the queue. These never affect acceptance or apply.
+    if let Some(recipient) = args.mailbox.as_deref() {
+        let messages = mayor
+            .drain_mail(recipient)
+            .with_context(|| format!("failed to drain mailbox for `{recipient}`"))?;
+        print_mailbox(recipient, &messages);
+        return Ok(());
+    }
+    if args.ledger {
+        let ledger = mayor.ledger().context("failed to read coordination ledger")?;
+        print_ledger(&ledger);
+        return Ok(());
+    }
+    if args.reconcile {
+        // H17: rebuild the ledger from the authoritative queue dirs (dirs win),
+        // persist it, and print it. Observability/repair only — never touches the
+        // queue files or the apply gate. No-op write when coordination is disabled.
+        let ledger = mayor
+            .reconcile_ledger()
+            .context("failed to reconcile coordination ledger")?;
+        print_ledger(&ledger);
+        return Ok(());
+    }
+
     let status = mayor.status().await.context("mayor status failed")?;
     print_mayor_status(&status);
     if args.status_only {
@@ -1211,6 +1337,169 @@ fn print_mayor_status(status: &nerve_core::MayorStatus) {
     for patrol in &status.active_patrols {
         println!("  patrol heartbeat: {patrol}");
     }
+}
+
+/// S14: render the coordination ledger. Observability only — this is a
+/// projection of queue state, never an acceptance/apply signal.
+fn print_ledger(ledger: &nerve_core::Ledger) {
+    println!("ledger: version={} entries={}", ledger.version, ledger.entries.len());
+    for entry in ledger.entries.values() {
+        let owner = entry.owner.as_deref().unwrap_or("-");
+        let cost = entry
+            .cost_microusd
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "  {task} state={state:?} owner={owner} cost_microusd={cost}",
+            task = entry.task_id,
+            state = entry.state,
+        );
+    }
+}
+
+/// S14: render a drained coordination mailbox.
+fn print_mailbox(recipient: &str, messages: &[nerve_core::MailMessage]) {
+    println!("mailbox: recipient={recipient} drained={}", messages.len());
+    for msg in messages {
+        println!(
+            "  [{kind:?}] from={from} id={id}: {body}",
+            kind = msg.kind,
+            from = msg.from,
+            id = msg.id,
+            body = msg.body,
+        );
+    }
+}
+
+/// S13 shared core for `nv dispatch-plan` and the `dispatch_plan` RPC. Loads the
+/// stored plan, parses its `## Steps` deterministically, converts each step to a
+/// [`PatrolTask`], and enqueues them on the Mayor queue. Returns the enqueued
+/// task ids.
+///
+/// **ENQUEUE ONLY (north star):** it never runs a loop and never applies. Patrol
+/// workers later execute the queued tasks in dry-run mode with the full
+/// verification gate intact; apply remains the per-run S11 consent decision, so
+/// the handoff can never auto-apply. **Fails closed:** a plan with no parseable
+/// steps is rejected rather than silently enqueuing nothing.
+async fn dispatch_plan_steps(
+    cwd: &Path,
+    config: &Config,
+    plan_id: &str,
+    max_steps: Option<usize>,
+    budget_microusd: Option<u64>,
+) -> Result<Vec<String>> {
+    let store = NerveStore::new(cwd);
+    let report = store
+        .load_plan(plan_id)
+        .with_context(|| format!("failed to load plan `{plan_id}` (run `nv plan` first)"))?;
+
+    let mut steps = parse_plan_steps_from_markdown(&report.plan_markdown);
+    if steps.is_empty() {
+        anyhow::bail!(
+            "plan `{plan_id}` has no parseable steps in its `## Steps` section; nothing to dispatch"
+        );
+    }
+    if let Some(limit) = max_steps {
+        // `--max-steps 0` is a degenerate cap: the plan HAS steps but the
+        // operator asked for none. Fail closed with a precise error rather than
+        // silently returning a zero-step "success" (which would read as
+        // "dispatched" while enqueuing nothing). A plan with no parseable steps
+        // is the distinct error reported above.
+        if limit == 0 {
+            anyhow::bail!(
+                "--max-steps must be >= 1; 0 would dispatch nothing for plan `{plan_id}`"
+            );
+        }
+        steps.truncate(limit);
+    }
+
+    // Objective gives each dispatched step the overall goal; affected files scope
+    // its context. If the stored markdown no longer validates, the objective
+    // falls back to empty — the parsed steps are what drive dispatch.
+    let objective = validate_plan_markdown(&report.plan_markdown)
+        .map(|sections| sections.objective)
+        .unwrap_or_default();
+
+    let mp = mayor_config_with_overrides(config, None, None, None, None);
+    let total = config.orchestration.budget_cost_microusd_ceiling;
+    let mayor = Mayor::new(mp, cwd.to_path_buf(), total);
+
+    // Default per-task budget: the configured per-patrol ceiling, else the total
+    // ceiling, else 0 (unbudgeted). An explicit --budget overrides.
+    let default_budget = config
+        .orchestration
+        .mayor_patrol
+        .as_ref()
+        .and_then(|m| m.per_patrol_budget_microusd)
+        .or(total)
+        .unwrap_or(0);
+    let budget = budget_microusd.unwrap_or(default_budget);
+
+    // Build every PatrolTask first, then fail closed BEFORE enqueuing any of
+    // them. The derived task id `<plan_id>-step-NN` must satisfy the SAME
+    // queue-component rule `Mayor::enqueue` enforces (1..=128 bytes of
+    // [A-Za-z0-9_-]). A `plan_id` near the 128-byte store limit, or a plan with
+    // enough steps to widen the `-step-NN` suffix, derives an over-long task id;
+    // catching that here — atomically, before the first enqueue — both gives the
+    // operator an actionable error and avoids a partial dispatch that would have
+    // left earlier steps queued before Mayor rejected a later one with an opaque
+    // `InvalidIdentifier`. `plan_id`'s charset is already constrained by
+    // `load_plan`'s `validate_store_id`, so only length can overflow here.
+    let tasks: Vec<_> = steps
+        .iter()
+        .map(|step| {
+            plan_step_to_patrol_task(plan_id, &objective, step, &report.estimated_files, budget)
+        })
+        .collect();
+    for task in &tasks {
+        if !is_valid_queue_id(&task.task_id) {
+            anyhow::bail!(
+                "plan `{plan_id}` ({} bytes) derives queue task id `{}` ({} bytes), which exceeds \
+                 the 128-byte queue-component limit; shorten the plan id before dispatching",
+                plan_id.len(),
+                task.task_id,
+                task.task_id.len(),
+            );
+        }
+    }
+
+    let mut enqueued = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let task_id = task.task_id.clone();
+        mayor
+            .enqueue(task)
+            .await
+            .with_context(|| format!("failed to enqueue plan step `{task_id}`"))?;
+        enqueued.push(task_id);
+    }
+    Ok(enqueued)
+}
+
+/// S13 `nv dispatch-plan` — enqueue a stored plan's steps for the loop.
+async fn run_dispatch_plan_subcommand(args: DispatchPlanArgs) -> Result<()> {
+    let cwd = match args.cwd {
+        Some(path) => path,
+        None => env::current_dir().context("failed to read current directory")?,
+    };
+    let config = Config::load_from(&cwd)?;
+    let enqueued = dispatch_plan_steps(
+        &cwd,
+        &config,
+        &args.plan_id,
+        args.max_steps,
+        args.budget_microusd,
+    )
+    .await?;
+    println!(
+        "dispatched plan `{}`: {} step(s) enqueued (dry-run; patrols run them, apply stays opt-in)",
+        args.plan_id,
+        enqueued.len()
+    );
+    for id in &enqueued {
+        println!("  queued: {id}");
+    }
+    println!("run `nv patrol --id <slot>` to execute the queued steps.");
+    Ok(())
 }
 
 async fn run_patrol_subcommand(args: PatrolArgs, mock: bool) -> Result<()> {
@@ -1258,13 +1547,25 @@ async fn run_patrol_subcommand(args: PatrolArgs, mock: bool) -> Result<()> {
             .with_context(|| format!("rpc bus init failed for patrol `{}`", args.id))?,
     );
 
+    // S13: real dispatch — each claimed task runs the synaptic loop in DRY-RUN
+    // (the full verification gate stays intact; the loop never applies). Own the
+    // config + adapters in `Arc`s so the `'static` `DispatchFuture` can borrow
+    // them; clone the handles per task (cheap).
+    let adapters = Arc::new(adapters_for_config(mock, &config));
+    let config = Arc::new(config);
+    let patrol_id = args.id.clone();
+
     if args.once {
-        // One-shot dispatch: claim a task, dispatch it through the in-process
-        // synaptic loop, and write the result.
+        // One-shot dispatch: claim a task, run it through the in-process synaptic
+        // loop, and write the result.
         let outcome = patrol
             .run_one(|task: PatrolTask| {
-                Box::pin(
-                    async move { Ok(nerve_core::PatrolResult::success(&task.task_id, "stub", 0)) },
+                patrol_dispatch(
+                    task,
+                    patrol_id.clone(),
+                    cwd.clone(),
+                    Arc::clone(&config),
+                    Arc::clone(&adapters),
                 )
             })
             .await
@@ -1276,13 +1577,16 @@ async fn run_patrol_subcommand(args: PatrolArgs, mock: bool) -> Result<()> {
         return Ok(());
     }
 
-    let _ = mock; // adapter mode currently selected via config, not patrol arg
     let (_tx, rx) = watch::channel(false);
     patrol
         .run_loop(
             |task: PatrolTask| {
-                Box::pin(
-                    async move { Ok(nerve_core::PatrolResult::success(&task.task_id, "stub", 0)) },
+                patrol_dispatch(
+                    task,
+                    patrol_id.clone(),
+                    cwd.clone(),
+                    Arc::clone(&config),
+                    Arc::clone(&adapters),
                 )
             },
             rx,
@@ -1290,6 +1594,62 @@ async fn run_patrol_subcommand(args: PatrolArgs, mock: bool) -> Result<()> {
         .await
         .context("patrol run_loop failed")?;
     Ok(())
+}
+
+/// S13: map a finalized [`RunReport`] to a [`PatrolResult`]. A `blocked` run
+/// (the deterministic gate rejected the patch) becomes a Failed result; any
+/// other terminal state is Success. `patch_sha` is the UNAPPLIED patch id —
+/// dispatch runs dry-run, so `report.applied` is always false here.
+fn patrol_result_from_report(
+    task_id: &str,
+    patrol_id: &str,
+    report: &RunReport,
+) -> nerve_core::PatrolResult {
+    let cost = report.usage.estimated_cost_microusd.unwrap_or(0);
+    let mut result = if report.blocked {
+        nerve_core::PatrolResult::failed(
+            task_id,
+            patrol_id,
+            cost,
+            format!(
+                "run blocked by verification gate (goal_satisfied={:?})",
+                report.goal_satisfied
+            ),
+        )
+    } else {
+        nerve_core::PatrolResult::success(task_id, patrol_id, cost)
+    };
+    result.patch_sha = report.final_patch.as_ref().map(|patch| patch.id.clone());
+    result
+}
+
+/// S13: the real Patrol dispatch — run one claimed task through the synaptic
+/// loop in DRY-RUN (`RunOptions::new(false)`). The deterministic verification
+/// gate (S4/S6/S7/S10/S11/S12) stays intact and the loop NEVER applies: a
+/// dispatched plan step can only produce a reviewed, unapplied patch. A loop
+/// error is recorded as a failed result (the task moves to `failed/`) rather
+/// than aborting the whole patrol.
+fn patrol_dispatch(
+    task: PatrolTask,
+    patrol_id: String,
+    cwd: PathBuf,
+    config: Arc<Config>,
+    adapters: Arc<Vec<Box<dyn ModelAdapter>>>,
+) -> nerve_core::DispatchFuture {
+    Box::pin(async move {
+        let loop_task = Task::new(task.prompt.clone(), &cwd);
+        match run_synaptic_loop(loop_task, &config, adapters.as_slice(), RunOptions::new(false))
+            .await
+        {
+            Ok(report) => Ok(patrol_result_from_report(&task.task_id, &patrol_id, &report)),
+            Err(err) => Ok(nerve_core::PatrolResult::failed(
+                &task.task_id,
+                &patrol_id,
+                0,
+                err.to_string(),
+            )),
+        }
+    })
 }
 
 fn patrol_rpc_token_path(session_meta: &Path, id: &str) -> PathBuf {
@@ -1872,12 +2232,25 @@ async fn run_plan_subcommand(args: PlanArgs, mock: bool, json: bool) -> Result<(
     .await
     .map_err(plan_error_to_anyhow)?;
 
+    // S13: persist the plan so `nv dispatch-plan <id>` can hand its steps to the
+    // loop later. Best-effort — a persistence failure must not fail plan output.
+    persist_plan_for_dispatch(&task_cwd, &report);
+
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
     print_plan_report(&report);
     Ok(())
+}
+
+/// S13: best-effort persist a [`PlanReport`] under `.nerve/plans/` so it can be
+/// dispatched later. A save failure is surfaced loudly on stderr but never fails
+/// the caller — plan output is purely advisory and must always print.
+fn persist_plan_for_dispatch(cwd: &Path, report: &PlanReport) {
+    if let Err(err) = NerveStore::new(cwd).save_plan(report) {
+        eprintln!("⚠ failed to persist plan `{}` for dispatch: {err}", report.task_id);
+    }
 }
 
 fn plan_error_to_anyhow(err: PlanError) -> anyhow::Error {
@@ -1970,6 +2343,7 @@ async fn run_interactive_plan(prompt: String, state: &InteractiveState) -> Resul
     )
     .await
     .map_err(plan_error_to_anyhow)?;
+    persist_plan_for_dispatch(&cwd, &report);
     print_plan_report(&report);
     Ok(())
 }
@@ -2586,6 +2960,7 @@ impl InteractiveState {
         };
         match report.final_feedback.verdict {
             Verdict::Lgtm => "lgtm",
+            Verdict::AcceptWithNits => "nits",
             Verdict::RequestChanges => "changes",
             Verdict::Block => {
                 if report.budget_exceeded {
@@ -2765,6 +3140,7 @@ fn render_status_bar(state: &InteractiveState) -> String {
     let verdict_value = state.last_verdict_label();
     let verdict_label = match verdict_value {
         "lgtm" => success("ok"),
+        "nits" => warn("nits"),
         "changes" => warn("changes"),
         value if value.starts_with("block") => error_style("blocked"),
         _ => "-".to_string(),
@@ -2961,8 +3337,26 @@ fn print_interactive_result(report: &RunReport, apply_requested: bool) {
 
     if let Some(patch) = &report.final_patch {
         lines.push(format!("patch {}  files={}", patch.id, patch.files.len()));
+        if let Some(classification) = report.apply_classification.as_ref() {
+            // S12: surface the deterministic auto-mode classification.
+            let risk = if classification.is_high() { "high" } else { "low" };
+            let detail = if classification.reasons.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", classification.reasons.join("; "))
+            };
+            lines.push(format!(
+                "auto-mode: {risk} risk ({} files, {} lines){detail}",
+                classification.files_touched, classification.lines_changed
+            ));
+        }
         if report.applied {
             lines.push("Applied patch. Use /rollback to undo the last patch.".to_string());
+        } else if apply_downgraded(report) {
+            lines.push(
+                "auto-mode kept this as a dry-run (high-risk patch). Use /diff to inspect or /apply to apply it."
+                    .to_string(),
+            );
         } else if !apply_requested && !report.blocked {
             lines.push(
                 "reviewed patch ready. Use /diff to inspect or /apply to apply it.".to_string(),
@@ -3249,13 +3643,21 @@ async fn handle_mcp_slash(raw_command: &str, args: Vec<&str>, cwd: &Path) -> Res
         println!("/mcp: no servers configured (roles.mcp / profiles[].mcp empty)");
         return Ok(());
     };
+    let posture = resolve_mcp_posture(&config, &mcp);
     let mut iter = args.into_iter();
     let action = iter.next().unwrap_or("list");
     match action {
         "list" => {
             let mut registry = McpRegistry::new();
             registry
-                .register_all(&mcp.servers, &mcp.write_tool_patterns, &mcp.allow_tools)
+                .register_all(
+                    &mcp.servers,
+                    &mcp.write_tool_patterns,
+                    &mcp.allow_tools,
+                    posture,
+                    &mcp.argument_policy,
+                    cwd,
+                )
                 .await
                 .context("/mcp list: failed to start configured servers")?;
             for (name, client) in registry.iter() {
@@ -3304,7 +3706,8 @@ async fn handle_mcp_slash(raw_command: &str, args: Vec<&str>, cwd: &Path) -> Res
             } else {
                 mcp.write_tool_patterns.clone()
             };
-            let client = McpClient::new(spec, patterns);
+            let client = McpClient::new(spec, patterns, posture)
+                .with_argument_policy(mcp.argument_policy.clone(), cwd.to_path_buf());
             client.start().await?;
             let result = client
                 .call_tool(McpToolCall {
@@ -3898,16 +4301,17 @@ fn render_goal_intent_proposal(intent: &GoalIntent) {
     if intent.proposed_spec.env.is_empty() {
         println!("  env:          (inherit only configured allowlist)");
     } else {
+        // H12: list every model-proposed override on its own line under a loud
+        // header. env is injected into the check child and overrides the
+        // operator allowlist, so the human confirmation gate must see each one
+        // explicitly — never a single comma-joined blob that hides an entry.
+        let n = intent.proposed_spec.env.len();
         println!(
-            "  env override: {}",
-            intent
-                .proposed_spec
-                .env
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "  ⚠ env:        {n} model-proposed override(s) injected into the check — review each:"
         );
+        for (k, v) in &intent.proposed_spec.env {
+            println!("      {k}={v}");
+        }
     }
     println!("  rationale:    {}", intent.rationale);
     println!("  source:       {}", intent.source_adapter);
@@ -4177,9 +4581,10 @@ async fn handle_budget_command(
                 next: next.clone(),
                 source: "slash".to_string(),
                 user_confirmed,
-                // sec-gap-12 hash chain: append_budget_audit_entry fills this
-                // with the current chain head before persisting.
+                // sec-gap-12 hash chain: append_budget_audit_entry fills
+                // prev_hash (and, when keyed, entry_mac) before persisting.
                 prev_hash: None,
+                entry_mac: None,
             };
             append_budget_audit_entry(&budget_audit_path(cwd), entry)
                 .with_context(|| "failed to append budget audit entry")?;
@@ -4311,6 +4716,9 @@ async fn run_rpc_daemon(
         RpcBus::new(rpc_config, &cwd)
             .with_context(|| "failed to open RPC bus for daemon startup")?,
     );
+    // S9: tracks in-flight (nonblocking) runs so the read loop stays responsive
+    // and shutdown can await them.
+    let registry: RunRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     if print_token {
         // Token surfaces as a typed envelope on stdout (not the bearer text
@@ -4349,8 +4757,15 @@ async fn run_rpc_daemon(
             }
         };
 
-        if let Err(error) =
-            handle_rpc_command(value, apply, mock, bus.clone(), worktree_override).await
+        if let Err(error) = handle_rpc_command(
+            value,
+            apply,
+            mock,
+            bus.clone(),
+            worktree_override,
+            registry.clone(),
+        )
+        .await
         {
             println!(
                 "{}",
@@ -4364,6 +4779,19 @@ async fn run_rpc_daemon(
         if once {
             break;
         }
+    }
+
+    // S9: await every in-flight run before shutting down. This makes `--once`
+    // wait for the spawned run to finish (it no longer blocks the read loop),
+    // ensures a graceful shutdown never drops a running loop mid-flight, and
+    // releases the bus clones held by the run tasks so the `Arc::try_unwrap`
+    // below can reclaim the bus.
+    let handles: Vec<JoinHandle<()>> = match registry.lock() {
+        Ok(mut reg) => reg.drain().map(|(_, run)| run.join).collect(),
+        Err(_) => Vec::new(),
+    };
+    for handle in handles {
+        let _ = handle.await;
     }
 
     // sec-4 #5: tear down the bearer-token file on graceful shutdown so a
@@ -4388,6 +4816,343 @@ fn emit_envelope_line(envelope: &RpcEnvelope) {
 
 fn rpc_envelope(kind: &str, payload: serde_json::Value) -> RpcEnvelope {
     RpcEnvelope::new(kind, payload).with_fresh_metadata()
+}
+
+/// S9/S11/S15: a tracked in-flight run — its join handle (for graceful shutdown),
+/// its S11 [`ApplyConsent`] handle (so the operator can escalate THIS run to apply
+/// mid-flight via `approve`), and its S15 [`CancelToken`] (so the operator can
+/// cancel THIS run via `cancel`). Both handles are held in the daemon's memory and
+/// are unreachable by the lead subprocess, which is what makes consent forge-proof
+/// and cancellation un-spoofable (see `ApplyConsent` / `CancelToken`).
+struct TrackedRun {
+    join: JoinHandle<()>,
+    consent: ApplyConsent,
+    cancel: CancelToken,
+}
+
+/// S11: grant apply-consent to an in-flight run, returning whether a grant was
+/// made. A run-id that is ABSENT *or already FINISHED* returns `false` and flips
+/// nothing: a finished run has already passed its single apply seam and can never
+/// act on a grant, so "approving" it would only write a misleading audit record
+/// for a run that can never apply. (Finished entries linger in the registry until
+/// the next spawn/shutdown prunes them, so this guard — not mere presence — is
+/// what makes the `approve` contract "in-flight only" hold.)
+fn grant_in_flight(reg: &HashMap<String, TrackedRun>, run_id: &str) -> bool {
+    match reg.get(run_id) {
+        Some(run) if !run.join.is_finished() => {
+            run.consent.grant();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// S15: cancel a specific in-flight run, returning whether a cancel was sent. Like
+/// [`grant_in_flight`], a run-id that is ABSENT *or already FINISHED* returns
+/// `false` and flips nothing — a finished run has already passed its last round
+/// seam, so cancelling it would do nothing but report a misleading success. The
+/// flip is rejection-direction only: it can never apply or accept a run, only stop
+/// one (the cancelled run is reported blocked, never applied).
+fn cancel_in_flight(reg: &HashMap<String, TrackedRun>, run_id: &str) -> bool {
+    match reg.get(run_id) {
+        Some(run) if !run.join.is_finished() => {
+            run.cancel.cancel();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// S15: bulk-cancel EVERY in-flight run, returning the count cancelled. Only
+/// not-yet-finished runs are flipped (finished ones are no-ops). Explicit operator
+/// opt-in (`cancel` with `all:true`); rejection-direction only.
+fn cancel_all_in_flight(reg: &HashMap<String, TrackedRun>) -> usize {
+    let mut count = 0;
+    for run in reg.values() {
+        if !run.join.is_finished() {
+            run.cancel.cancel();
+            count += 1;
+        }
+    }
+    count
+}
+
+/// S9: tracks in-flight (nonblocking) run tasks by run-id so the daemon read
+/// loop stays responsive while runs execute, and graceful shutdown can await
+/// them. A plain `std::sync::Mutex` is fine: every critical section is a short
+/// synchronous insert / `retain` / `drain` with no `.await` held across it.
+type RunRegistry = Arc<std::sync::Mutex<HashMap<String, TrackedRun>>>;
+
+/// S9: map a completed round to its live `round.started` + `round.ended`
+/// envelopes (the round-seam signal streamed as each round finishes).
+fn round_seam_envelopes(session_id: &str, round: &RoundRecord) -> (RpcEnvelope, RpcEnvelope) {
+    use nerve_types::rpc_kinds;
+    let started = rpc_envelope(
+        rpc_kinds::ROUND_STARTED,
+        serde_json::json!({ "session_id": session_id, "round": round.round }),
+    );
+    let ended = rpc_envelope(
+        rpc_kinds::ROUND_ENDED,
+        serde_json::json!({
+            "session_id": session_id,
+            "round": round.round,
+            "verdict": round.reviewer.verdict,
+            "check": round.check_result,
+        }),
+    );
+    (started, ended)
+}
+
+/// S9: map an in-flight S8 checkpoint to a `session.status` envelope (served by
+/// the `status` command from the on-disk checkpoints, so it works even across a
+/// daemon restart). A checkpoint carries no acceptance fields, so this can only
+/// ever report progress — never that a run was accepted.
+fn checkpoint_status_envelope(checkpoint: &RunCheckpoint) -> RpcEnvelope {
+    use nerve_types::rpc_kinds;
+    rpc_envelope(
+        rpc_kinds::SESSION_STATUS,
+        serde_json::json!({
+            "session_id": checkpoint.task.id,
+            "prompt": checkpoint.task.prompt,
+            "status": checkpoint.status,
+            "rounds": checkpoint.rounds.len(),
+            "updated_at": checkpoint.updated_at,
+        }),
+    )
+}
+
+/// S9: emit the terminal lifecycle envelopes for a finished run (everything
+/// v1's blocking `prompt` handler emitted EXCEPT `session.started` and the
+/// round seams, which v2 now streams live). Preserves full v1 parity: the
+/// legacy flat-JSON batch, the typed agent stdout chunks, and the typed
+/// budget / patch / session.ended envelopes plus the legacy `session_end` line.
+/// S12: whether the auto-mode classifier downgraded an operator-consented apply
+/// to a dry-run for this run (High-risk patch under `Enforce`). False when the
+/// classifier is off/advisory or the patch was Low risk.
+fn apply_downgraded(report: &RunReport) -> bool {
+    report
+        .apply_classification
+        .as_ref()
+        .is_some_and(|classification| classification.downgraded)
+}
+
+fn emit_terminal_envelopes(report: &RunReport, bus: &RpcBus) -> Result<()> {
+    use nerve_types::rpc_kinds;
+
+    emit_report_events(report)?;
+
+    for event in &report.events {
+        for envelope in agent_event_to_envelopes(event, &report.selection.lead) {
+            emit_envelope_line(&envelope);
+            let _ = bus.emit(&envelope.kind, envelope.payload.clone());
+        }
+    }
+
+    let budget_envelope = rpc_envelope(
+        rpc_kinds::BUDGET_CHANGED,
+        serde_json::json!({
+            "session_id": report.task.id,
+            "input_tokens": report.usage.input_tokens,
+            "output_tokens": report.usage.output_tokens,
+            "estimated_cost_microusd": report.usage.estimated_cost_microusd,
+            "budget_exceeded": report.budget_exceeded,
+        }),
+    );
+    emit_envelope_line(&budget_envelope);
+    let _ = bus.emit(rpc_kinds::BUDGET_CHANGED, budget_envelope.payload.clone());
+
+    if let Some(patch) = &report.final_patch {
+        let kind = if report.applied {
+            rpc_kinds::PATCH_APPLIED
+        } else {
+            rpc_kinds::PATCH_DISCARDED
+        };
+        let patch_envelope = rpc_envelope(
+            kind,
+            serde_json::json!({
+                "session_id": report.task.id,
+                "patch_id": patch.id,
+                "files": patch.files.len(),
+                "blocked": report.blocked,
+            }),
+        );
+        emit_envelope_line(&patch_envelope);
+        let _ = bus.emit(kind, patch_envelope.payload.clone());
+    }
+
+    let session_ended = rpc_envelope(
+        rpc_kinds::SESSION_ENDED,
+        serde_json::json!({
+            "session_id": report.task.id,
+            "verdict": report.final_feedback.verdict,
+            "applied": report.applied,
+            "blocked": report.blocked,
+            // S10: additive field naming the live-crossfire-Block reason behind a
+            // blocked run (Halt action). Additive payload key, no schema bump.
+            "crossfire_halted": report.crossfire_halted,
+            // S15: additive field — true when the run was cancelled by the
+            // operator at a round seam (rejection-direction; the run is blocked
+            // and never applied). Additive payload key, no schema bump.
+            "cancelled": report.cancelled,
+            // S12: additive field — true when the auto-mode classifier downgraded
+            // an operator-consented apply to a dry-run because the patch was High
+            // risk (Enforce). The run was NOT blocked (acceptance is unchanged);
+            // the patch is staged for manual review. Additive key, no schema bump.
+            "apply_downgraded": apply_downgraded(report),
+            "patch_id": report.final_patch.as_ref().map(|patch| patch.id.clone()),
+        }),
+    );
+    emit_envelope_line(&session_ended);
+    let _ = bus.emit(rpc_kinds::SESSION_ENDED, session_ended.payload.clone());
+
+    // Legacy `session_end` JSON kept for v0.3.0 consumers; v0.5.0 consumers read
+    // the typed envelope above.
+    println!(
+        "{}",
+        serde_json::json!({
+            "type": "session_end",
+            "session_id": report.task.id,
+            "verdict": report.final_feedback.verdict,
+            "applied": report.applied,
+            "blocked": report.blocked,
+            "patch_id": report.final_patch.as_ref().map(|patch| patch.id.clone())
+        })
+    );
+    Ok(())
+}
+
+/// S9: spawn a synaptic-loop run WITHOUT blocking the daemon read loop. Emits
+/// `session.started` immediately, streams `round.started`/`round.ended` live as
+/// each round completes (via the loop's round observer), and emits the terminal
+/// lifecycle envelopes when the run finishes. The run is tracked in `registry`
+/// by run-id so shutdown can await it.
+///
+/// Streaming + checkpoints are read-only telemetry: the run still goes through
+/// the unchanged `run_synaptic_loop` deterministic gate, and nothing here can
+/// auto-apply or fabricate acceptance.
+fn spawn_streaming_run(
+    prompt: String,
+    apply: bool,
+    mock: bool,
+    worktree_override: Option<bool>,
+    bus: Arc<RpcBus>,
+    registry: RunRegistry,
+) -> Result<()> {
+    use nerve_types::rpc_kinds;
+
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let config = Config::load_from(&cwd)?;
+    let mut task = Task::new(prompt, &cwd);
+    task.context_paths = collect_context_paths(&task.prompt, &cwd);
+    let run_id = task.id.clone();
+    // Resolve the profile up front so `session.started` can name lead/reviewer;
+    // the loop recomputes it deterministically (cheap, identical result).
+    let selection = config.select_profile(&task)?;
+
+    let session_started = rpc_envelope(
+        rpc_kinds::SESSION_STARTED,
+        serde_json::json!({
+            "session_id": run_id,
+            "prompt": task.prompt,
+            "lead": selection.lead,
+            "reviewer": selection.reviewer,
+        }),
+    );
+    emit_envelope_line(&session_started);
+    let _ = bus.emit(rpc_kinds::SESSION_STARTED, session_started.payload.clone());
+
+    // S11: the shared apply-consent handle for THIS run. The run task holds one
+    // clone (read at the apply seam); the registry holds another so the operator
+    // can `approve` this run-id mid-flight. Held in daemon memory — unreachable
+    // by the lead subprocess.
+    let consent = ApplyConsent::new();
+    let run_consent = consent.clone();
+    // S15: the shared cancel handle for THIS run. Same ownership model — the run
+    // task holds one clone (checked at each round seam); the registry holds
+    // another so the operator can `cancel` this run-id mid-flight.
+    let cancel = CancelToken::new();
+    let run_cancel = cancel.clone();
+
+    let (round_tx, mut round_rx) = mpsc::unbounded_channel::<RoundRecord>();
+
+    // STREAMER: forward each live round to round.started + round.ended. Ends
+    // when `round_tx` drops (the loop finished and released the observer).
+    let streamer_bus = bus.clone();
+    let streamer_id = run_id.clone();
+    let streamer = tokio::spawn(async move {
+        while let Some(round) = round_rx.recv().await {
+            let (started, ended) = round_seam_envelopes(&streamer_id, &round);
+            emit_envelope_line(&started);
+            let _ = streamer_bus.emit(&started.kind, started.payload.clone());
+            emit_envelope_line(&ended);
+            let _ = streamer_bus.emit(&ended.kind, ended.payload.clone());
+        }
+    });
+
+    // RUN: drive the streaming loop, persist, then emit terminal envelopes.
+    let run_bus = bus.clone();
+    let run_id_for_task = run_id.clone();
+    let handle = tokio::spawn(async move {
+        let mut options = RunOptions::new(apply)
+            .with_apply_grant(run_consent)
+            .with_cancel_token(run_cancel);
+        if let Some(spec) = config.orchestration.check_ulimit.as_ref()
+            && !spec.is_empty()
+        {
+            options = options.with_ulimit(core_ulimit_from_config(spec));
+        }
+        if let Some(on) = worktree_override {
+            options = options.with_worktree(on);
+        }
+        let adapters = adapters_for_config(mock, &config);
+        let outcome =
+            run_synaptic_loop_streaming(task, &config, &adapters, options, round_tx).await;
+
+        // The loop has released `round_tx`, so the streamer's channel is now
+        // closed; await it FIRST so every live round seam is flushed to stdout
+        // BEFORE any terminal envelope. This preserves causal ordering on the
+        // JSONL stream (session.started -> round seams -> terminal envelopes);
+        // without it the streamer could still be draining buffered rounds while
+        // `session.ended` is printed, interleaving a round.ended after the end.
+        let _ = streamer.await;
+
+        match outcome {
+            Ok(report) => {
+                if let Err(error) = NerveStore::new(&cwd).save_report(&report) {
+                    eprintln!("warning: failed to persist session report: {error}");
+                }
+                if let Err(error) = emit_terminal_envelopes(&report, &run_bus) {
+                    eprintln!("warning: failed to emit terminal envelopes: {error}");
+                }
+            }
+            Err(error) => {
+                // The run failed before producing a report; surface it on the
+                // same JSONL stream so a consumer is not left waiting forever.
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "error",
+                        "session_id": run_id_for_task,
+                        "message": error.to_string(),
+                    })
+                );
+            }
+        }
+    });
+
+    if let Ok(mut reg) = registry.lock() {
+        // Drop handles for runs that already finished so the map stays bounded.
+        reg.retain(|_, run| !run.join.is_finished());
+        reg.insert(
+            run_id,
+            TrackedRun {
+                join: handle,
+                consent,
+                cancel,
+            },
+        );
+    }
+    Ok(())
 }
 
 /// Convert an [`AgentEvent`] into the Tier 2e envelope kinds expected by
@@ -4427,6 +5192,7 @@ async fn handle_rpc_command(
     mock: bool,
     bus: Arc<RpcBus>,
     worktree_override: Option<bool>,
+    registry: RunRegistry,
 ) -> Result<()> {
     use nerve_types::rpc_kinds;
 
@@ -4436,119 +5202,178 @@ async fn handle_rpc_command(
         .context("missing string field `command`")?;
     match command {
         "prompt" => {
+            // S9: spawn the run WITHOUT blocking the read loop. `session.started`
+            // is emitted immediately, round seams stream live, and the terminal
+            // envelopes are emitted when the run finishes. The deterministic
+            // acceptance gate is unchanged — this only changes WHEN envelopes are
+            // emitted (live vs the old post-hoc replay), never WHETHER a patch is
+            // accepted.
             let prompt = value
                 .get("prompt")
                 .and_then(serde_json::Value::as_str)
                 .context("missing string field `prompt`")?;
-            let report = run_report(prompt.to_string(), apply, mock, worktree_override).await?;
-            emit_report_events(&report)?;
-            // Tier 2e (v0.5.0) lifecycle envelopes: emit through the bus and
-            // also stream them as newline-delimited JSON on stdout so consumers
-            // that don't subscribe to the broadcast channel still observe them.
-            let session_started = rpc_envelope(
-                rpc_kinds::SESSION_STARTED,
-                serde_json::json!({
-                    "session_id": report.task.id,
-                    "prompt": report.task.prompt,
-                    "lead": report.selection.lead,
-                    "reviewer": report.selection.reviewer,
-                }),
-            );
-            emit_envelope_line(&session_started);
-            let _ = bus.emit(rpc_kinds::SESSION_STARTED, session_started.payload.clone());
-
-            for event in &report.events {
-                for envelope in agent_event_to_envelopes(event, &report.selection.lead) {
-                    emit_envelope_line(&envelope);
-                    let _ = bus.emit(&envelope.kind, envelope.payload.clone());
+            spawn_streaming_run(
+                prompt.to_string(),
+                apply,
+                mock,
+                worktree_override,
+                bus.clone(),
+                registry.clone(),
+            )?;
+        }
+        "approve" => {
+            // S11: escalate a SPECIFIC in-flight run to apply-consent. The
+            // operator names the run-id (from `session.started`/`status`); we
+            // flip its IN-MEMORY `ApplyConsent` handle (the forge-proof gate
+            // input the lead cannot reach) so the run applies its accepted patch
+            // at its apply seam. We also record an audit grant under
+            // `.nerve/approvals/` so a reconnecting client can see the standing
+            // grant. This NEVER weakens acceptance: the run still applies only
+            // if the deterministic gate did not block it.
+            let run_id = value
+                .get("run_id")
+                .or_else(|| value.get("session_id"))
+                .and_then(serde_json::Value::as_str)
+                .context("missing string field `run_id`")?;
+            // Only an in-flight (not-yet-finished) run can still reach its apply
+            // seam, so only it may be escalated; a finished/unknown run-id is a
+            // no-op (`granted:false`, nothing written). See `grant_in_flight`.
+            let granted = match registry.lock() {
+                Ok(reg) => grant_in_flight(&reg, run_id),
+                Err(_) => false,
+            };
+            if granted {
+                let cwd = env::current_dir().context("failed to read current directory")?;
+                if let Err(error) =
+                    NerveStore::new(&cwd).record_approval(&ApprovalGrant::apply(run_id))
+                {
+                    eprintln!("warning: failed to record approval grant: {error}");
                 }
             }
-
-            // Round.started/ended pair per recorded round. We do not have
-            // per-iter timings from `RunReport` (one-shot RPC) so the envelope
-            // carries the round index only.
-            for round in &report.rounds {
-                let round_started = rpc_envelope(
-                    rpc_kinds::ROUND_STARTED,
-                    serde_json::json!({
-                        "session_id": report.task.id,
-                        "round": round.round,
-                    }),
-                );
-                emit_envelope_line(&round_started);
-                let _ = bus.emit(rpc_kinds::ROUND_STARTED, round_started.payload.clone());
-
-                let round_ended = rpc_envelope(
-                    rpc_kinds::ROUND_ENDED,
-                    serde_json::json!({
-                        "session_id": report.task.id,
-                        "round": round.round,
-                        "verdict": round.reviewer.verdict,
-                        "check": round.check_result,
-                    }),
-                );
-                emit_envelope_line(&round_ended);
-                let _ = bus.emit(rpc_kinds::ROUND_ENDED, round_ended.payload.clone());
-            }
-
-            // Budget envelope: cumulative usage at the end of the session.
-            let budget_envelope = rpc_envelope(
-                rpc_kinds::BUDGET_CHANGED,
-                serde_json::json!({
-                    "session_id": report.task.id,
-                    "input_tokens": report.usage.input_tokens,
-                    "output_tokens": report.usage.output_tokens,
-                    "estimated_cost_microusd": report.usage.estimated_cost_microusd,
-                    "budget_exceeded": report.budget_exceeded,
-                }),
-            );
-            emit_envelope_line(&budget_envelope);
-            let _ = bus.emit(rpc_kinds::BUDGET_CHANGED, budget_envelope.payload.clone());
-
-            // Patch envelope: applied vs discarded.
-            if let Some(patch) = &report.final_patch {
-                let kind = if report.applied {
-                    rpc_kinds::PATCH_APPLIED
-                } else {
-                    rpc_kinds::PATCH_DISCARDED
-                };
-                let patch_envelope = rpc_envelope(
-                    kind,
-                    serde_json::json!({
-                        "session_id": report.task.id,
-                        "patch_id": patch.id,
-                        "files": patch.files.len(),
-                        "blocked": report.blocked,
-                    }),
-                );
-                emit_envelope_line(&patch_envelope);
-                let _ = bus.emit(kind, patch_envelope.payload.clone());
-            }
-
-            let session_ended = rpc_envelope(
-                rpc_kinds::SESSION_ENDED,
-                serde_json::json!({
-                    "session_id": report.task.id,
-                    "verdict": report.final_feedback.verdict,
-                    "applied": report.applied,
-                    "blocked": report.blocked,
-                    "patch_id": report.final_patch.as_ref().map(|patch| patch.id.clone())
-                }),
-            );
-            emit_envelope_line(&session_ended);
-            let _ = bus.emit(rpc_kinds::SESSION_ENDED, session_ended.payload.clone());
-
-            // Legacy `session_end` JSON kept for v0.3.0 consumers; v0.5.0
-            // consumers read the typed envelope above.
+            // A plain ack line (additive, no schema bump). `granted=false` means
+            // the run-id is not in flight (finished or never existed), so nothing
+            // was escalated.
             println!(
                 "{}",
                 serde_json::json!({
-                    "type": "session_end",
-                    "session_id": report.task.id,
-                    "verdict": report.final_feedback.verdict,
-                    "applied": report.applied,
-                    "blocked": report.blocked,
-                    "patch_id": report.final_patch.as_ref().map(|patch| patch.id.clone())
+                    "type": "approve_ack",
+                    "run_id": run_id,
+                    "granted": granted,
+                })
+            );
+        }
+        "cancel" => {
+            // S15: cancel in-flight run(s). `all:true` cancels EVERY in-flight run
+            // (explicit operator opt-in for bulk); otherwise `run_id` names a
+            // single run. Flips the IN-MEMORY `CancelToken` the lead cannot reach;
+            // honored at the next round seam. Rejection-direction only — a
+            // cancelled run is reported blocked and is NEVER applied, so this can
+            // never weaken acceptance. No disk write: the cancelled run's blocked
+            // report is persisted by the normal finalize path.
+            let all = value
+                .get("all")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if all {
+                let count = match registry.lock() {
+                    Ok(reg) => cancel_all_in_flight(&reg),
+                    Err(_) => 0,
+                };
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "cancel_all_ack",
+                        "count": count,
+                    })
+                );
+            } else {
+                let run_id = value
+                    .get("run_id")
+                    .or_else(|| value.get("session_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .context("missing string field `run_id` (or `all: true`)")?;
+                // Only an in-flight run can still reach a round seam, so only it
+                // can be cancelled; a finished/unknown run-id is a no-op.
+                let cancelled = match registry.lock() {
+                    Ok(reg) => cancel_in_flight(&reg, run_id),
+                    Err(_) => false,
+                };
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "cancel_ack",
+                        "run_id": run_id,
+                        "cancelled": cancelled,
+                    })
+                );
+            }
+        }
+        "conductor" => {
+            // S15: Conductor LIVE state — a snapshot of the in-memory run registry
+            // (this daemon process only; unlike `status` it is not restored from
+            // on-disk checkpoints). OBSERVABILITY ONLY: it reports liveness, never
+            // acceptance — the payload deliberately carries NO
+            // applied/blocked/goal_satisfied keys (mirrors S9 `status` and the S14
+            // ledger's non-authoritative contract).
+            let mut live = 0usize;
+            if let Ok(mut reg) = registry.lock() {
+                // Prune finished entries so the snapshot reflects live runs.
+                reg.retain(|_, run| !run.join.is_finished());
+                for (run_id, run) in reg.iter() {
+                    live += 1;
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "conductor_run",
+                            "run_id": run_id,
+                            "running": true,
+                            "cancelled": run.cancel.is_cancelled(),
+                        })
+                    );
+                }
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "conductor_end",
+                    "live": live,
+                })
+            );
+        }
+        "status" => {
+            // S9: report in-flight runs from the S8 on-disk checkpoints, so this
+            // works even across a daemon restart. A checkpoint has no acceptance
+            // fields, so `status` can only report progress, never acceptance.
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            let store = NerveStore::new(&cwd);
+            let checkpoints = store
+                .list_checkpoints()
+                .with_context(|| "failed to list in-flight run checkpoints")?;
+            for checkpoint in &checkpoints {
+                let envelope = checkpoint_status_envelope(checkpoint);
+                emit_envelope_line(&envelope);
+                let _ = bus.emit(&envelope.kind, envelope.payload.clone());
+                // S11: surface a standing apply-consent grant for this run so a
+                // reconnecting client knows it was approved. Audit-only — this
+                // never drives the gate (the gate reads the in-memory handle).
+                if let Ok(Some(grant)) = store.load_approval(&checkpoint.task.id) {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "approval_grant",
+                            "run_id": grant.run_id,
+                            "apply_consent": grant.apply_consent,
+                            "granted_at": grant.granted_at,
+                        })
+                    );
+                }
+            }
+            // A terminal summary line so a consumer knows the listing is complete.
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "status_end",
+                    "in_flight": checkpoints.len(),
                 })
             );
         }
@@ -4581,6 +5406,7 @@ async fn handle_rpc_command(
             )
             .await
             .map_err(plan_error_to_anyhow)?;
+            persist_plan_for_dispatch(&cwd, &report);
             let envelope = rpc_envelope(
                 rpc_kinds::PLAN_PROPOSED,
                 serde_json::json!({
@@ -4593,6 +5419,32 @@ async fn handle_rpc_command(
             );
             emit_envelope_line(&envelope);
             let _ = bus.emit(rpc_kinds::PLAN_PROPOSED, envelope.payload.clone());
+        }
+        "dispatch_plan" => {
+            // S13 RPC entry point for `nv dispatch-plan`. Loads a stored plan,
+            // converts its steps to PatrolTasks, and enqueues them. Enqueue only
+            // — it never runs a loop and never applies.
+            let plan_id = value
+                .get("plan_id")
+                .and_then(serde_json::Value::as_str)
+                .context("missing string field `plan_id`")?;
+            let max_steps = value
+                .get("max_steps")
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as usize);
+            let budget_microusd = value
+                .get("budget_microusd")
+                .and_then(serde_json::Value::as_u64);
+            let cwd = env::current_dir().context("failed to read current directory")?;
+            let config = Config::load_from(&cwd)?;
+            let enqueued =
+                dispatch_plan_steps(&cwd, &config, plan_id, max_steps, budget_microusd).await?;
+            let envelope = rpc_envelope(
+                RPC_PLAN_DISPATCHED,
+                serde_json::json!({ "plan_id": plan_id, "enqueued": enqueued }),
+            );
+            emit_envelope_line(&envelope);
+            let _ = bus.emit(RPC_PLAN_DISPATCHED, envelope.payload.clone());
         }
         "get_state" | "history" => {
             let cwd = env::current_dir().context("failed to read current directory")?;
@@ -4843,6 +5695,10 @@ async fn run_report_with_overrides(
     let mut options = RunOptions::new(apply);
     if let Some(spec) = goal {
         options = options.with_goal(spec);
+    } else {
+        // S4: surface which deterministic gate will run when no explicit /goal
+        // is set, so acceptance is never silently reduced to reviewer opinion.
+        announce_builtin_verifier(&config, &cwd);
     }
     if let Some(spec) = config.orchestration.check_ulimit.as_ref()
         && !spec.is_empty()
@@ -4857,11 +5713,61 @@ async fn run_report_with_overrides(
     Ok(report)
 }
 
+/// S4: print which deterministic gate will run when a `nv run` has no explicit
+/// `/goal`. Loud by design — the dangerous case (no verifier AND no goal, so
+/// acceptance rests on the reviewer verdict alone) is always a warning, never
+/// silence, even when the built-in verifier is `off` (the safe default).
+fn announce_builtin_verifier(config: &Config, cwd: &Path) {
+    // S4 trust boundary: a project-local `nerve.config.json` cannot enable the
+    // executing Auto/Command modes without out-of-band operator consent.
+    let consent = project_verifier_consent_from_env();
+    let exec_trusted = config.builtin_verifier_exec_trusted(consent);
+    let mode = &config.orchestration.builtin_verifier.mode;
+    match resolve_builtin_verifier(&config.orchestration, cwd, exec_trusted) {
+        // Operator opted in (auto/command) from a trusted source and a gate
+        // resolved: it WILL execute repo code. Muted info — the consented case.
+        Some(resolved) => {
+            eprintln!(
+                "{}",
+                muted(format!(
+                    "verifier: {} (built-in; no /goal set — override with --goal or orchestration.builtin_verifier)",
+                    resolved.label
+                ))
+            );
+        }
+        // No deterministic gate. Acceptance would rest on the reviewer verdict
+        // alone — the exact gap S4 closes — so warn loudly and show how to opt
+        // in. `off` is the default (Nerve never executes repo code without
+        // consent), so this fires for most fresh runs by design.
+        None => {
+            let hint: String = if !exec_trusted && !matches!(mode, BuiltinVerifierMode::Off) {
+                // Project config asked for an executing verifier; refused.
+                format!(
+                    "this project's nerve.config.json requested it but repo config cannot run code without consent — move the setting to ~/.config/nerve/config.json or set {PROJECT_VERIFIER_CONSENT_ENV}=1, or pass --goal"
+                )
+            } else if matches!(mode, BuiltinVerifierMode::Off) {
+                "set orchestration.builtin_verifier.mode = \"auto\" (runs your project's tests) or \"command\", or pass --goal".to_string()
+            } else {
+                "no test/build markers detected; set orchestration.builtin_verifier.command or pass --goal".to_string()
+            };
+            eprintln!(
+                "{}",
+                warn(format!(
+                    "⚠ no deterministic verifier and no /goal — acceptance rests on the reviewer verdict alone; {hint}"
+                ))
+            );
+        }
+    }
+}
+
 fn adapters_for_config(mock: bool, config: &Config) -> Vec<Box<dyn ModelAdapter>> {
     default_adapters_with_limits(
         mock,
-        config.orchestration.adapter_timeout_secs,
-        config.orchestration.adapter_max_output_bytes,
+        AdapterLimits::new(
+            config.orchestration.adapter_timeout_secs,
+            config.orchestration.adapter_max_output_bytes,
+            config.orchestration.adapter_spawn_retries,
+        ),
     )
 }
 
@@ -4993,7 +5899,11 @@ fn print_report(report: &nerve_core::RunReport, apply_requested: bool) {
         println!("Session budget exceeded; no files were changed.");
     }
 
-    if report.blocked && !report.budget_exceeded {
+    if report.crossfire_halted {
+        println!(
+            "Run short-circuited by a live crossfire Block (S10 halt); no files were changed."
+        );
+    } else if report.blocked && !report.budget_exceeded {
         println!("Patch blocked by reviewer policy; no files were changed.");
     }
 
@@ -5214,8 +6124,20 @@ fn summarize_auth_output(name: &str, text: &str, success: bool) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
-fn collect_context_paths(prompt: &str, cwd: &Path) -> Vec<PathBuf> {
+/// Result of scanning a prompt for referenced context paths.
+///
+/// `missing_explicit` holds tokens the user *unambiguously* meant as file
+/// references (they contain a path separator) but which do not exist on disk.
+/// These are surfaced loudly by [`collect_context_paths`] so the loop never
+/// runs against silently-dropped context (S3: fail-loud context loading).
+struct ContextScan {
+    paths: Vec<PathBuf>,
+    missing_explicit: Vec<PathBuf>,
+}
+
+fn scan_context_paths(prompt: &str, cwd: &Path) -> ContextScan {
     let mut paths = Vec::new();
+    let mut missing_explicit = Vec::new();
     for token in prompt.split_whitespace() {
         let token = token.trim_matches(|ch: char| {
             matches!(
@@ -5224,7 +6146,14 @@ fn collect_context_paths(prompt: &str, cwd: &Path) -> Vec<PathBuf> {
             )
         });
         if looks_like_path_token(token) {
-            push_unique_path(&mut paths, PathBuf::from(token));
+            let path = PathBuf::from(token);
+            // Only `/`-bearing tokens are treated as explicit, unambiguous file
+            // references worth warning about — a bare `config.json` or a version
+            // string like `v1.0.0` must not trigger a false "not found" alarm.
+            if token.contains('/') && !context_path_exists(cwd, &path) {
+                push_unique_path(&mut missing_explicit, path.clone());
+            }
+            push_unique_path(&mut paths, path);
         }
     }
 
@@ -5232,7 +6161,34 @@ fn collect_context_paths(prompt: &str, cwd: &Path) -> Vec<PathBuf> {
         push_unique_path(&mut paths, path);
     }
 
-    paths
+    ContextScan {
+        paths,
+        missing_explicit,
+    }
+}
+
+/// Resolve a referenced path against `cwd` (absolute paths checked as-is) and
+/// report whether it exists.
+fn context_path_exists(cwd: &Path, path: &Path) -> bool {
+    if path.is_absolute() {
+        path.exists()
+    } else {
+        cwd.join(path).exists()
+    }
+}
+
+fn collect_context_paths(prompt: &str, cwd: &Path) -> Vec<PathBuf> {
+    let scan = scan_context_paths(prompt, cwd);
+    for missing in &scan.missing_explicit {
+        eprintln!(
+            "{}",
+            warn(format!(
+                "⚠ referenced path not found: {} — context may be incomplete",
+                missing.display()
+            ))
+        );
+    }
+    scan.paths
 }
 
 fn looks_like_path_token(token: &str) -> bool {
@@ -5292,6 +6248,272 @@ mod tests {
         assert!(paths.contains(&PathBuf::from("crates/nerve-core/src/lib.rs")));
     }
 
+    // --- S11: approve escalates in-flight runs only ---------------------------
+
+    #[tokio::test]
+    async fn approve_grants_only_in_flight_runs() {
+        // S11 (codex r2 fix): a FINISHED or UNKNOWN run-id must NOT be granted and
+        // must flip no consent — only an in-flight run can still reach its apply
+        // seam, so approving a finished run would write a misleading audit record
+        // for a run that can never apply. Finished entries linger in the registry
+        // until the next spawn/shutdown, so `grant_in_flight`'s `is_finished`
+        // guard (not mere presence) is what enforces the "in-flight only" contract.
+        let mut reg: HashMap<String, TrackedRun> = HashMap::new();
+
+        // A finished run: an empty task driven to completion by the scheduler.
+        let finished = tokio::spawn(async {});
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let finished_consent = ApplyConsent::new();
+        reg.insert(
+            "finished".to_string(),
+            TrackedRun {
+                join: finished,
+                consent: finished_consent.clone(),
+                cancel: CancelToken::new(),
+            },
+        );
+
+        // An in-flight run: a task that never completes on its own.
+        let inflight = tokio::spawn(std::future::pending::<()>());
+        let inflight_consent = ApplyConsent::new();
+        reg.insert(
+            "inflight".to_string(),
+            TrackedRun {
+                join: inflight,
+                consent: inflight_consent.clone(),
+                cancel: CancelToken::new(),
+            },
+        );
+
+        // Finished run: not granted, consent untouched (no misleading audit).
+        assert!(!grant_in_flight(&reg, "finished"));
+        assert!(!finished_consent.is_granted());
+        // Unknown run-id: not granted.
+        assert!(!grant_in_flight(&reg, "does-not-exist"));
+        // In-flight run: granted, consent flipped.
+        assert!(grant_in_flight(&reg, "inflight"));
+        assert!(inflight_consent.is_granted());
+    }
+
+    // --- S15: bulk cancel (in-memory, rejection-direction) --------------------
+
+    #[tokio::test]
+    async fn cancel_targets_only_in_flight_runs() {
+        // Mirrors `approve_grants_only_in_flight_runs`: a finished/unknown run-id
+        // is a no-op, only a live run is flipped. Cancelling can only ever STOP a
+        // run (the cancelled run is reported blocked, never applied).
+        let mut reg: HashMap<String, TrackedRun> = HashMap::new();
+
+        let finished = tokio::spawn(async {});
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let finished_cancel = CancelToken::new();
+        reg.insert(
+            "finished".to_string(),
+            TrackedRun {
+                join: finished,
+                consent: ApplyConsent::new(),
+                cancel: finished_cancel.clone(),
+            },
+        );
+
+        let inflight = tokio::spawn(std::future::pending::<()>());
+        let inflight_cancel = CancelToken::new();
+        reg.insert(
+            "inflight".to_string(),
+            TrackedRun {
+                join: inflight,
+                consent: ApplyConsent::new(),
+                cancel: inflight_cancel.clone(),
+            },
+        );
+
+        // Finished run: not cancelled (token untouched).
+        assert!(!cancel_in_flight(&reg, "finished"));
+        assert!(!finished_cancel.is_cancelled());
+        // Unknown run-id: not cancelled.
+        assert!(!cancel_in_flight(&reg, "does-not-exist"));
+        // In-flight run: cancelled, token flipped.
+        assert!(cancel_in_flight(&reg, "inflight"));
+        assert!(inflight_cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancel_all_cancels_live_runs_only() {
+        let mut reg: HashMap<String, TrackedRun> = HashMap::new();
+
+        let finished = tokio::spawn(async {});
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let finished_cancel = CancelToken::new();
+        reg.insert(
+            "finished".to_string(),
+            TrackedRun {
+                join: finished,
+                consent: ApplyConsent::new(),
+                cancel: finished_cancel.clone(),
+            },
+        );
+
+        let a = tokio::spawn(std::future::pending::<()>());
+        let a_cancel = CancelToken::new();
+        reg.insert(
+            "a".to_string(),
+            TrackedRun {
+                join: a,
+                consent: ApplyConsent::new(),
+                cancel: a_cancel.clone(),
+            },
+        );
+        let b = tokio::spawn(std::future::pending::<()>());
+        let b_cancel = CancelToken::new();
+        reg.insert(
+            "b".to_string(),
+            TrackedRun {
+                join: b,
+                consent: ApplyConsent::new(),
+                cancel: b_cancel.clone(),
+            },
+        );
+
+        // Bulk cancel flips BOTH live runs and leaves the finished one untouched.
+        let count = cancel_all_in_flight(&reg);
+        assert_eq!(count, 2);
+        assert!(a_cancel.is_cancelled());
+        assert!(b_cancel.is_cancelled());
+        assert!(!finished_cancel.is_cancelled());
+    }
+
+    // --- S9: live round-seam stream + status helpers --------------------------
+
+    #[test]
+    fn round_seam_envelopes_carry_session_round_and_verdict() {
+        let round = nerve_types::RoundRecord {
+            round: 2,
+            lead: nerve_types::AgentOutput::text("lead", "round 2"),
+            reviewer: nerve_types::ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            check_result: Some(nerve_types::CheckResult::Pass),
+            patch_sha: Some("sha2".to_string()),
+            envelope_id: None,
+        };
+        let (started, ended) = round_seam_envelopes("run-1", &round);
+
+        assert_eq!(started.kind, nerve_types::rpc_kinds::ROUND_STARTED);
+        assert_eq!(started.payload["session_id"], "run-1");
+        assert_eq!(started.payload["round"], 2);
+
+        assert_eq!(ended.kind, nerve_types::rpc_kinds::ROUND_ENDED);
+        assert_eq!(ended.payload["session_id"], "run-1");
+        assert_eq!(ended.payload["round"], 2);
+        assert_eq!(
+            ended.payload["verdict"],
+            serde_json::to_value(round.reviewer.verdict.clone()).unwrap()
+        );
+        assert_eq!(
+            ended.payload["check"],
+            serde_json::to_value(round.check_result.clone()).unwrap()
+        );
+    }
+
+    #[test]
+    fn checkpoint_status_envelope_reports_progress_not_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("in flight", dir.path());
+        let checkpoint = RunCheckpoint {
+            task: task.clone(),
+            selection: nerve_config::ProfileSelection {
+                id: None,
+                lead: "lead".to_string(),
+                reviewer: "reviewer".to_string(),
+                review_strictness: nerve_config::ReviewStrictness::Normal,
+                max_refinement_rounds: 1,
+                plan_strategy: PlanStrategy::Single,
+                plan_system_prompt_override: None,
+            },
+            status: nerve_core::store::RunStatus::Running,
+            rounds: Vec::new(),
+            updated_at: "2026-06-17T00:00:00Z".to_string(),
+        };
+        let envelope = checkpoint_status_envelope(&checkpoint);
+
+        assert_eq!(envelope.kind, nerve_types::rpc_kinds::SESSION_STATUS);
+        assert_eq!(envelope.payload["session_id"], task.id);
+        assert_eq!(envelope.payload["status"], "running");
+        assert_eq!(envelope.payload["rounds"], 0);
+        // North star: a status envelope can NEVER assert acceptance — it is
+        // derived from a checkpoint, which carries no acceptance fields.
+        assert!(envelope.payload.get("applied").is_none());
+        assert!(envelope.payload.get("blocked").is_none());
+        assert!(envelope.payload.get("goal_satisfied").is_none());
+    }
+
+    #[test]
+    fn scan_flags_missing_explicit_path_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let scan = scan_context_paths("please fix src/missing/module.rs", dir.path());
+
+        // The slash-bearing reference is collected as context AND flagged missing.
+        assert!(
+            scan.paths
+                .contains(&PathBuf::from("src/missing/module.rs"))
+        );
+        assert!(
+            scan.missing_explicit
+                .contains(&PathBuf::from("src/missing/module.rs")),
+            "missing slash-path must be flagged: {:?}",
+            scan.missing_explicit
+        );
+    }
+
+    #[test]
+    fn scan_does_not_flag_existing_path_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
+
+        let scan = scan_context_paths("review src/lib.rs carefully", dir.path());
+
+        assert!(scan.paths.contains(&PathBuf::from("src/lib.rs")));
+        assert!(
+            scan.missing_explicit.is_empty(),
+            "existing path must not be flagged: {:?}",
+            scan.missing_explicit
+        );
+    }
+
+    #[test]
+    fn scan_does_not_false_alarm_on_dotted_non_path_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        // `v1.0.0` and bare `config.json` lack a path separator: even though
+        // they look path-ish, they must not raise a missing-context alarm.
+        let scan = scan_context_paths("bump to v1.0.0 and tweak config.json", dir.path());
+
+        assert!(
+            scan.missing_explicit.is_empty(),
+            "dotted non-slash tokens must not be flagged: {:?}",
+            scan.missing_explicit
+        );
+    }
+
+    #[test]
+    fn scan_flags_missing_absolute_path_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope/gone.rs");
+        let prompt = format!("inspect {}", missing.display());
+
+        let scan = scan_context_paths(&prompt, dir.path());
+
+        assert!(
+            scan.missing_explicit.contains(&missing),
+            "missing absolute path must be flagged: {:?}",
+            scan.missing_explicit
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn executable_check_rejects_files_without_execute_bit() {
@@ -5337,6 +6559,109 @@ mod tests {
         let suggestions = command_suggestions("/provider");
 
         assert!(suggestions.iter().any(|spec| spec.command == "/adapter"));
+    }
+
+    #[test]
+    fn interactive_state_labels_accept_with_nits_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("review accepted with nits", dir.path());
+        let report = RunReport {
+            task,
+            selection: nerve_config::ProfileSelection {
+                id: None,
+                lead: "lead".to_string(),
+                reviewer: "reviewer".to_string(),
+                review_strictness: nerve_config::ReviewStrictness::Normal,
+                max_refinement_rounds: 1,
+                plan_strategy: PlanStrategy::Single,
+                plan_system_prompt_override: None,
+            },
+            rounds: Vec::new(),
+            crossfire_feedback: Vec::new(),
+            final_output: nerve_types::AgentOutput::text("lead", "done"),
+            final_feedback: nerve_types::ReviewerFeedback::accept_with_nits(
+                "reviewer",
+                Vec::new(),
+                "Accepted with minor notes",
+            ),
+            final_patch: None,
+            events: Vec::new(),
+            usage: Default::default(),
+            budget_exceeded: false,
+            no_progress_exceeded: false,
+            crossfire_halted: false,
+            cancelled: false,
+            goal_satisfied: None,
+            applied: false,
+            blocked: false,
+            apply_classification: None,
+            ran_unconfined: false,
+        };
+        let mut state = InteractiveState::new(false, true, None);
+        state.last_report = Some(report);
+
+        assert_eq!(state.last_verdict_label(), "nits");
+    }
+
+    // --- S12: auto-mode classifier telemetry surface -------------------------
+
+    fn report_with_classification(
+        classification: Option<nerve_core::ApplyClassification>,
+    ) -> RunReport {
+        RunReport {
+            task: nerve_types::Task::new("t", std::path::Path::new(".")),
+            selection: nerve_config::ProfileSelection {
+                id: None,
+                lead: "lead".to_string(),
+                reviewer: "reviewer".to_string(),
+                review_strictness: nerve_config::ReviewStrictness::Normal,
+                max_refinement_rounds: 1,
+                plan_strategy: PlanStrategy::Single,
+                plan_system_prompt_override: None,
+            },
+            rounds: Vec::new(),
+            crossfire_feedback: Vec::new(),
+            final_output: nerve_types::AgentOutput::text("lead", "done"),
+            final_feedback: nerve_types::ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            final_patch: None,
+            events: Vec::new(),
+            usage: Default::default(),
+            budget_exceeded: false,
+            no_progress_exceeded: false,
+            crossfire_halted: false,
+            cancelled: false,
+            goal_satisfied: None,
+            applied: false,
+            blocked: false,
+            apply_classification: classification,
+            ran_unconfined: false,
+        }
+    }
+
+    #[test]
+    fn apply_downgraded_reflects_classification() {
+        // No classification (Off) ⇒ not downgraded.
+        assert!(!apply_downgraded(&report_with_classification(None)));
+        // High-risk but not downgraded (Advisory) ⇒ not downgraded.
+        assert!(!apply_downgraded(&report_with_classification(Some(
+            nerve_core::ApplyClassification {
+                risk: nerve_core::ApplyRisk::High,
+                reasons: vec!["touches 99 files".to_string()],
+                files_touched: 99,
+                lines_changed: 10,
+                downgraded: false,
+            }
+        ))));
+        // Downgraded (Enforce vetoed the apply) ⇒ true.
+        assert!(apply_downgraded(&report_with_classification(Some(
+            nerve_core::ApplyClassification {
+                risk: nerve_core::ApplyRisk::High,
+                reasons: vec!["touches 99 files".to_string()],
+                files_touched: 99,
+                lines_changed: 10,
+                downgraded: true,
+            }
+        ))));
     }
 
     #[test]
@@ -5826,6 +7151,47 @@ mod tests {
                 assert_eq!(args.max_patrols, Some(4));
                 assert_eq!(args.per_patrol_budget_microusd, Some(100_000));
                 assert!(args.status_only);
+                // S14/H17 flags default off/none.
+                assert!(!args.ledger);
+                assert!(!args.reconcile);
+                assert!(args.mailbox.is_none());
+            }
+            other => panic!("expected Mayor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_mayor_subcommand_s14_coordination_flags() {
+        use clap::Parser;
+        let ledger = Cli::try_parse_from(["nv", "mayor", "--ledger"])
+            .expect("clap must accept `nv mayor --ledger`");
+        match ledger.command {
+            Some(Command::Mayor(args)) => {
+                assert!(args.ledger);
+                assert!(!args.reconcile);
+                assert!(args.mailbox.is_none());
+            }
+            other => panic!("expected Mayor subcommand, got {other:?}"),
+        }
+
+        let reconcile = Cli::try_parse_from(["nv", "mayor", "--reconcile"])
+            .expect("clap must accept `nv mayor --reconcile`");
+        match reconcile.command {
+            Some(Command::Mayor(args)) => {
+                assert!(args.reconcile);
+                assert!(!args.ledger);
+                assert!(args.mailbox.is_none());
+            }
+            other => panic!("expected Mayor subcommand, got {other:?}"),
+        }
+
+        let mail = Cli::try_parse_from(["nv", "mayor", "--mailbox", "patrol-1"])
+            .expect("clap must accept `nv mayor --mailbox <id>`");
+        match mail.command {
+            Some(Command::Mayor(args)) => {
+                assert_eq!(args.mailbox.as_deref(), Some("patrol-1"));
+                assert!(!args.ledger);
+                assert!(!args.reconcile);
             }
             other => panic!("expected Mayor subcommand, got {other:?}"),
         }
@@ -5854,6 +7220,183 @@ mod tests {
             }
             other => panic!("expected Patrol subcommand, got {other:?}"),
         }
+    }
+
+    // ----- S13: plan → loop dispatch -----
+
+    #[test]
+    fn parse_dispatch_plan_subcommand_flags() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "nv",
+            "dispatch-plan",
+            "plan-abc",
+            "--max-steps",
+            "2",
+            "--budget-microusd",
+            "5000",
+        ])
+        .expect("clap must accept `nv dispatch-plan ...`");
+        match cli.command {
+            Some(Command::DispatchPlan(args)) => {
+                assert_eq!(args.plan_id, "plan-abc");
+                assert_eq!(args.max_steps, Some(2));
+                assert_eq!(args.budget_microusd, Some(5000));
+            }
+            other => panic!("expected DispatchPlan subcommand, got {other:?}"),
+        }
+    }
+
+    fn save_sample_plan(dir: &Path, plan_id: &str, steps_md: &str) {
+        let report: PlanReport = serde_json::from_value(serde_json::json!({
+            "task_id": plan_id,
+            "plan_markdown": format!("## Objective\nbuild it\n\n## Affected files\n- a.rs\n\n## Steps\n{steps_md}"),
+            "reviewer_feedback": "",
+            "estimated_files": ["a.rs"],
+            "finished_at": "2026-06-17T00:00:00Z",
+        }))
+        .expect("valid PlanReport json");
+        NerveStore::new(dir).save_plan(&report).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_steps_enqueues_each_step() {
+        let dir = tempfile::tempdir().unwrap();
+        save_sample_plan(dir.path(), "plan-xyz", "1. one\n2. two\n3. three\n");
+        let config = Config::load_from(dir.path()).unwrap();
+
+        let enqueued = dispatch_plan_steps(dir.path(), &config, "plan-xyz", None, Some(1000))
+            .await
+            .unwrap();
+        assert_eq!(
+            enqueued,
+            vec![
+                "plan-xyz-step-01".to_string(),
+                "plan-xyz-step-02".to_string(),
+                "plan-xyz-step-03".to_string(),
+            ]
+        );
+        // Each queued task exists on disk under .nerve/queue/pending/.
+        let pending = dir.path().join(".nerve").join("queue").join("pending");
+        for id in &enqueued {
+            assert!(pending.join(format!("{id}.json")).exists(), "missing {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_steps_respects_max_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        save_sample_plan(dir.path(), "plan-cap", "1. one\n2. two\n3. three\n");
+        let config = Config::load_from(dir.path()).unwrap();
+
+        let enqueued = dispatch_plan_steps(dir.path(), &config, "plan-cap", Some(2), Some(1000))
+            .await
+            .unwrap();
+        assert_eq!(enqueued.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_steps_empty_steps_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        // A `## Steps` section with prose but no list items → no parseable steps.
+        save_sample_plan(dir.path(), "plan-empty", "just prose, no list\n");
+        let config = Config::load_from(dir.path()).unwrap();
+
+        let err = dispatch_plan_steps(dir.path(), &config, "plan-empty", None, Some(1000))
+            .await
+            .expect_err("a stepless plan must be refused, not silently no-op");
+        assert!(err.to_string().contains("no parseable steps"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_max_steps_zero_fails_closed() {
+        // A plan WITH steps but `--max-steps 0` must not silently report a
+        // zero-step success — it fails closed with a precise, distinct error.
+        let dir = tempfile::tempdir().unwrap();
+        save_sample_plan(dir.path(), "plan-zero", "1. one\n2. two\n");
+        let config = Config::load_from(dir.path()).unwrap();
+
+        let err = dispatch_plan_steps(dir.path(), &config, "plan-zero", Some(0), Some(1000))
+            .await
+            .expect_err("--max-steps 0 must be refused, not a silent no-op success");
+        assert!(err.to_string().contains("--max-steps must be >= 1"));
+
+        // Nothing enqueued.
+        let pending = dir.path().join(".nerve").join("queue").join("pending");
+        let queued = std::fs::read_dir(&pending).map(|rd| rd.count()).unwrap_or(0);
+        assert_eq!(queued, 0, "a refused dispatch must enqueue nothing");
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_missing_plan_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load_from(dir.path()).unwrap();
+        assert!(
+            dispatch_plan_steps(dir.path(), &config, "nope", None, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_rejects_overlong_plan_id_fails_closed() {
+        // A 121-byte plan id is a VALID store key (`validate_store_id` allows
+        // 1..=128) so the plan saves and loads fine — but the derived queue
+        // task id `<plan_id>-step-01` is 129 bytes, over Mayor's 128-byte
+        // component limit. Dispatch must refuse up front with an actionable
+        // error and enqueue NOTHING (no partial dispatch). Regression for the
+        // S13 review's correctness finding.
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = "p".repeat(121);
+        save_sample_plan(dir.path(), &plan_id, "1. one\n2. two\n");
+        let config = Config::load_from(dir.path()).unwrap();
+
+        let err = dispatch_plan_steps(dir.path(), &config, &plan_id, None, Some(1000))
+            .await
+            .expect_err("an overlong plan id must be refused, not partially dispatched");
+        let msg = err.to_string();
+        assert!(msg.contains("exceeds"), "unhelpful error: {msg}");
+        assert!(msg.contains("128-byte"), "unhelpful error: {msg}");
+
+        // Fail-closed: not a single step may have been enqueued.
+        let pending = dir.path().join(".nerve").join("queue").join("pending");
+        let queued = std::fs::read_dir(&pending).map(|rd| rd.count()).unwrap_or(0);
+        assert_eq!(queued, 0, "dispatch must enqueue nothing when it fails closed");
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_accepts_max_length_dispatchable_plan_id() {
+        // Boundary: a 120-byte plan id derives `<120>-step-NN` = 128 bytes for
+        // any 2-digit step index — exactly at the limit, so it dispatches.
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = "p".repeat(120);
+        save_sample_plan(dir.path(), &plan_id, "1. one\n2. two\n");
+        let config = Config::load_from(dir.path()).unwrap();
+
+        let enqueued = dispatch_plan_steps(dir.path(), &config, &plan_id, None, Some(1000))
+            .await
+            .expect("a 120-byte plan id stays within the 128-byte queue-id limit");
+        assert_eq!(enqueued.len(), 2);
+        for id in &enqueued {
+            assert_eq!(id.len(), 128, "boundary task id `{id}` must be exactly 128 bytes");
+        }
+    }
+
+    #[test]
+    fn patrol_result_maps_blocked_to_failed_else_success() {
+        // Accepted (not blocked) run → Success, cost from usage, no patch.
+        let mut ok = report_with_classification(None);
+        ok.usage.estimated_cost_microusd = Some(4242);
+        let res = patrol_result_from_report("t1", "p1", &ok);
+        assert_eq!(res.verdict, nerve_core::PatrolVerdict::Success);
+        assert_eq!(res.cost_microusd, 4242);
+        assert_eq!(res.patch_sha, None);
+
+        // Blocked run (deterministic gate rejected) → Failed.
+        let mut blocked = report_with_classification(None);
+        blocked.blocked = true;
+        let res = patrol_result_from_report("t1", "p1", &blocked);
+        assert_eq!(res.verdict, nerve_core::PatrolVerdict::Failed);
     }
 
     /// Doctor must surface a `Fail` entry when `sessions/index.json` is
@@ -5954,9 +7497,13 @@ mod tests {
             usage: Default::default(),
             budget_exceeded: false,
             no_progress_exceeded: false,
+            crossfire_halted: false,
+            cancelled: false,
             goal_satisfied: None,
             applied: false,
             blocked: false,
+            apply_classification: None,
+            ran_unconfined: false,
         };
         NerveStore::new(dir.path()).save_report(&report).unwrap();
 

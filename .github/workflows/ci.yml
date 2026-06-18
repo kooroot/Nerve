@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # H7: run the Linux real-kernel confinement proofs on an actual kernel. The
+  # bwrap argv (H5/H6/H7) and decision logic are unit-tested on every platform,
+  # but the runtime jail — out-of-root write denial, network unshare, Landlock
+  # write-confinement, the seccomp denylist — can only be PROVEN on a real Linux
+  # kernel with bubblewrap installed. This job installs bwrap, enables
+  # unprivileged user namespaces, and runs the workspace tests so the
+  # `#[cfg(target_os = "linux")]` real-kernel proofs in `nerve-core::sandbox`
+  # actually execute instead of compiling-only on the macOS/Windows dev host.
+  #
+  # Scope: this job is Linux-only (macOS Seatbelt has its own macOS-host tests).
+  # The Windows runtime is covered by the separate `windows-token-acl` job below
+  # (H9), which proves the Windows RPC-token owner-only DACL on `windows-latest`.
+  linux-real-kernel:
+    name: Linux real-kernel confinement proofs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install bubblewrap (the Linux sandbox backend under test)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+
+      - name: Enable unprivileged user namespaces
+        # The bwrap proof (H7) needs unprivileged user namespaces; Ubuntu 24.04
+        # restricts them via AppArmor by default, which would make the proof SKIP.
+        # Clearing the restriction lets it RUN. `|| true`: these keys do not exist
+        # on older kernels, where userns is already unrestricted.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+
+      - name: Set up a delegated cgroup v2 base (H15 fork-bomb cap proof)
+        # The H15 proof (cgroup_pids_max_caps_fork_real_kernel) needs a cgroup v2
+        # base it can create per-check leaf cgroups under, with the pids+memory
+        # controllers delegated to the runner user. On a unified-hierarchy systemd
+        # host (ubuntu-latest) we create a base under the root cgroup, make the
+        # controllers available to it, and hand ownership to the runner. We then
+        # SELF-TEST, as the runner, that a child cgroup can actually be created and
+        # pids.max written — mirroring exactly what the production code does. Only
+        # if that succeeds do we export NERVE_CGROUP_PARENT, which makes the Rust
+        # proof RUN (and it PANICS if it then cannot create a cgroup — so once we
+        # claim delegation works there is no silent green-skip). If a future runner
+        # image withdraws delegation we log a loud warning and leave the env unset,
+        # so the proof SKIPS rather than failing CI on an environment limitation;
+        # the degrade-with-note path is covered by an always-on unit test
+        # (degrades_with_surfaced_note_when_base_unusable) regardless.
+        run: |
+          set -x
+          if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+            echo "::warning::not a cgroup v2 unified host; H15 cgroup cap proof will skip"
+            exit 0
+          fi
+          base=/sys/fs/cgroup/nerve.test
+          sudo mkdir -p "$base"
+          echo "+pids +memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" "$base"
+          if mkdir "$base/selftest" 2>/dev/null \
+             && echo "+pids +memory" > "$base/cgroup.subtree_control" 2>/dev/null \
+             && echo 6 > "$base/selftest/pids.max" 2>/dev/null; then
+            echo "cgroup delegation OK; controllers: $(cat "$base"/cgroup.controllers)"
+            rmdir "$base/selftest" 2>/dev/null || true
+            echo "NERVE_CGROUP_PARENT=$base" >> "$GITHUB_ENV"
+          else
+            echo "::warning::cgroup v2 delegation unavailable to the runner; H15 fork-bomb cap proof will SKIP (degrade path is unit-tested). controllers: $(cat "$base"/cgroup.controllers 2>/dev/null || echo none)"
+            rmdir "$base/selftest" 2>/dev/null || true
+          fi
+
+      - name: Versions
+        run: |
+          uname -a
+          cargo --version
+          bwrap --version
+
+      - name: Build (workspace)
+        run: cargo build --workspace --locked
+
+      - name: Run tests — real-kernel confinement proofs must actually run here
+        # NERVE_CI_REAL_KERNEL turns a "kernel lacks support" SKIP into a loud
+        # FAILURE for EVERY Linux confinement proof (bwrap [H7], Landlock [H5],
+        # seccomp [H6]) — they all route their skip through one shared gate — so
+        # this job cannot silently green-skip any confinement proof on a runner
+        # that has those features. The H15 cgroup fork-bomb cap proof keys on its
+        # own opt-in signal instead: NERVE_CGROUP_PARENT (exported by the step
+        # above only after a successful delegation self-test) makes it RUN and
+        # PANIC if the cgroup cannot be created. `--nocapture` surfaces each
+        # proof's run/skip line.
+        env:
+          NERVE_CI_REAL_KERNEL: "1"
+        run: cargo test --workspace --locked -- --nocapture
+
+  # H9: prove the Windows RPC-token owner-only DACL on a real Windows kernel.
+  # The owner-only SDDL is unit-tested on every platform and the Win32 path is
+  # cross-compile/clippy-checked on the macOS dev host, but the actual
+  # CreateFileW-with-SECURITY_ATTRIBUTES + GetNamedSecurityInfoW read-back can
+  # only be PROVEN on Windows. The `rpc::` tests include
+  # `windows_token_file_is_owner_only_real`, which writes a token through the
+  # production path and asserts the on-disk DACL is exactly one owner ACE on a
+  # PROTECTED DACL (with a negative control that a default-ACL file is rejected),
+  # plus two regressions: an existing non-owner-only token is rotated rather than
+  # reused on startup, and the CREATE_NEW staging refuses a pre-existing file so
+  # token bytes never land under a stale/planted wider ACL.
+  #
+  # Scope: this job runs ONLY the `nerve-core` `rpc::` tests, not the whole
+  # workspace, so it proves H9 without coupling to unrelated Windows-runtime
+  # behaviour of other modules. The test target still fully compiles for Windows
+  # (which is what the macOS `--target x86_64-pc-windows-msvc --all-targets`
+  # clippy gate checks), so a Windows-only compile regression is caught here too.
+  windows-token-acl:
+    name: Windows RPC token owner-only ACL proof
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Versions
+        run: |
+          cargo --version
+          rustc --version
+
+      - name: Run the Windows RPC token owner-only DACL proof
+        # `rpc::` selects both the platform-independent owner_only_sddl unit test
+        # and the Windows-only owner-only DACL runtime proof. `--nocapture`
+        # surfaces the assertion lines.
+        run: |
+          cargo test -p nerve-core --locked --lib rpc:: -- --nocapture

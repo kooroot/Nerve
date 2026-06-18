@@ -117,12 +117,28 @@ impl ReviewerFeedback {
             raw_text: raw_text.into(),
         }
     }
+
+    pub fn accept_with_nits(
+        reviewer_id: impl Into<String>,
+        issues: Vec<Issue>,
+        raw_text: impl Into<String>,
+    ) -> Self {
+        Self {
+            reviewer_id: reviewer_id.into(),
+            verdict: Verdict::AcceptWithNits,
+            issues,
+            suggested_patch: None,
+            cost: None,
+            raw_text: raw_text.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     Lgtm,
+    AcceptWithNits,
     RequestChanges,
     Block,
 }
@@ -130,6 +146,18 @@ pub enum Verdict {
 impl Verdict {
     pub fn is_terminal_success(&self) -> bool {
         matches!(self, Self::Lgtm)
+    }
+
+    /// Whether this verdict counts as an acceptance, given whether the active
+    /// review strictness permits cosmetic nits. `Lgtm` always accepts;
+    /// `AcceptWithNits` accepts only when nits are permitted (High strictness
+    /// degrades it to a change request). Strictness gating lives in the caller.
+    pub fn accepts_under(&self, nits_permitted: bool) -> bool {
+        match self {
+            Self::Lgtm => true,
+            Self::AcceptWithNits => nits_permitted,
+            _ => false,
+        }
     }
 }
 
@@ -159,13 +187,35 @@ pub enum AgentEvent {
 #[serde(rename_all = "snake_case")]
 pub enum CheckResult {
     Pass,
-    Fail { reason: String },
+    Fail {
+        reason: String,
+        /// S7 distance-to-goal signal: the deterministic check's pass-ratio in
+        /// PERMILLE (0..=1000) when its output exposed a recognizable test
+        /// summary, else absent. Permille (not `f64`) keeps `CheckResult: Eq`,
+        /// which `RoundRecord`/`RpcEnvelope` depend on. Optional + skipped-when-
+        /// `None` so older consumers stay wire-compatible (minor schema bump).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<u16>,
+    },
     Skipped,
 }
 
 impl CheckResult {
     pub fn is_pass(&self) -> bool {
         matches!(self, Self::Pass)
+    }
+
+    /// Distance-to-goal progress in `[0.0, 1.0]` (S7): `Pass` is fully satisfied
+    /// (`1.0`), `Skipped` carries no signal (`None`), and `Fail` reports the
+    /// parsed pass-ratio when the check emitted a recognizable test summary.
+    /// This is additive telemetry and a stall hint — it NEVER affects
+    /// acceptance, which still requires a real [`CheckResult::Pass`].
+    pub fn progress(&self) -> Option<f64> {
+        match self {
+            Self::Pass => Some(1.0),
+            Self::Skipped => None,
+            Self::Fail { progress, .. } => progress.map(|p| f64::from(p) / 1000.0),
+        }
     }
 }
 
@@ -186,7 +236,7 @@ pub struct RoundRecord {
 ///
 /// Bumped on breaking schema changes. Minor compatible: unknown fields in
 /// payload or envelope must be silently ignored by older consumers.
-pub const RPC_SCHEMA_VERSION: &str = "1.0.0";
+pub const RPC_SCHEMA_VERSION: &str = "1.2.0";
 
 /// Versioned wire envelope used for RPC event streaming between the core
 /// runtime and external consumers (TUI, plugins, telemetry sinks).
@@ -265,6 +315,10 @@ pub mod rpc_kinds {
     pub const MCP_TOOL_INVOKED: &str = "mcp.tool_invoked";
     pub const MCP_TOOL_RESULT: &str = "mcp.tool_result";
     pub const SESSION_FORKED: &str = "session.forked";
+    // S9 — daemon v2: in-flight run summary, served from the S8 round
+    // checkpoints by the `status` command. Additive kind (minor-compatible:
+    // older consumers ignore unknown kinds), NOT a schema-version bump.
+    pub const SESSION_STATUS: &str = "session.status";
 }
 
 /// Output of a `/plan` (Plan mode, read-only analysis) run.
@@ -310,6 +364,96 @@ pub enum McpRole {
     Both,
 }
 
+/// How an MCP server's `read_only` posture admits tools (H1, P1 hardening).
+///
+/// The default [`DenyByDefault`](McpReadOnlyPosture::DenyByDefault) is FAIL-CLOSED:
+/// under `read_only` a tool is admitted only on positive evidence (an explicit
+/// per-server `allowed_tools` membership, or an MCP tool annotation reporting
+/// `readOnlyHint == true` / `destructiveHint == false`). The substring write-tool
+/// denylist is demoted to a secondary veto. [`LegacyDenylist`](McpReadOnlyPosture::LegacyDenylist)
+/// restores the pre-H1 behavior (substring denylist is the only guard, fails OPEN
+/// on unrecognized mutating tool names) and is the weaker posture — it is
+/// provenance-gated at config resolution so a repo-local config cannot select it.
+///
+/// This enum lives in `nerve-types` (not `nerve-config`) so `nerve-adapter` — which
+/// depends only on `nerve-types` — can hold the resolved posture without taking a
+/// dependency on `nerve-config`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum McpReadOnlyPosture {
+    /// Fail-closed: admit only on explicit allowlist membership or positive
+    /// read-only annotation evidence. The safe default.
+    #[default]
+    DenyByDefault,
+    /// Legacy fail-open: the substring write-tool denylist is the only guard.
+    /// Weaker; provenance-gated so a repo-local config cannot opt into it.
+    LegacyDenylist,
+}
+
+/// H11: optional per-tool MCP **argument** policy applied AFTER name gating
+/// (allowlist + read-only posture + write-pattern veto), as defense-in-depth on
+/// top of them. Name gating only checks WHICH tool is called; this constrains the
+/// ARGUMENTS a tool receives, since a name-admitted tool may still accept a
+/// dangerous path or command-like argument.
+///
+/// Strictly ADDITIVE and MONOTONE-RESTRICTIVE: a tool with no entry here is
+/// unconstrained (byte-for-byte the pre-H11 behavior), and a present entry can
+/// only ever REJECT a call — there is no value that admits a name-gated-rejected
+/// tool or relaxes any existing check. Because it can only tighten, a repo-local
+/// (`Project`-source) config that enables it cannot opt the operator into broader
+/// tool access or looser arguments than the no-policy baseline (mirroring the
+/// `SandboxConfig.strict` rationale), so — unlike the weaker `LegacyDenylist`
+/// posture — it needs no operator-consent provenance gate.
+///
+/// Lives in `nerve-types` so `nerve-adapter` (which depends only on `nerve-types`)
+/// can hold the resolved policy without depending on `nerve-config`.
+///
+/// `deny_unknown_fields`: a misspelled rule key would otherwise deserialize into
+/// an *inert* rule, silently leaving the argument the operator meant to confine
+/// UNconfined (a fail-open footgun for a security control). Rejecting unknown
+/// keys makes a typo a loud parse error instead — matching the fail-closed posture
+/// of the top-level `McpConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct McpArgumentPolicy {
+    /// Per-tool argument rules keyed by tool name. An empty map (the default)
+    /// means no argument policy — every tool is unconstrained, as before H11.
+    #[serde(default)]
+    pub tools: BTreeMap<String, McpToolArgRules>,
+}
+
+/// Argument-validation rules for a single MCP tool (see [`McpArgumentPolicy`]).
+///
+/// Each rule keys off a JSON object key in [`McpToolCall::arguments`]. A key that
+/// is absent, or whose value is not a string, is simply not checked by that rule
+/// (the policy only constrains arguments the call actually supplies) — EXCEPT
+/// that a declared path argument with no configured project root fails CLOSED.
+///
+/// `deny_unknown_fields` here too: a typo like `path_arg` must not silently
+/// degrade a confinement rule to a no-op (see [`McpArgumentPolicy`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct McpToolArgRules {
+    /// Argument keys whose string values are treated as filesystem paths and must
+    /// resolve INSIDE the project root: an absolute path outside the root, or a
+    /// relative path whose `..` climbs above the root (even one that later
+    /// re-enters via matching components), is rejected. Matching is LEXICAL via
+    /// native [`std::path`] semantics (no filesystem access, so it is TOCTOU-free
+    /// and works for not-yet-created paths); a symlink inside the root that points
+    /// outward is NOT resolved, and a value is NOT parsed as a URI — a URI-style
+    /// string like `file:///etc/passwd` is treated as the relative filename
+    /// `file:/etc/passwd` (confined under the root), so if a server resolves a
+    /// `path_args` key as a URI rather than a path this lexical check does not
+    /// confine it. This is defense-in-depth, not a complete capability model.
+    #[serde(default)]
+    pub path_args: Vec<String>,
+    /// Argument keys whose string values must NOT contain any of the listed
+    /// substrings (ASCII case-insensitive) — a coarse denylist for command-like
+    /// arguments (e.g. refusing `;`, `rm `, `sudo`). Purely subtractive.
+    #[serde(default)]
+    pub deny_substrings: BTreeMap<String, Vec<String>>,
+}
+
 /// Default transport for newly-defined MCP server specs (stdio in v1.0).
 pub fn default_mcp_transport() -> McpTransport {
     McpTransport::Stdio
@@ -351,6 +495,13 @@ pub struct McpServerSpec {
 }
 
 /// Catalog entry describing a single MCP tool advertised by a server.
+///
+/// `read_only_hint` / `destructive_hint` mirror the optional MCP tool
+/// `annotations.readOnlyHint` / `annotations.destructiveHint` fields. They are
+/// `None` when the server omits the annotation (or supplies a non-boolean), and
+/// under [`McpReadOnlyPosture::DenyByDefault`] only a positive value
+/// (`read_only_hint == Some(true)` or `destructive_hint == Some(false)`) counts as
+/// read-only evidence — a missing annotation is NOT evidence (fail-closed).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpToolInfo {
     pub server: String,
@@ -359,6 +510,10 @@ pub struct McpToolInfo {
     pub description: Option<String>,
     #[serde(default)]
     pub input_schema: Option<serde_json::Value>,
+    #[serde(default)]
+    pub read_only_hint: Option<bool>,
+    #[serde(default)]
+    pub destructive_hint: Option<bool>,
 }
 
 /// A reviewer/lead-initiated MCP tool invocation, forwarded through the
@@ -735,6 +890,58 @@ mod tests {
     }
 
     #[test]
+    fn mcp_argument_policy_defaults_empty_and_round_trips() {
+        // Absent map → inert default (no per-tool rules).
+        let empty: McpArgumentPolicy =
+            serde_json::from_str("{}").expect("decode empty argument policy");
+        assert!(empty.tools.is_empty());
+        assert_eq!(empty, McpArgumentPolicy::default());
+
+        // A populated policy round-trips, including both rule kinds and the
+        // absent-field defaults.
+        let wire = json!({
+            "tools": {
+                "read_file": { "path_args": ["path", "uri"] },
+                "query": { "deny_substrings": { "sql": [";", "drop"] } },
+            }
+        })
+        .to_string();
+        let policy: McpArgumentPolicy =
+            serde_json::from_str(&wire).expect("decode argument policy");
+        let read = &policy.tools["read_file"];
+        assert_eq!(read.path_args, vec!["path".to_string(), "uri".to_string()]);
+        assert!(read.deny_substrings.is_empty(), "absent deny_substrings defaults empty");
+        let query = &policy.tools["query"];
+        assert!(query.path_args.is_empty(), "absent path_args defaults empty");
+        assert_eq!(query.deny_substrings["sql"], vec![";".to_string(), "drop".to_string()]);
+
+        let reser: McpArgumentPolicy = serde_json::from_str(
+            &serde_json::to_string(&policy).expect("serialize argument policy"),
+        )
+        .expect("re-decode argument policy");
+        assert_eq!(reser, policy);
+    }
+
+    #[test]
+    fn mcp_argument_policy_rejects_typoed_rule_keys() {
+        // A misspelled rule key must fail LOUDLY, not silently produce an inert
+        // (unconfined) rule — `deny_unknown_fields` on the nested structs.
+        let typo_rule = r#"{ "tools": { "read_file": { "path_arg": ["path"] } } }"#;
+        assert!(
+            serde_json::from_str::<McpArgumentPolicy>(typo_rule).is_err(),
+            "typo'd `path_arg` must be rejected, not silently inert"
+        );
+        let typo_top = r#"{ "tool": {} }"#;
+        assert!(
+            serde_json::from_str::<McpArgumentPolicy>(typo_top).is_err(),
+            "typo'd top-level `tool` must be rejected"
+        );
+        // The correctly-spelled form still parses.
+        let ok = r#"{ "tools": { "read_file": { "path_args": ["path"] } } }"#;
+        assert!(serde_json::from_str::<McpArgumentPolicy>(ok).is_ok());
+    }
+
+    #[test]
     fn mcp_tool_result_defaults_on_missing_fields() {
         let wire = json!({
             "server": "lsp",
@@ -868,5 +1075,50 @@ mod tests {
         .to_string();
         let rec: RoundRecord = serde_json::from_str(&wire).expect("decode legacy round");
         assert!(rec.envelope_id.is_none());
+    }
+
+    #[test]
+    fn verdict_accept_with_nits_serde_round_trip() {
+        let wire = serde_json::to_string(&Verdict::AcceptWithNits).expect("serialize verdict");
+        assert_eq!(wire, "\"accept_with_nits\"");
+        let decoded: Verdict = serde_json::from_str(&wire).expect("decode verdict");
+        assert_eq!(decoded, Verdict::AcceptWithNits);
+    }
+
+    #[test]
+    fn accept_with_nits_is_not_terminal_success_but_accepts() {
+        assert!(!Verdict::AcceptWithNits.is_terminal_success());
+        // Strictness-aware acceptance: nits accept only when permitted.
+        assert!(Verdict::AcceptWithNits.accepts_under(true));
+        assert!(!Verdict::AcceptWithNits.accepts_under(false));
+        // Lgtm accepts regardless of strictness; failures never accept.
+        assert!(Verdict::Lgtm.accepts_under(true));
+        assert!(Verdict::Lgtm.accepts_under(false));
+        assert!(!Verdict::RequestChanges.accepts_under(true));
+        assert!(!Verdict::Block.accepts_under(true));
+    }
+
+    #[test]
+    fn round_record_with_accept_with_nits_round_trips() {
+        let rec = RoundRecord {
+            round: 2,
+            lead: AgentOutput::text("lead", "patch"),
+            reviewer: ReviewerFeedback::accept_with_nits(
+                "rev",
+                vec![Issue {
+                    severity: IssueSeverity::Info,
+                    message: "tighten naming".to_string(),
+                }],
+                "ACCEPT_WITH_NITS: tighten naming",
+            ),
+            check_result: Some(CheckResult::Pass),
+            patch_sha: Some("abc123".to_string()),
+            envelope_id: None,
+        };
+        let wire = serde_json::to_string(&rec).expect("serialize round");
+        let decoded: RoundRecord = serde_json::from_str(&wire).expect("decode round");
+        assert_eq!(decoded, rec);
+        assert_eq!(decoded.reviewer.verdict, Verdict::AcceptWithNits);
+        assert_eq!(decoded.reviewer.issues[0].severity, IssueSeverity::Info);
     }
 }

@@ -237,7 +237,15 @@ struct FileSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FileState {
-    Present(String),
+    // Snapshots are byte-exact, not UTF-8: the pre-apply snapshot is the
+    // rollback safety net (the last line of defense when a later file in a
+    // multi-file apply fails), so it must restore whatever bytes were on disk
+    // verbatim, never assuming the content was valid UTF-8. The patch payload
+    // itself is still UTF-8 text (FilePatch.original/modified are String, and a
+    // binary target is rejected at validation before it ever reaches a
+    // snapshot), so this byte fidelity is defense-in-depth that keeps rollback
+    // correct independent of the text-validation regime.
+    Present(Vec<u8>),
     Missing,
 }
 
@@ -245,7 +253,7 @@ impl FileSnapshot {
     fn capture(cwd: &Path, path: PathBuf) -> Result<Self> {
         ensure_safe_relative_path(cwd, &path)?;
         let state = if target_exists(cwd, &path) {
-            FileState::Present(read_to_string(cwd, &path)?)
+            FileState::Present(read_bytes(cwd, &path)?)
         } else {
             FileState::Missing
         };
@@ -254,7 +262,7 @@ impl FileSnapshot {
 
     fn restore(&self, cwd: &Path) -> Result<()> {
         match &self.state {
-            FileState::Present(value) => write_string(cwd, &self.path, value),
+            FileState::Present(value) => write_bytes(cwd, &self.path, value),
             FileState::Missing => remove_file(cwd, &self.path),
         }
     }
@@ -448,7 +456,10 @@ impl FilePatch {
         }
     }
 
-    fn is_noop(&self) -> bool {
+    /// Whether this file patch changes nothing: identical content and not a
+    /// rename. Used to skip empty entries when summarizing a patch (e.g. the S12
+    /// auto-mode classifier counts only files that effect a real change).
+    pub fn is_noop(&self) -> bool {
         self.original == self.modified && !matches!(self.operation, FileOperation::Rename { .. })
     }
 }
@@ -458,6 +469,38 @@ fn read_to_string(cwd: &Path, relative: &Path) -> Result<String> {
     match fs::read_to_string(&path) {
         Ok(value) => Ok(value),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        // A non-UTF-8 target reads as `InvalidData`. The patch payload is text
+        // (unified diffs over String content), so a binary/non-UTF-8 file
+        // cannot be patched as text — surface that as an explicit `Unsupported`
+        // rather than a confusing generic I/O fault. Every caller of this
+        // function (`FilePatch::validate`, `ParsedFileDiff::to_file_patch`) runs
+        // BEFORE any file is mutated in `apply`/`rollback` (both call `validate`
+        // first), so the rejection aborts a multi-file apply atomically, before
+        // any file on disk is touched.
+        Err(source) if source.kind() == std::io::ErrorKind::InvalidData => {
+            Err(PatchError::Unsupported {
+                message: format!(
+                    "`{}` is not valid UTF-8 text; binary files and binary diffs are not supported",
+                    relative.display()
+                ),
+            })
+        }
+        Err(source) => Err(PatchError::Io {
+            path: relative.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Read a target's exact bytes for a rollback snapshot. Unlike `read_to_string`
+/// this never rejects on encoding — a snapshot must capture whatever is on disk
+/// verbatim. Mirrors `read_to_string`'s `NotFound` → empty behavior so a target
+/// that vanishes between the existence check and the read does not error.
+fn read_bytes(cwd: &Path, relative: &Path) -> Result<Vec<u8>> {
+    let path = cwd.join(relative);
+    match fs::read(&path) {
+        Ok(value) => Ok(value),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(source) => Err(PatchError::Io {
             path: relative.to_path_buf(),
             source,
@@ -466,6 +509,12 @@ fn read_to_string(cwd: &Path, relative: &Path) -> Result<String> {
 }
 
 fn write_string(cwd: &Path, relative: &Path, value: &str) -> Result<()> {
+    write_bytes(cwd, relative, value.as_bytes())
+}
+
+/// Atomically write bytes via a sibling temp file + rename. Used for both text
+/// patch application (`write_string`) and byte-exact rollback restoration.
+fn write_bytes(cwd: &Path, relative: &Path, value: &[u8]) -> Result<()> {
     let path = cwd.join(relative);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| PatchError::Io {
@@ -1405,5 +1454,72 @@ rename to new.txt
                 entry.path().display()
             );
         }
+    }
+
+    /// H16: a multi-file patch whose later target is a binary/non-UTF-8 file on
+    /// disk must be rejected with a clear `Unsupported` error BEFORE any file is
+    /// modified — the earlier text file must be left byte-for-byte untouched, so
+    /// a mixed text+binary patch never partially applies.
+    #[test]
+    fn rejects_binary_target_atomically_before_any_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let text_path = dir.path().join("a.txt");
+        let binary_path = dir.path().join("b.bin");
+        // Valid-UTF-8 text target (would apply cleanly on its own).
+        fs::write(&text_path, "before\n").unwrap();
+        // Non-UTF-8 bytes: a lone 0xFF/0xFE is invalid UTF-8.
+        let binary = [0x00u8, 0xff, 0xfe, 0x01, 0x80, 0x00, 0x42];
+        fs::write(&binary_path, binary).unwrap();
+
+        // The patch claims a text modify on both; the binary one cannot be read
+        // as text, so validation rejects it.
+        let patch = NvPatch::new(vec![
+            FilePatch::new("a.txt", "before\n", "after\n"),
+            FilePatch::new("b.bin", "whatever\n", "ignored\n"),
+        ]);
+
+        let err = patch.apply(dir.path(), false).unwrap_err();
+        assert!(
+            matches!(err, PatchError::Unsupported { ref message } if message.contains("b.bin")
+                && message.contains("UTF-8")),
+            "expected a clear Unsupported error naming the binary file, got: {err:?}"
+        );
+
+        // Atomicity: the text file is byte-for-byte unchanged, the binary file
+        // is intact, and no staged temp files leaked.
+        assert_eq!(fs::read(&text_path).unwrap(), b"before\n");
+        assert_eq!(fs::read(&binary_path).unwrap(), binary);
+        assert_no_staged_write_temps(dir.path());
+    }
+
+    /// H16: the rollback snapshot primitive captures and restores exact bytes,
+    /// not UTF-8 — so the safety net stays faithful for any on-disk content.
+    /// `FileSnapshot` is private; this exercises it directly because the public
+    /// apply path rejects binary targets at validation (so binary bytes never
+    /// reach a snapshot through the public API), yet the primitive itself must
+    /// still be byte-exact as defense-in-depth.
+    #[test]
+    fn snapshot_captures_and_restores_binary_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.bin");
+        let original: Vec<u8> = vec![0x00, 0xff, 0xfe, 0x80, 0x01, 0x00, 0x7f, 0xc3, 0x28];
+        fs::write(&path, &original).unwrap();
+
+        let snapshot = FileSnapshot::capture(dir.path(), PathBuf::from("blob.bin")).unwrap();
+        assert_eq!(snapshot.state, FileState::Present(original.clone()));
+
+        // Mutate the file out from under the snapshot, then restore.
+        fs::write(&path, [0xde, 0xad, 0xbe, 0xef]).unwrap();
+        snapshot.restore(dir.path()).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_no_staged_write_temps(dir.path());
+
+        // A snapshot of a missing file restores by removing it.
+        let missing = FileSnapshot::capture(dir.path(), PathBuf::from("absent.bin")).unwrap();
+        assert_eq!(missing.state, FileState::Missing);
+        fs::write(dir.path().join("absent.bin"), [0x01, 0x02]).unwrap();
+        missing.restore(dir.path()).unwrap();
+        assert!(!dir.path().join("absent.bin").exists());
     }
 }

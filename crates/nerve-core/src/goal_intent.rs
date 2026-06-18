@@ -134,6 +134,13 @@ impl GoalIntentConverter {
             });
         }
 
+        // H12: the model-proposed `env` is scrutinised by `GoalSpec::validate`
+        // below (the deterministic chokepoint shared with the persisted
+        // active-goal reload). env is the one spec field forwarded verbatim and
+        // at execution time OVERRIDES the operator `check_env` allowlist (see
+        // nerve_core::goal), so code-execution-vector keys (`LD_PRELOAD`,
+        // `RUSTC_WRAPPER`, `PATH`, …) are rejected fail-closed there; survivors
+        // are surfaced per-line in the confirmation gate.
         let resolved_cwd = cwd.to_path_buf();
         let spec = GoalSpec {
             id: Uuid::new_v4().to_string(),
@@ -485,5 +492,67 @@ mod tests {
             }
             other => panic!("expected OneshotNotSupported, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn convert_rejects_model_proposed_linker_env() {
+        // H12: the env screen lives in GoalSpec::validate (the chokepoint shared
+        // with the persisted active-goal reload), so a code-execution-vector key
+        // surfaces through ValidationFailed(ForbiddenEnvKey).
+        let mock = MockAdapter::new("mock-ldpreload");
+        mock.set_oneshot_response(
+            r#"{"check_cmd":["cargo","test"],"timeout_secs":60,"env":{"LD_PRELOAD":"/tmp/evil.so"},"rationale":"runs tests"}"#,
+        );
+        let converter = GoalIntentConverter::new(Arc::new(mock));
+
+        let err = converter
+            .convert("run tests", &cwd())
+            .await
+            .expect_err("must reject LD_PRELOAD override");
+
+        match err {
+            GoalIntentError::ValidationFailed(ConfigError::ForbiddenEnvKey(key)) => {
+                assert_eq!(key, "LD_PRELOAD");
+            }
+            other => panic!("expected ValidationFailed(ForbiddenEnvKey), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn convert_rejects_model_proposed_path_override() {
+        let mock = MockAdapter::new("mock-path");
+        mock.set_oneshot_response(
+            r#"{"check_cmd":["cargo","test"],"timeout_secs":60,"env":{"PATH":"/tmp/evil:/usr/bin"},"rationale":"runs tests"}"#,
+        );
+        let converter = GoalIntentConverter::new(Arc::new(mock));
+
+        let err = converter
+            .convert("run tests", &cwd())
+            .await
+            .expect_err("must reject PATH override");
+
+        assert!(matches!(
+            err,
+            GoalIntentError::ValidationFailed(ConfigError::ForbiddenEnvKey(k)) if k == "PATH"
+        ));
+    }
+
+    #[tokio::test]
+    async fn convert_accepts_benign_env_override() {
+        let mock = MockAdapter::new("mock-benign-env");
+        mock.set_oneshot_response(
+            r#"{"check_cmd":["cargo","test"],"timeout_secs":60,"env":{"RUST_BACKTRACE":"1"},"rationale":"runs tests with backtrace"}"#,
+        );
+        let converter = GoalIntentConverter::new(Arc::new(mock));
+
+        let intent = converter
+            .convert("run tests with a backtrace", &cwd())
+            .await
+            .expect("benign env override must convert");
+
+        assert_eq!(
+            intent.proposed_spec.env.get("RUST_BACKTRACE"),
+            Some(&"1".to_string())
+        );
     }
 }

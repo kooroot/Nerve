@@ -1,8 +1,10 @@
-//! sec-gap-5: parent-level setrlimit helpers applied before spawning a /goal
-//! `check_cmd` child. v0.3.0 ships a unix-only implementation; non-unix
-//! callers receive `Unsupported`. Linux honours every limit; macOS supports
-//! AS / FSIZE / CPU and tolerates NPROC best-effort. v1.0 will replace this
-//! with cgroups (Linux) per §3 Tier 2g.
+//! sec-gap-5 / H15: parent-level setrlimit helpers applied before spawning a
+//! /goal `check_cmd` child. Unix-only; non-unix callers receive `Unsupported`.
+//! Linux honours every limit; macOS supports AS / FSIZE / CPU and rejects
+//! NPROC for unprivileged callers — that gap is now reported honestly via
+//! [`unenforced_notes`] rather than silently returning `Ok`. On Linux these
+//! per-process ceilings are COMPLEMENTED — not replaced — by aggregate
+//! cgroup v2 caps (`pids.max`/`memory.max`); see [`crate::cgroup`].
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -102,6 +104,31 @@ pub fn apply_ulimit(_spec: &CheckUlimit) -> Result<(), UlimitError> {
     Err(UlimitError::Unsupported)
 }
 
+/// Parent-side (pre-spawn) advisory — NOT for use inside `pre_exec`. Returns the
+/// config field names of limits this platform will silently fail to enforce, so
+/// the caller can surface them rather than let the child degrade unseen (H15).
+///
+/// macOS rejects `RLIMIT_NPROC` for unprivileged callers, so [`apply_ulimit`]
+/// best-effort-ignores it (returns `Ok` instead of aborting the spawn); without
+/// this report an operator would wrongly believe `nproc` is enforced.
+/// `RLIMIT_AS`/`FSIZE`/`CPU` are honored on macOS and never listed. On Linux and
+/// other unix every `setrlimit` is honored, so this is always empty.
+#[cfg(unix)]
+pub fn unenforced_notes(spec: &CheckUlimit) -> Vec<&'static str> {
+    let mut notes = Vec::new();
+    if cfg!(target_os = "macos") && spec.nproc.is_some() {
+        notes.push("nproc");
+    }
+    notes
+}
+
+/// Non-unix has no setrlimit at all; the whole spec is unsupported (the caller
+/// already errors via `apply_ulimit`), so there is nothing partial to report.
+#[cfg(not(unix))]
+pub fn unenforced_notes(_spec: &CheckUlimit) -> Vec<&'static str> {
+    Vec::new()
+}
+
 #[cfg(unix)]
 fn set_resource(
     resource: RlimitResource,
@@ -120,8 +147,10 @@ fn set_resource(
         return Ok(());
     }
     if macos_best_effort && cfg!(target_os = "macos") {
-        // macOS rejects RLIMIT_NPROC for unprivileged callers; degrade to
-        // best-effort instead of failing the whole spawn.
+        // macOS rejects RLIMIT_NPROC for unprivileged callers. We degrade to
+        // best-effort here (rather than failing the whole spawn), but this is no
+        // longer SILENT: the parent surfaces it pre-spawn via `unenforced_notes`
+        // so the operator is not left believing nproc is enforced (H15).
         return Ok(());
     }
     Err(UlimitError::SetRlimit {
@@ -234,6 +263,35 @@ mod tests {
     #[test]
     fn validate_accepts_empty_spec() {
         validate(&CheckUlimit::default()).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unenforced_notes_reports_macos_nproc_only() {
+        // On macOS, a configured `nproc` is surfaced as unenforced (RLIMIT_NPROC
+        // is rejected for unprivileged callers); on Linux/other unix it is
+        // honored and nothing is reported.
+        let with_nproc = CheckUlimit {
+            nproc: Some(8),
+            address_space_bytes: Some(1 << 30),
+            ..Default::default()
+        };
+        let notes = unenforced_notes(&with_nproc);
+        if cfg!(target_os = "macos") {
+            assert_eq!(notes, vec!["nproc"]);
+        } else {
+            assert!(notes.is_empty(), "linux/unix honors nproc: {notes:?}");
+        }
+
+        // AS/FSIZE/CPU are honored everywhere on unix — never reported, even on
+        // macOS, and an nproc-free spec yields no notes on any platform.
+        let no_nproc = CheckUlimit {
+            address_space_bytes: Some(1 << 30),
+            file_size_bytes: Some(1024),
+            cpu_secs: Some(10),
+            ..Default::default()
+        };
+        assert!(unenforced_notes(&no_nproc).is_empty());
     }
 
     #[test]

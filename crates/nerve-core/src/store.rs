@@ -1,8 +1,9 @@
 use crate::RunReport;
 use anyhow::{Context, Result};
 use chrono::Utc;
+use nerve_config::ProfileSelection;
 use nerve_patch::{ApplyReport, NvPatch};
-use nerve_types::Verdict;
+use nerve_types::{PlanReport, RoundRecord, Task, Verdict};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -61,6 +62,82 @@ pub struct PatchRecord {
     pub applied: bool,
 }
 
+/// Lifecycle marker for a [`RunCheckpoint`]. A checkpoint is only ever written
+/// while a loop is `Running`; the terminal `Finished` state is reserved for a
+/// possible future "the run ended but I want the checkpoint to linger" use and
+/// is never produced by the S8 write path (finalize *clears* the checkpoint
+/// instead — see [`NerveStore::save_report`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    Running,
+    Finished,
+}
+
+/// An explicitly IN-PROGRESS snapshot of a synaptic loop, written once per
+/// completed round so a mid-loop crash leaves the rounds-so-far recoverable on
+/// disk (substrate for S9's nonblocking daemon + live stream).
+///
+/// **Security invariant (S8 north star #2):** a checkpoint is *structurally*
+/// distinct from a finalized [`RunReport`] — it deliberately carries NO
+/// `applied` / `blocked` / `goal_satisfied` / `final_patch` fields. Those exist
+/// only at finalize, so it is impossible for a crash-recovered checkpoint to be
+/// mistaken for a completed/accepted run, and a checkpoint write (or its
+/// failure) can never change which patch the deterministic gate accepts. The
+/// presence of a checkpoint file after process exit means exactly "this run was
+/// interrupted before finalize" — `save_report` removes it on a clean finish.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RunCheckpoint {
+    pub task: Task,
+    pub selection: ProfileSelection,
+    /// `Running` for every checkpoint the loop writes; see [`RunStatus`].
+    pub status: RunStatus,
+    /// Rounds completed so far, in order.
+    pub rounds: Vec<RoundRecord>,
+    /// rfc3339 timestamp of this snapshot (chrono::Utc, as elsewhere in store).
+    pub updated_at: String,
+}
+
+/// S11: an AUDIT record that an operator explicitly escalated approval (today:
+/// apply-consent) for ONE run, keyed on the run's id. Written when the operator
+/// sends an `approve` for an in-flight run so a reconnecting client can SEE the
+/// standing grant; it is "sticky per run" because the run's authoritative,
+/// forge-proof consent lives in the daemon's in-memory `ApplyConsent` handle for
+/// the run's whole life.
+///
+/// **Security invariant (load-bearing):** this disk record is AUDIT-ONLY and is
+/// NEVER consulted by the deterministic apply gate. The lead is an arbitrary CLI
+/// subprocess with write access to `.nerve/` in `task.cwd`; if the gate trusted
+/// this file the lead could forge operator consent and self-escalate dry-run →
+/// apply. The gate instead reads the in-memory `ApplyConsent` (see nerve-core
+/// `RunOptions::apply_grant`), which the lead cannot reach. A grant is also NOT
+/// an acceptance: it is structurally distinct from [`RunReport`]/[`RunCheckpoint`]
+/// — it carries ONLY consent + identity, never a verdict / `blocked` /
+/// `goal_satisfied` / patch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalGrant {
+    /// The run this grant is scoped to (`Task::id`). A grant for one run-id is
+    /// never consulted for another — no cross-run leak.
+    pub run_id: String,
+    /// Operator consented to APPLY this run's accepted patch.
+    pub apply_consent: bool,
+    /// rfc3339 timestamp the grant was recorded (chrono::Utc).
+    pub granted_at: String,
+}
+
+impl ApprovalGrant {
+    /// An apply-consent grant for `run_id`, stamped now.
+    pub fn apply(run_id: impl Into<String>) -> Self {
+        Self {
+            run_id: run_id.into(),
+            apply_consent: true,
+            granted_at: Utc::now().to_rfc3339(),
+        }
+    }
+}
+
 impl NerveStore {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self { cwd: cwd.into() }
@@ -77,7 +154,130 @@ impl NerveStore {
             self.upsert_patch_record(PatchRecord::from_report(report, patch))?;
         }
 
+        // The finalized report supersedes any in-flight checkpoint for this run:
+        // its presence means "still running / interrupted", so a clean finalize
+        // must remove it (idempotent — Ok if it was never written).
+        self.clear_checkpoint(&report.task.id)?;
+
         Ok(())
+    }
+
+    /// Persist an IN-PROGRESS round checkpoint (S8). Atomic write under
+    /// `.nerve/checkpoints/{id}.json`. See [`RunCheckpoint`] for why this can
+    /// never assert acceptance.
+    pub fn save_checkpoint(&self, checkpoint: &RunCheckpoint) -> Result<()> {
+        fs::create_dir_all(self.checkpoints_dir())
+            .with_context(|| format!("failed to create `{}`", self.checkpoints_dir().display()))?;
+        write_json(&self.checkpoint_path(&checkpoint.task.id), checkpoint)
+    }
+
+    /// Load the in-flight checkpoint for `id` (errors if absent — callers that
+    /// tolerate absence should check [`Self::list_checkpoints`] instead).
+    pub fn load_checkpoint(&self, id: &str) -> Result<RunCheckpoint> {
+        read_json(&self.checkpoint_path(id))
+    }
+
+    /// All in-flight / interrupted checkpoints — the recovery + observability
+    /// surface S9's daemon reads to resume or report on running loops.
+    pub fn list_checkpoints(&self) -> Result<Vec<RunCheckpoint>> {
+        let dir = self.checkpoints_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut checkpoints = Vec::new();
+        for entry in fs::read_dir(&dir)
+            .with_context(|| format!("failed to read `{}`", dir.display()))?
+        {
+            let entry = entry?;
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            checkpoints.push(read_json(&entry.path())?);
+        }
+        checkpoints.sort_by(|a: &RunCheckpoint, b| b.updated_at.cmp(&a.updated_at));
+        Ok(checkpoints)
+    }
+
+    /// Remove the checkpoint for `id`. Idempotent: `Ok(())` if already absent,
+    /// so it is safe to call unconditionally at finalize.
+    pub fn clear_checkpoint(&self, id: &str) -> Result<()> {
+        let path = self.checkpoint_path(id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to remove `{}`", path.display()))
+            }
+        }
+    }
+
+    /// S11: persist a per-run approval grant as an AUDIT record under
+    /// `.nerve/approvals/{run-id}.json`. See [`ApprovalGrant`]: this is written
+    /// by the trusted daemon for observability/reconnect and is NEVER consulted
+    /// by the apply gate (the gate reads the in-memory `ApplyConsent` handle).
+    pub fn record_approval(&self, grant: &ApprovalGrant) -> Result<()> {
+        write_json(&self.approval_path(&grant.run_id), grant)
+    }
+
+    /// S11: load the standing approval grant for `run_id`, if any. Absence (no
+    /// file) is `Ok(None)`. Used only for observability (e.g. daemon `status`),
+    /// never as a gate input.
+    pub fn load_approval(&self, run_id: &str) -> Result<Option<ApprovalGrant>> {
+        let path = self.approval_path(run_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_json(&path).map(Some)
+    }
+
+    /// S13: persist a [`PlanReport`] under `.nerve/plans/<task_id>.json` so a
+    /// later `nv dispatch-plan <id>` can retrieve it and hand its steps off to
+    /// the loop. Atomic write; the directory is created on demand. Returns the
+    /// path written. Purely additive — plan output is unchanged for callers
+    /// that never dispatch.
+    pub fn save_plan(&self, report: &PlanReport) -> Result<PathBuf> {
+        validate_store_id("plan id", &report.task_id)?;
+        fs::create_dir_all(self.plans_dir())
+            .with_context(|| format!("failed to create `{}`", self.plans_dir().display()))?;
+        let path = self.plan_path(&report.task_id);
+        write_json(&path, report)?;
+        Ok(path)
+    }
+
+    /// S13: load a stored [`PlanReport`] by id. `plan_id` is operator-supplied
+    /// (`nv dispatch-plan <plan-id>`), unlike the UUID `Task::id`s elsewhere, so
+    /// it is validated as a safe file component first — a traversal id must
+    /// never read JSON outside `.nerve/plans/`. Missing plan is an error.
+    pub fn load_plan(&self, plan_id: &str) -> Result<PlanReport> {
+        validate_store_id("plan id", plan_id)?;
+        let path = self.plan_path(plan_id);
+        if !path.exists() {
+            anyhow::bail!("no stored plan `{plan_id}` at `{}`", path.display());
+        }
+        read_json(&path)
+    }
+
+    /// S13: enumerate stored plan ids (sorted). Empty when no plan has been
+    /// saved yet.
+    pub fn list_plans(&self) -> Result<Vec<String>> {
+        let dir = self.plans_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::new();
+        for entry in
+            fs::read_dir(&dir).with_context(|| format!("failed to read `{}`", dir.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+                ids.push(stem.to_string());
+            }
+        }
+        ids.sort();
+        Ok(ids)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
@@ -161,6 +361,10 @@ impl NerveStore {
             .with_context(|| format!("failed to create `{}`", self.session_meta_dir().display()))?;
         fs::create_dir_all(self.patches_dir())
             .with_context(|| format!("failed to create `{}`", self.patches_dir().display()))?;
+        fs::create_dir_all(self.checkpoints_dir())
+            .with_context(|| format!("failed to create `{}`", self.checkpoints_dir().display()))?;
+        fs::create_dir_all(self.approvals_dir())
+            .with_context(|| format!("failed to create `{}`", self.approvals_dir().display()))?;
         Ok(())
     }
 
@@ -244,12 +448,38 @@ impl NerveStore {
         self.root_dir().join("patches")
     }
 
+    fn checkpoints_dir(&self) -> PathBuf {
+        self.root_dir().join("checkpoints")
+    }
+
+    /// S11: per-run approval grant audit records (see [`ApprovalGrant`]).
+    fn approvals_dir(&self) -> PathBuf {
+        self.root_dir().join("approvals")
+    }
+
+    /// S13: persisted [`PlanReport`]s, the source for `nv dispatch-plan`.
+    fn plans_dir(&self) -> PathBuf {
+        self.root_dir().join("plans")
+    }
+
     fn session_path(&self, id: &str) -> PathBuf {
         self.sessions_dir().join(format!("{id}.json"))
     }
 
+    fn checkpoint_path(&self, id: &str) -> PathBuf {
+        self.checkpoints_dir().join(format!("{id}.json"))
+    }
+
+    fn approval_path(&self, id: &str) -> PathBuf {
+        self.approvals_dir().join(format!("{id}.json"))
+    }
+
     fn session_meta_path(&self, id: &str) -> PathBuf {
         self.session_meta_dir().join(format!("{id}.json"))
+    }
+
+    fn plan_path(&self, id: &str) -> PathBuf {
+        self.plans_dir().join(format!("{id}.json"))
     }
 
     fn patch_path(&self, id: &str) -> PathBuf {
@@ -341,6 +571,23 @@ impl Drop for StoreLock {
     }
 }
 
+/// S13: reject an operator-supplied id that could escape the store directory.
+/// Used for `plan_id` (from `nv dispatch-plan <plan-id>`), which—unlike the
+/// UUID `Task::id`s the rest of the store keys on—is untrusted input. Mirrors
+/// the strict allowlist contract of `mayor_patrol::validate_file_component`
+/// (1..=128 chars of `[A-Za-z0-9_-]`), so `/`, `\`, `..`, and control chars all
+/// fail closed. UUID task ids (hex + hyphen) pass.
+fn validate_store_id(kind: &str, id: &str) -> Result<()> {
+    let ok = (1..=128).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !ok {
+        anyhow::bail!("invalid {kind} `{id}`: must be 1..=128 chars of [A-Za-z0-9_-]");
+    }
+    Ok(())
+}
+
 fn read_json<T>(path: &Path) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -396,7 +643,281 @@ mod tests {
     use crate::RunReport;
     use nerve_config::{PlanStrategy, ProfileSelection, ReviewStrictness};
     use nerve_patch::{FilePatch, NvPatch};
-    use nerve_types::{AgentOutput, ReviewerFeedback, Task};
+    use nerve_types::{AgentOutput, ReviewerFeedback, RoundRecord, Task};
+
+    fn sample_selection() -> ProfileSelection {
+        ProfileSelection {
+            id: None,
+            lead: "lead".to_string(),
+            reviewer: "reviewer".to_string(),
+            review_strictness: ReviewStrictness::Normal,
+            max_refinement_rounds: 1,
+            plan_strategy: PlanStrategy::Single,
+            plan_system_prompt_override: None,
+        }
+    }
+
+    fn sample_round(round: u8) -> RoundRecord {
+        let patch = NvPatch::new(vec![FilePatch::create("created.txt", "created\n")]);
+        RoundRecord {
+            round,
+            lead: AgentOutput::with_patch("lead", "patch", patch),
+            reviewer: ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            check_result: None,
+            patch_sha: None,
+            envelope_id: None,
+        }
+    }
+
+    fn sample_checkpoint(task: &Task, rounds: usize) -> RunCheckpoint {
+        RunCheckpoint {
+            task: task.clone(),
+            selection: sample_selection(),
+            status: RunStatus::Running,
+            rounds: (0..rounds).map(|i| sample_round(i as u8)).collect(),
+            updated_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn sample_plan_report(task_id: &str) -> PlanReport {
+        PlanReport {
+            task_id: task_id.to_string(),
+            plan_markdown: "## Objective\nx\n\n## Steps\n1. a\n2. b\n".to_string(),
+            reviewer_feedback: String::new(),
+            estimated_loc: Some(10),
+            estimated_files: vec![PathBuf::from("a.rs")],
+            cost: None,
+            finished_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn plan_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        let report = sample_plan_report("plan-001");
+
+        let path = store.save_plan(&report).unwrap();
+        assert!(path.ends_with("plans/plan-001.json"));
+        let loaded = store.load_plan("plan-001").unwrap();
+        assert_eq!(loaded, report);
+        assert_eq!(store.list_plans().unwrap(), vec!["plan-001".to_string()]);
+    }
+
+    #[test]
+    fn load_plan_missing_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        assert!(store.load_plan("nope").is_err());
+        // No plans dir yet → empty list, not an error.
+        assert!(store.list_plans().unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_plan_rejects_traversal_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        for bad in ["../escape", "a/b", "..", "with space", "tab\tid", ""] {
+            assert!(
+                store.load_plan(bad).is_err(),
+                "traversal/invalid id must be rejected: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_plan_rejects_traversal_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        let report = sample_plan_report("../escape");
+        assert!(store.save_plan(&report).is_err());
+    }
+
+    #[test]
+    fn checkpoint_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        let task = Task::new("do work", dir.path());
+        let checkpoint = sample_checkpoint(&task, 2);
+
+        store.save_checkpoint(&checkpoint).unwrap();
+        let loaded = store.load_checkpoint(&task.id).unwrap();
+
+        assert_eq!(loaded, checkpoint);
+        assert_eq!(loaded.status, RunStatus::Running);
+        assert_eq!(loaded.rounds.len(), 2);
+    }
+
+    #[test]
+    fn save_report_clears_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        let patch = NvPatch::new(vec![FilePatch::create("created.txt", "created\n")]);
+        let task = Task::new("create file", dir.path());
+        store.save_checkpoint(&sample_checkpoint(&task, 1)).unwrap();
+        assert!(store.load_checkpoint(&task.id).is_ok());
+
+        let report = RunReport {
+            task: task.clone(),
+            selection: sample_selection(),
+            rounds: Vec::new(),
+            crossfire_feedback: Vec::new(),
+            final_output: AgentOutput::with_patch("lead", "patch", patch.clone()),
+            final_feedback: ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            final_patch: Some(patch),
+            events: Vec::new(),
+            usage: Default::default(),
+            budget_exceeded: false,
+            no_progress_exceeded: false,
+            crossfire_halted: false,
+            cancelled: false,
+            goal_satisfied: None,
+            applied: false,
+            blocked: false,
+            apply_classification: None,
+            ran_unconfined: false,
+        };
+        store.save_report(&report).unwrap();
+
+        // The finalized report supersedes the in-flight checkpoint.
+        assert!(store.load_checkpoint(&task.id).is_err());
+        assert!(store.list_checkpoints().unwrap().is_empty());
+    }
+
+    /// H13: the additive `ran_unconfined` telemetry is exposed in the serialized
+    /// JSON report when a run degraded to unconfined, and older reports that
+    /// predate the field load as `false` (serde default) — never erroring. Pure
+    /// telemetry: it rides alongside the verdict; it is not the verdict.
+    #[test]
+    fn run_report_exposes_ran_unconfined_and_defaults_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = NvPatch::new(vec![FilePatch::create("created.txt", "created\n")]);
+        let task = Task::new("create file", dir.path());
+        let report = RunReport {
+            task,
+            selection: sample_selection(),
+            rounds: Vec::new(),
+            crossfire_feedback: Vec::new(),
+            final_output: AgentOutput::with_patch("lead", "patch", patch.clone()),
+            final_feedback: ReviewerFeedback::lgtm("reviewer", "LGTM"),
+            final_patch: Some(patch),
+            events: Vec::new(),
+            usage: Default::default(),
+            budget_exceeded: false,
+            no_progress_exceeded: false,
+            crossfire_halted: false,
+            cancelled: false,
+            goal_satisfied: None,
+            applied: false,
+            blocked: false,
+            apply_classification: None,
+            // A run that degraded to an unconfined `Auto` check.
+            ran_unconfined: true,
+        };
+
+        // The JSON report a degraded run produces carries the signal verbatim.
+        let mut value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["ran_unconfined"], serde_json::json!(true));
+
+        // A pre-H13 persisted report has no such key: it must load as `false`,
+        // never error — and the deterministic gate fields are untouched.
+        value.as_object_mut().unwrap().remove("ran_unconfined");
+        let legacy: RunReport = serde_json::from_value(value).unwrap();
+        assert!(!legacy.ran_unconfined);
+        assert!(!legacy.blocked);
+        assert_eq!(legacy.goal_satisfied, None);
+    }
+
+    #[test]
+    fn clear_checkpoint_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        // Clearing a never-written checkpoint is a no-op success.
+        store.clear_checkpoint("nonexistent").unwrap();
+
+        let task = Task::new("do work", dir.path());
+        store.save_checkpoint(&sample_checkpoint(&task, 1)).unwrap();
+        store.clear_checkpoint(&task.id).unwrap();
+        store.clear_checkpoint(&task.id).unwrap();
+        assert!(store.load_checkpoint(&task.id).is_err());
+    }
+
+    #[test]
+    fn list_checkpoints_returns_in_flight_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+        // No directory yet ⇒ empty, not an error.
+        assert!(store.list_checkpoints().unwrap().is_empty());
+
+        let task_a = Task::new("task a", dir.path());
+        let task_b = Task::new("task b", dir.path());
+        store.save_checkpoint(&sample_checkpoint(&task_a, 1)).unwrap();
+        store.save_checkpoint(&sample_checkpoint(&task_b, 3)).unwrap();
+
+        let listed = store.list_checkpoints().unwrap();
+        assert_eq!(listed.len(), 2);
+        let ids: std::collections::HashSet<_> =
+            listed.iter().map(|c| c.task.id.clone()).collect();
+        assert!(ids.contains(&task_a.id));
+        assert!(ids.contains(&task_b.id));
+    }
+
+    #[test]
+    fn concurrent_checkpoint_writes_never_corrupt_under_multi_instance() {
+        // Each thread models a SEPARATE `nv` instance: its own `NerveStore` over
+        // the SAME `.nerve/` dir. `save_checkpoint` -> `write_json_atomic` writes
+        // to a unique per-call `NamedTempFile` then `rename(2)`s it onto
+        // `{id}.json`, so concurrent writers either touch DIFFERENT files (distinct
+        // run-ids) or race renames onto the SAME path where each rename swaps in
+        // one COMPLETE file. A reader therefore never observes a torn/partial
+        // checkpoint. This is a structural property of atomic per-id writes — NOT a
+        // guarantee that requires a single serialized writer task; checkpoints stay
+        // non-authoritative recovery telemetry either way.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let path_ref = path.as_path();
+
+        // 8 distinct run-ids, each written once by its own instance...
+        let distinct: Vec<Task> = (0..8)
+            .map(|i| Task::new(format!("run {i}"), path_ref))
+            .collect();
+        // ...plus one HOT id hammered concurrently by many instances (rename races
+        // onto a single path), with VARYING payload sizes to widen any non-atomic
+        // partial-write window.
+        let hot = Task::new("hot run", path_ref);
+        let hot_ref = &hot;
+
+        std::thread::scope(|scope| {
+            for task in &distinct {
+                scope.spawn(move || {
+                    let store = NerveStore::new(path_ref);
+                    store.save_checkpoint(&sample_checkpoint(task, 1)).unwrap();
+                });
+            }
+            for round in 0..32u8 {
+                let rounds = (round % 5) as usize + 1;
+                scope.spawn(move || {
+                    let store = NerveStore::new(path_ref);
+                    store
+                        .save_checkpoint(&sample_checkpoint(hot_ref, rounds))
+                        .unwrap();
+                });
+            }
+        });
+
+        // `list_checkpoints` `read_json`s EVERY `*.json`, so a single torn file
+        // would make this `unwrap` panic. All distinct ids plus the hot id must
+        // have survived as complete, parseable checkpoints.
+        let listed = NerveStore::new(path_ref).list_checkpoints().unwrap();
+        let ids: std::collections::HashSet<_> =
+            listed.iter().map(|c| c.task.id.clone()).collect();
+        for task in &distinct {
+            assert!(ids.contains(&task.id), "distinct checkpoint {} missing", task.id);
+        }
+        assert!(ids.contains(&hot.id), "hot checkpoint missing");
+        // 8 distinct + 1 hot = 9 valid files (no duplicates, none corrupt).
+        assert_eq!(listed.len(), 9);
+    }
 
     #[test]
     fn apply_and_rollback_keep_session_history_in_sync() {
@@ -423,9 +944,13 @@ mod tests {
             usage: Default::default(),
             budget_exceeded: false,
             no_progress_exceeded: false,
+            crossfire_halted: false,
+            cancelled: false,
             goal_satisfied: None,
             applied: false,
             blocked: false,
+            apply_classification: None,
+            ran_unconfined: false,
         };
         let store = NerveStore::new(dir.path());
         store.save_report(&report).unwrap();
@@ -466,9 +991,13 @@ mod tests {
             usage: Default::default(),
             budget_exceeded: false,
             no_progress_exceeded: false,
+            crossfire_halted: false,
+            cancelled: false,
             goal_satisfied: None,
             applied: false,
             blocked: false,
+            apply_classification: None,
+            ran_unconfined: false,
         };
         let store = NerveStore::new(dir.path());
         store.save_report(&report).unwrap();
@@ -478,5 +1007,41 @@ mod tests {
         let summary = store.list_sessions().unwrap().remove(0);
         assert_eq!(summary.name.as_deref(), Some("first pass"));
         assert_eq!(summary.cwd, dir.path());
+    }
+
+    // --- S11: per-run approval grant audit records ---------------------------
+
+    #[test]
+    fn approval_grant_round_trips_and_is_per_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NerveStore::new(dir.path());
+
+        // Absent grant reads as None (the dry-run-safe default).
+        assert!(store.load_approval("run-a").unwrap().is_none());
+
+        let grant = ApprovalGrant::apply("run-a");
+        assert!(grant.apply_consent);
+        store.record_approval(&grant).unwrap();
+
+        let loaded = store.load_approval("run-a").unwrap().unwrap();
+        assert_eq!(loaded, grant);
+        // Per-run isolation: a grant for run-a is never visible for run-b.
+        assert!(store.load_approval("run-b").unwrap().is_none());
+    }
+
+    #[test]
+    fn approval_grant_is_structurally_distinct_from_checkpoint() {
+        // A grant must never be deserializable as a checkpoint (or vice-versa):
+        // `deny_unknown_fields` on both keeps a consent record from ever being
+        // read as in-flight run state, and vice-versa.
+        let grant = ApprovalGrant::apply("run-a");
+        let grant_json = serde_json::to_string(&grant).unwrap();
+        assert!(serde_json::from_str::<RunCheckpoint>(&grant_json).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let task = Task::new("t", dir.path());
+        let checkpoint = sample_checkpoint(&task, 1);
+        let checkpoint_json = serde_json::to_string(&checkpoint).unwrap();
+        assert!(serde_json::from_str::<ApprovalGrant>(&checkpoint_json).is_err());
     }
 }
